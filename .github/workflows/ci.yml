@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Syntax, Schema & Unit Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install GLib schema compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libglib2.0-bin
+
+      - name: Check JS / CJS syntax
+        run: |
+          for f in extension.js prefs.js piClient.js protocol.js zcodeBridge.cjs core/*.js ui/*.js tests/*.js; do
+            node --check "$f"
+          done
+
+      - name: Validate GSettings XML schema strictly
+        run: glib-compile-schemas --strict --dry-run schemas
+
+      - name: Run automated unit & state-machine tests
+        run: npm test

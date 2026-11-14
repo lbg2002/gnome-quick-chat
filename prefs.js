@@ -5,149 +5,19 @@ import GLib from 'gi://GLib';
 import Soup from 'gi://Soup?version=3.0';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 import {
-    buildZCodePersonalConfigOverride,
+    getBackendCapabilities,
     normalizeOpenAIEndpoint,
-    parseCodexProviderCatalog,
-    parseZCodeProviderCatalog,
 } from './protocol.js';
+import {
+    detectEffectiveBackend,
+    loadLocalBackendCatalog,
+} from './core/backendDetect.js';
+import {
+    loadOpenAIApiKey,
+    storeOpenAIApiKey,
+} from './core/secretStore.js';
 
 const Decoder = new TextDecoder('utf-8');
-const Encoder = new TextEncoder();
-
-function applyModelSelectionSideEffects(settings) {
-    const home = GLib.get_home_dir();
-    const provider = settings.get_string('provider').trim();
-    const model = settings.get_string('model').trim();
-
-    // 1. Sync ZCode defaultModelSelection so ZCode CLI uses the chosen provider & model immediately
-    const personalPath = GLib.build_filenamev([home, '.zcode', 'v2', 'provider_config.json']);
-    const personalObj = readJsonFile(personalPath);
-    if (personalObj) {
-        const override = buildZCodePersonalConfigOverride(personalObj, {provider, model});
-        if (override && override.configObj) {
-            const payload = Encoder.encode(JSON.stringify(override.configObj, null, 2));
-            try {
-                const runtimeDir = GLib.get_user_runtime_dir() || '/tmp';
-                const runtimePath = GLib.build_filenamev([runtimeDir, 'quick-chat-zcode-provider.json']);
-                GLib.file_set_contents(runtimePath, payload);
-            } catch (_) {}
-            if (override.providerId && override.modelId) {
-                try {
-                    GLib.file_set_contents(personalPath, payload);
-                } catch (_) {}
-            }
-        }
-    }
-
-    // 2. Clear remoteSessionId in current session state file so next turn doesn't resume an old model's session
-    const sessionId = settings.get_string('session-id').trim();
-    if (sessionId) {
-        const stateFile = GLib.build_filenamev([
-            GLib.get_user_data_dir(),
-            'quick-chat',
-            'sessions',
-            `${sessionId}.qc.json`,
-        ]);
-        const stateObj = readJsonFile(stateFile);
-        if (stateObj && stateObj.remoteSessionId) {
-            stateObj.remoteSessionId = '';
-            try {
-                GLib.file_set_contents(stateFile, Encoder.encode(JSON.stringify(stateObj)));
-            } catch (_) {}
-        }
-    }
-}
-
-function readJsonFile(path) {
-    if (!path || !GLib.file_test(path, GLib.FileTest.EXISTS)) return null;
-    try {
-        const [ok, raw] = GLib.file_get_contents(path);
-        if (!ok || !raw) return null;
-        return JSON.parse(Decoder.decode(raw));
-    } catch (_) {
-        return null;
-    }
-}
-
-function readTextFile(path) {
-    if (!path || !GLib.file_test(path, GLib.FileTest.EXISTS)) return '';
-    try {
-        const [ok, raw] = GLib.file_get_contents(path);
-        return ok && raw ? Decoder.decode(raw) : '';
-    } catch (_) {
-        return '';
-    }
-}
-
-function detectEffectiveBackend(configuredBackend) {
-    if (configuredBackend && configuredBackend !== 'auto') return configuredBackend;
-    const home = GLib.get_home_dir();
-    const checkBin = name => Boolean(GLib.find_program_in_path(name));
-    if (checkBin('pi')) return 'pi';
-    if (GLib.file_test('/opt/ZCode/resources/glm/zcode.cjs', GLib.FileTest.EXISTS)) return 'zcode';
-    if (checkBin('codex') || GLib.file_test(GLib.build_filenamev([home, '.codex', 'config.toml']), GLib.FileTest.EXISTS)) {
-        return 'codex';
-    }
-    return 'zcode';
-}
-
-function loadLocalBackendCatalog(effectiveBackend) {
-    const home = GLib.get_home_dir();
-    if (effectiveBackend === 'zcode') {
-        const personalPath = GLib.build_filenamev([home, '.zcode', 'v2', 'provider_config.json']);
-        const builtinPath = '/opt/ZCode/resources/config/provider/zcode-builtin.json';
-        const personalObj = readJsonFile(personalPath);
-        const builtinObj = readJsonFile(builtinPath);
-        const cat = parseZCodeProviderCatalog(personalObj, builtinObj);
-        return {
-            backendLabel: 'ZCode CLI',
-            providers: cat.providers,
-        };
-    }
-
-    if (effectiveBackend === 'codex') {
-        const tomlPath = GLib.build_filenamev([home, '.codex', 'config.toml']);
-        const cachePath = GLib.build_filenamev([home, '.codex', 'models_cache.json']);
-        const cat = parseCodexProviderCatalog(readTextFile(tomlPath), readJsonFile(cachePath));
-        return {
-            backendLabel: 'Codex CLI',
-            providers: cat.providers,
-        };
-    }
-
-    if (effectiveBackend === 'pi') {
-        const piModelsPath = GLib.build_filenamev([home, '.pi', 'agent', 'models.json']);
-        const piObj = readJsonFile(piModelsPath);
-        const providers = [];
-        if (piObj && typeof piObj === 'object') {
-            for (const [k, v] of Object.entries(piObj.providers || piObj)) {
-                if (v && typeof v === 'object') {
-                    const models = Array.isArray(v.models)
-                        ? v.models.map(m => String(m?.id || m?.name || m || '').trim()).filter(Boolean)
-                        : [];
-                    providers.push({id: k, name: k, baseUrl: v.baseUrl || '', apiKey: '', models});
-                }
-            }
-        }
-        if (!providers.length) {
-            providers.push(
-                {id: 'anthropic', name: 'Anthropic', baseUrl: '', apiKey: '', models: ['claude-sonnet-4-5', 'claude-opus-4-5']},
-                {id: 'openai', name: 'OpenAI', baseUrl: '', apiKey: '', models: ['gpt-5', 'gpt-4.1', 'o3']},
-                {id: 'google', name: 'Google Gemini', baseUrl: '', apiKey: '', models: ['gemini-2.5-pro', 'gemini-2.5-flash']},
-                {id: 'deepseek', name: 'DeepSeek', baseUrl: '', apiKey: '', models: ['deepseek-chat', 'deepseek-reasoner']},
-            );
-        }
-        return {
-            backendLabel: 'Pi CLI',
-            providers,
-        };
-    }
-
-    return {
-        backendLabel: '自定义 OpenAI API',
-        providers: [],
-    };
-}
 
 function makeResetButton(tooltip, onClick) {
     const btn = new Gtk.Button({
@@ -163,7 +33,7 @@ function makeResetButton(tooltip, onClick) {
 export default class QuickChatPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const s = this.getSettings();
-        window.set_default_size(640, 680);
+        window.set_default_size(650, 720);
 
         // =====================================================================
         // Page 1: 模型与后端 (Models & Backends)
@@ -177,7 +47,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // --- Group 1: 后端引擎 ---
         const backendGroup = new Adw.PreferencesGroup({
             title: '后端引擎',
-            description: '选择对话使用的 AI 引擎，修改后在空闲时自动热更新。',
+            description: '选择对话使用的 AI 引擎，修改后在空闲时自动热更新（绝不篡改外部 CLI 全局配置文件）。',
         });
         modelPage.add(backendGroup);
 
@@ -199,7 +69,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // --- Group 2: 自定义 OpenAI API 连接配置 (仅在 openai 模式下显示) ---
         const openaiGroup = new Adw.PreferencesGroup({
             title: '自定义 OpenAI 接口连接',
-            description: '支持 OpenAI / DeepSeek / Ollama / 本地代理等标准 /v1/chat/completions 流式协议。',
+            description: '支持 OpenAI / DeepSeek / Ollama / 本地代理等标准 /v1/chat/completions 流式协议。API Key 加密保存在系统密钥环 (GNOME Keyring)。',
         });
         modelPage.add(openaiGroup);
 
@@ -211,10 +81,44 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         openaiGroup.add(baseUrlRow);
 
         const apiKeyRow = new Adw.PasswordEntryRow({
-            title: '接口密钥 (API Key)',
+            title: '接口密钥 (API Key · 密钥环加密存储)',
         });
-        s.bind('openai-api-key', apiKeyRow, 'text', Gio.SettingsBindFlags.DEFAULT);
         openaiGroup.add(apiKeyRow);
+
+        let syncingSecret = true;
+        let secretSaveTimer = 0;
+        let latestApiKeyDraft = '';
+
+        loadOpenAIApiKey(s).then(loadedKey => {
+            latestApiKeyDraft = loadedKey || '';
+            syncingSecret = true;
+            apiKeyRow.text = latestApiKeyDraft;
+            syncingSecret = false;
+        }).catch(() => {
+            syncingSecret = false;
+        });
+
+        apiKeyRow.connect('notify::text', () => {
+            if (syncingSecret) return;
+            latestApiKeyDraft = apiKeyRow.text.trim();
+            if (secretSaveTimer) {
+                try { GLib.source_remove(secretSaveTimer); } catch (_) {}
+            }
+            secretSaveTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
+                secretSaveTimer = 0;
+                storeOpenAIApiKey(s, latestApiKeyDraft).catch(() => {});
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+
+        window.connect('close-request', () => {
+            if (secretSaveTimer) {
+                try { GLib.source_remove(secretSaveTimer); } catch (_) {}
+                secretSaveTimer = 0;
+                storeOpenAIApiKey(s, latestApiKeyDraft).catch(() => {});
+            }
+            return false;
+        });
 
         const sysPromptRow = new Adw.EntryRow({
             title: '系统提示词 (System Prompt)',
@@ -223,10 +127,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         sysPromptRow.add_suffix(makeResetButton('恢复默认系统提示词', () => s.set_string('system-prompt', '')));
         openaiGroup.add(sysPromptRow);
 
-        // --- Group 3: Provider 与模型选择 (支持所有后端查询、下拉选择与手动修改) ---
+        // --- Group 3: Provider、模型选择与思考强度 ---
         const catalogGroup = new Adw.PreferencesGroup({
-            title: 'Provider 与模型选择',
-            description: '自动读取本机 CLI 配置或在线查询可用模型，支持下拉选择或下方手动输入。',
+            title: 'Provider、模型与思考强度',
+            description: '只读扫描本机 CLI 配置或在线查询可用模型，支持下拉选择或手动输入。',
         });
         modelPage.add(catalogGroup);
 
@@ -265,25 +169,234 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         }));
         catalogGroup.add(providerEntryRow);
 
+        const getEffectiveBackend = () => detectEffectiveBackend(
+            s.get_string('backend'),
+            s.get_string('pi-path'),
+            s.get_string('openai-base-url')
+        );
+        const getActiveModelKey = () => (getEffectiveBackend() === 'openai' ? 'openai-model' : 'model');
+
         const modelEntryRow = new Adw.EntryRow({
             title: '模型 ID (可手动修改)',
         });
         modelEntryRow.add_suffix(makeResetButton('恢复默认模型', () => {
-            const eff = detectEffectiveBackend(s.get_string('backend'));
-            if (eff === 'openai') s.set_string('openai-model', '');
+            if (getEffectiveBackend() === 'openai') s.set_string('openai-model', '');
             else s.set_string('model', '');
         }));
         catalogGroup.add(modelEntryRow);
 
-        // --- State & Synchronization for Provider / Model ---
+        const efforts = ['default', 'fast', 'standard', 'deep'];
+        const effortRow = new Adw.ComboRow({
+            title: '思考强度 (Reasoning Effort)',
+            subtitle: '日常问答建议使用默认或快速模式以获得更低的首字延迟',
+            model: Gtk.StringList.new([
+                '默认 (保持后端原有推理设置)',
+                '快速 · 日常简短问答 (Low)',
+                '标准 · 常规分析推理 (Medium)',
+                '深入 · 复杂多步任务 (High)',
+            ]),
+        });
+        effortRow.selected = Math.max(0, efforts.indexOf(s.get_string('reasoning-effort')));
+        effortRow.connect('notify::selected', () => {
+            s.set_string('reasoning-effort', efforts[effortRow.selected] || 'default');
+        });
+        catalogGroup.add(effortRow);
+
+        // =====================================================================
+        // Page 2: 界面与权限 (UI, Shortcuts & Agent Permissions)
+        // =====================================================================
+        const uiPage = new Adw.PreferencesPage({
+            title: '界面与权限',
+            icon_name: 'preferences-system-symbolic',
+        });
+        window.add(uiPage);
+
+        // --- Group 1: 全局快捷键与提醒 ---
+        const shortcutGroup = new Adw.PreferencesGroup({
+            title: '全局快捷键与完成提醒',
+            description: '支持在桌面任意位置一键呼出随问或直接针对剪贴板文本提问（留空可禁用快捷键）。',
+        });
+        uiPage.add(shortcutGroup);
+
+        const toggleShortcutRow = new Adw.EntryRow({
+            title: '呼出 / 收起随问面板快捷键 (如 <Super><Shift>q)',
+        });
+        toggleShortcutRow.text = (s.get_strv('toggle-shortcut') || [])[0] || '';
+        toggleShortcutRow.connect('notify::text', () => {
+            const val = toggleShortcutRow.text.trim();
+            s.set_strv('toggle-shortcut', val ? [val] : []);
+        });
+        toggleShortcutRow.add_suffix(makeResetButton('恢复默认 <Super><Shift>q', () => {
+            toggleShortcutRow.text = '<Super><Shift>q';
+        }));
+        shortcutGroup.add(toggleShortcutRow);
+
+        const clipShortcutRow = new Adw.EntryRow({
+            title: '剪贴板 / 选中内容随问快捷键 (如 <Super><Shift>y)',
+        });
+        clipShortcutRow.text = (s.get_strv('clipboard-shortcut') || [])[0] || '';
+        clipShortcutRow.connect('notify::text', () => {
+            const val = clipShortcutRow.text.trim();
+            s.set_strv('clipboard-shortcut', val ? [val] : []);
+        });
+        clipShortcutRow.add_suffix(makeResetButton('恢复默认 <Super><Shift>y', () => {
+            clipShortcutRow.text = '<Super><Shift>y';
+        }));
+        shortcutGroup.add(clipShortcutRow);
+
+        const notifyCompleteRow = new Adw.SwitchRow({
+            title: '后台生成完成时弹出桌面通知',
+            subtitle: '当收起顶部通知栏等待长回答时，生成结束后发送轻量提醒（不抢占焦点）',
+        });
+        s.bind('notify-on-complete', notifyCompleteRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+        shortcutGroup.add(notifyCompleteRow);
+
+        // --- Group 2: 通知栏面板与排版 ---
+        const uiGroup = new Adw.PreferencesGroup({
+            title: '通知栏面板与动效',
+            description: '定制顶部通知栏左栏尺寸、过渡动画及增量 Markdown 渲染。',
+        });
+        uiPage.add(uiGroup);
+
+        const tabs = ['ai', 'notifications'];
+        const tabRow = new Adw.ComboRow({
+            title: '默认打开标签',
+            subtitle: '进入桌面时通知栏左侧默认展示的页面',
+            model: Gtk.StringList.new(['✦ 随问 (AI 助手)', '通知 (系统消息)']),
+        });
+        tabRow.selected = Math.max(0, tabs.indexOf(s.get_string('default-tab')));
+        tabRow.connect('notify::selected', () => {
+            s.set_string('default-tab', tabs[tabRow.selected] || 'ai');
+        });
+        uiGroup.add(tabRow);
+
+        const widthRow = new Adw.SpinRow({
+            title: '面板宽度 (px)',
+            subtitle: '同时固定随问与通知栏宽度，防止切换标签时日历抖动',
+            adjustment: new Gtk.Adjustment({
+                lower: 340,
+                upper: 680,
+                step_increment: 10,
+                page_increment: 40,
+            }),
+        });
+        widthRow.value = s.get_int('panel-width');
+        widthRow.connect('notify::value', () => {
+            s.set_int('panel-width', Math.round(widthRow.value));
+        });
+        uiGroup.add(widthRow);
+
+        const heightRow = new Adw.SpinRow({
+            title: '对话区高度 (px)',
+            subtitle: '消息滚动区域的最大显示高度',
+            adjustment: new Gtk.Adjustment({
+                lower: 280,
+                upper: 640,
+                step_increment: 10,
+                page_increment: 40,
+            }),
+        });
+        heightRow.value = s.get_int('panel-height');
+        heightRow.connect('notify::value', () => {
+            s.set_int('panel-height', Math.round(heightRow.value));
+        });
+        uiGroup.add(heightRow);
+
+        const animRow = new Adw.SwitchRow({
+            title: '启用平滑过渡动画',
+            subtitle: '标签切换渐隐、消息气泡入场与平滑滚动动效',
+        });
+        s.bind('enable-animations', animRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+        uiGroup.add(animRow);
+
+        const mdRow = new Adw.SwitchRow({
+            title: '增量 Markdown 与代码块渲染',
+            subtitle: '流式冻结已完成段落，支持标题、粗斜体、列表及一键复制代码块',
+        });
+        s.bind('render-markdown', mdRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+        uiGroup.add(mdRow);
+
+        // --- Group 3: CLI Agent 权限、能力矩阵与资源回收 ---
+        const agentGroup = new Adw.PreferencesGroup({
+            title: 'CLI Agent 权限与环境',
+            description: '根据当前所选后端动态适配工具、沙箱与交互式审批能力。',
+        });
+        uiPage.add(agentGroup);
+
+        const modes = ['chat', 'readonly', 'full'];
+        const modeComboModel = Gtk.StringList.new([
+            '纯问答 (禁用本地工具)',
+            '智能审批 Agent (推荐 · 敏感工具气泡内审批)',
+            '全自动 Agent (免审批自动执行一切工具)',
+        ]);
+        const modeRow = new Adw.ComboRow({
+            title: 'Agent 权限模式',
+            model: modeComboModel,
+        });
+        modeRow.selected = Math.max(0, modes.indexOf(s.get_string('agent-mode')));
+        modeRow.connect('notify::selected', () => {
+            if (syncingModeCombo) return;
+            s.set_string('agent-mode', modes[modeRow.selected] || 'readonly');
+        });
+        agentGroup.add(modeRow);
+
+        const piIdleRow = new Adw.SpinRow({
+            title: 'Pi 常驻进程空闲回收 (分钟)',
+            subtitle: '仅对 Pi RPC 后端生效（0 表示常驻不回收；回收后下次发消息自动拉起并恢复会话）',
+            adjustment: new Gtk.Adjustment({
+                lower: 0,
+                upper: 60,
+                step_increment: 1,
+                page_increment: 5,
+            }),
+        });
+        piIdleRow.value = s.get_int('pi-idle-minutes');
+        piIdleRow.connect('notify::value', () => {
+            s.set_int('pi-idle-minutes', Math.round(piIdleRow.value));
+        });
+        agentGroup.add(piIdleRow);
+
+        const piPathRow = new Adw.EntryRow({
+            title: 'CLI 可执行路径 (默认 pi)',
+        });
+        s.bind('pi-path', piPathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
+        piPathRow.add_suffix(makeResetButton('恢复默认路径', () => s.set_string('pi-path', 'pi')));
+        agentGroup.add(piPathRow);
+
+        const workspaceRow = new Adw.EntryRow({
+            title: 'Agent 工作目录 (留空默认使用主目录 ~)',
+        });
+        s.bind('workspace', workspaceRow, 'text', Gio.SettingsBindFlags.DEFAULT);
+        workspaceRow.add_suffix(makeResetButton('恢复默认主目录', () => s.set_string('workspace', '')));
+        agentGroup.add(workspaceRow);
+
+        // =====================================================================
+        // State & Synchronization for Provider / Model / Backend Capabilities
+        // =====================================================================
         let currentCatalog = {backendLabel: '', providers: []};
         let providerValues = [''];
         let modelValues = [''];
         let onlineOpenAIModels = [];
         let syncingUi = false;
+        let syncingModeCombo = false;
 
-        const getEffectiveBackend = () => detectEffectiveBackend(s.get_string('backend'));
-        const getActiveModelKey = () => (getEffectiveBackend() === 'openai' ? 'openai-model' : 'model');
+        const syncBackendCapabilitiesUi = eff => {
+            const caps = getBackendCapabilities(eff);
+            const curModeIdx = Math.max(0, modes.indexOf(s.get_string('agent-mode')));
+            syncingModeCombo = true;
+            modeComboModel.splice(0, modeComboModel.get_n_items(), caps.modeLabels);
+            modeRow.selected = curModeIdx;
+            syncingModeCombo = false;
+
+            modeRow.sensitive = caps.supportsTools;
+            if (!caps.supportsTools) {
+                modeRow.subtitle = '当前自定义 OpenAI API 仅使用标准 HTTP 对话流，不挂载本机工具或文件权限';
+            } else if (caps.supportsApproval) {
+                modeRow.subtitle = '支持按命令/域名/文件粒度分级审批，高危破坏性命令禁止会话级一键放行';
+            } else {
+                modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 使用 CLI 沙箱/白名单策略控制权限，不支持会话内交互弹窗审批`;
+            }
+        };
 
         const autoRepairSwappedProviderAndModel = providers => {
             const curProv = s.get_string('provider').trim();
@@ -372,6 +485,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             providerComboRow.visible = !isOpenAI;
             providerEntryRow.visible = !isOpenAI;
 
+            syncBackendCapabilitiesUi(eff);
+
             currentCatalog = loadLocalBackendCatalog(eff);
             if (!isOpenAI) {
                 autoRepairSwappedProviderAndModel(currentCatalog.providers);
@@ -413,18 +528,16 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     ? `自定义 API：已在线拉取 ${onlineOpenAIModels.length} 个可选模型。`
                     : '自定义 API：点击右上角「查询 / 刷新模型」可从 /v1/models 拉取在线模型列表。';
             } else {
-                catalogGroup.description = `${currentCatalog.backendLabel}：已发现 ${currentCatalog.providers.length} 个 Provider、${totalModels} 个预设模型。`;
+                catalogGroup.description = `${currentCatalog.backendLabel}：已只读扫描到 ${currentCatalog.providers.length} 个 Provider、${totalModels} 个预设模型。`;
             }
         };
 
-        // Events for Dropdowns & Manual Entries
         backendRow.connect('notify::selected', () => {
             const next = backends[backendRow.selected] || 'auto';
             if (s.get_string('backend') !== next) {
                 s.set_string('backend', next);
             }
             rebuildProviderAndModelUi();
-        applyModelSelectionSideEffects(s);
         });
 
         providerComboRow.connect('notify::selected', () => {
@@ -433,7 +546,6 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const val = idx >= 0 && idx < providerValues.length ? providerValues[idx] : '';
             if (s.get_string('provider') !== val) {
                 s.set_string('provider', val);
-                applyModelSelectionSideEffects(s);
             }
             syncingUi = true;
             if (providerEntryRow.text !== val) providerEntryRow.text = val;
@@ -449,7 +561,6 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             if (s.get_string(key) !== val) {
                 s.set_string(key, val);
             }
-            // If user picked a model in ZCode/Codex and provider was empty or mismatched, auto-select its owning provider
             if (val && getEffectiveBackend() !== 'openai') {
                 const curProv = s.get_string('provider').trim();
                 const currentProvObj = currentCatalog.providers.find(p => p.id === curProv);
@@ -460,9 +571,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     }
                 }
             }
-            applyModelSelectionSideEffects(s);
             rebuildProviderAndModelUi();
-        applyModelSelectionSideEffects(s);
         });
 
         providerEntryRow.connect('notify::text', () => {
@@ -470,9 +579,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const val = providerEntryRow.text.trim();
             if (s.get_string('provider') !== val) {
                 s.set_string('provider', val);
-                applyModelSelectionSideEffects(s);
                 rebuildProviderAndModelUi();
-        applyModelSelectionSideEffects(s);
             }
         });
 
@@ -482,13 +589,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const key = getActiveModelKey();
             if (s.get_string(key) !== val) {
                 s.set_string(key, val);
-                applyModelSelectionSideEffects(s);
                 rebuildModelDropdown();
             }
         });
 
-        // Live Query / Refresh Button (queries local configs AND remote /v1/models if available)
-        refreshBtn.connect('clicked', () => {
+        refreshBtn.connect('clicked', async () => {
             const eff = getEffectiveBackend();
             currentCatalog = loadLocalBackendCatalog(eff);
 
@@ -498,7 +603,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
             if (eff === 'openai') {
                 targetBaseUrl = s.get_string('openai-base-url').trim();
-                targetApiKey = s.get_string('openai-api-key').trim();
+                targetApiKey = latestApiKeyDraft || (await loadOpenAIApiKey(s));
             } else {
                 const curProv = s.get_string('provider').trim();
                 targetProviderObj = (curProv && currentCatalog.providers.find(p => p.id === curProv))
@@ -574,117 +679,5 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
 
         rebuildProviderAndModelUi();
-        applyModelSelectionSideEffects(s);
-
-        // =====================================================================
-        // Page 2: 界面与权限 (UI & Agent Permissions)
-        // =====================================================================
-        const uiPage = new Adw.PreferencesPage({
-            title: '界面与权限',
-            icon_name: 'preferences-system-symbolic',
-        });
-        window.add(uiPage);
-
-        // --- Group 1: 通知栏面板与排版 ---
-        const uiGroup = new Adw.PreferencesGroup({
-            title: '通知栏面板与动效',
-            description: '定制顶部通知栏左栏尺寸、过渡动画及 Markdown 富文本渲染。',
-        });
-        uiPage.add(uiGroup);
-
-        const tabs = ['ai', 'notifications'];
-        const tabRow = new Adw.ComboRow({
-            title: '默认打开标签',
-            subtitle: '进入桌面时通知栏左侧默认展示的页面',
-            model: Gtk.StringList.new(['✦ 随问 (AI 助手)', '通知 (系统消息)']),
-        });
-        tabRow.selected = Math.max(0, tabs.indexOf(s.get_string('default-tab')));
-        tabRow.connect('notify::selected', () => {
-            s.set_string('default-tab', tabs[tabRow.selected] || 'ai');
-        });
-        uiGroup.add(tabRow);
-
-        const widthRow = new Adw.SpinRow({
-            title: '面板宽度 (px)',
-            subtitle: '同时固定随问与通知栏宽度，防止切换标签时日历抖动',
-            adjustment: new Gtk.Adjustment({
-                lower: 340,
-                upper: 680,
-                step_increment: 10,
-                page_increment: 40,
-            }),
-        });
-        widthRow.value = s.get_int('panel-width');
-        widthRow.connect('notify::value', () => {
-            s.set_int('panel-width', Math.round(widthRow.value));
-        });
-        uiGroup.add(widthRow);
-
-        const heightRow = new Adw.SpinRow({
-            title: '对话区高度 (px)',
-            subtitle: '消息滚动区域的最大显示高度',
-            adjustment: new Gtk.Adjustment({
-                lower: 280,
-                upper: 640,
-                step_increment: 10,
-                page_increment: 40,
-            }),
-        });
-        heightRow.value = s.get_int('panel-height');
-        heightRow.connect('notify::value', () => {
-            s.set_int('panel-height', Math.round(heightRow.value));
-        });
-        uiGroup.add(heightRow);
-
-        const animRow = new Adw.SwitchRow({
-            title: '启用平滑过渡动画',
-            subtitle: '标签切换渐隐、消息气泡入场与平滑滚动动效',
-        });
-        s.bind('enable-animations', animRow, 'active', Gio.SettingsBindFlags.DEFAULT);
-        uiGroup.add(animRow);
-
-        const mdRow = new Adw.SwitchRow({
-            title: 'Markdown 与代码块渲染',
-            subtitle: '渲染标题、粗斜体、列表及带一键复制按钮的代码块',
-        });
-        s.bind('render-markdown', mdRow, 'active', Gio.SettingsBindFlags.DEFAULT);
-        uiGroup.add(mdRow);
-
-        // --- Group 2: CLI Agent 权限与路径 ---
-        const agentGroup = new Adw.PreferencesGroup({
-            title: 'CLI Agent 权限与环境',
-            description: '仅在使用 ZCode / Codex / Pi 等本机 CLI 引擎时生效。',
-        });
-        uiPage.add(agentGroup);
-
-        const modes = ['chat', 'readonly', 'full'];
-        const modeRow = new Adw.ComboRow({
-            title: 'Agent 权限模式',
-            subtitle: '智能审批模式支持联网、终端与文件工具，敏感操作在对话气泡内弹窗审批',
-            model: Gtk.StringList.new([
-                '纯问答 (禁用本地工具)',
-                '智能审批 Agent (推荐 · 敏感操作弹窗审批)',
-                '全自动 Agent (免审批自动执行一切工具)',
-            ]),
-        });
-        modeRow.selected = Math.max(0, modes.indexOf(s.get_string('agent-mode')));
-        modeRow.connect('notify::selected', () => {
-            s.set_string('agent-mode', modes[modeRow.selected] || 'readonly');
-        });
-        agentGroup.add(modeRow);
-
-        const piPathRow = new Adw.EntryRow({
-            title: 'CLI 可执行路径 (默认 pi)',
-        });
-        s.bind('pi-path', piPathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
-        piPathRow.add_suffix(makeResetButton('恢复默认路径', () => s.set_string('pi-path', 'pi')));
-        agentGroup.add(piPathRow);
-
-        const workspaceRow = new Adw.EntryRow({
-            title: 'Agent 工作目录 (留空默认使用主目录 ~)',
-        });
-        s.bind('workspace', workspaceRow, 'text', Gio.SettingsBindFlags.DEFAULT);
-        workspaceRow.add_suffix(makeResetButton('恢复默认主目录', () => s.set_string('workspace', '')));
-        agentGroup.add(workspaceRow);
     }
 }

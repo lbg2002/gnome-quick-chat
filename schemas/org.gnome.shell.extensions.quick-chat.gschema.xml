@@ -37,6 +37,27 @@
       <default>'readonly'</default>
       <summary>Agent permission mode (chat, readonly, full)</summary>
     </key>
+    <key name="reasoning-effort" type="s">
+      <default>'default'</default>
+      <summary>Thinking / reasoning effort (default, fast, standard, deep)</summary>
+    </key>
+    <key name="pi-idle-minutes" type="i">
+      <range min="0" max="60"/>
+      <default>5</default>
+      <summary>Minutes before reclaiming idle Pi RPC process (0 = never reclaim while enabled)</summary>
+    </key>
+    <key name="toggle-shortcut" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;q']</default>
+      <summary>Global shortcut to open DateMenu and focus Quick Chat</summary>
+    </key>
+    <key name="clipboard-shortcut" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;y']</default>
+      <summary>Global shortcut to open Quick Chat with clipboard content</summary>
+    </key>
+    <key name="notify-on-complete" type="b">
+      <default>false</default>
+      <summary>Send subtle desktop notification when background generation completes while panel is closed</summary>
+    </key>
     <key name="workspace" type="s">
       <default>''</default>
       <summary>Custom workspace path</summary>

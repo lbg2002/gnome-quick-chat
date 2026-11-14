@@ -2,15 +2,15 @@
 
 # ✦ Quick Chat · 随问 (`gnome-quick-chat`)
 
-**专为 Ubuntu 26.04 / GNOME Shell 50 打造的系统通知栏原生 AI 随问与 Agent 工具助手**
+**专为 Ubuntu 26.04 / GNOME Shell 50 打造的系统通知栏原生 AI 随问与轻量 Agent 助手**
 
 [![GNOME Shell](https://img.shields.io/badge/GNOME_Shell-50-4a86cf?logo=gnome&logoColor=white)](https://www.gnome.org/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-26.04_LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
-[![Backends](https://img.shields.io/badge/Engines-ZCode_%7C_Codex_%7C_Pi_%7C_OpenAI_API-2ec27e)](#3-四大智能后端与模型自动发现)
-[![Tests](https://img.shields.io/badge/Unit_Tests-9_Passed-success)](#7-开发与测试)
+[![Backends](https://img.shields.io/badge/Engines-ZCode_%7C_Codex_%7C_Pi_%7C_OpenAI_API-2ec27e)](#3-四大智能后端与能力矩阵)
+[![Tests](https://img.shields.io/badge/Unit_&_State_Tests-14_Passed-success)](#8-模块化架构开发与测试)
 
-点击屏幕顶部中央的「时间 / 日期」，即可在原有通知栏左栏无缝切换 **「✦ 随问 | 通知」**，右侧原生日历与世界时钟保持原样。  
-纯原生 `GJS` / `St` / `Clutter` 构建，**零 WebView 内存开销**，支持 **Markdown 代码块渲染**、**横向彩色小圆点工具轨迹**与**敏感工具交互式审批**。
+点击屏幕顶部中央的「时间 / 日期」（或按下全局快捷键 **`Super + Shift + Q`**），即可在通知栏左栏无缝切换 **「✦ 随问 | 通知」**，右侧原生日历与世界时钟保持原样。  
+纯原生 `GJS` / `St` / `Clutter` 构建，**零 WebView 内存开销**、**增量流式 Markdown 渲染不阻塞 GNOME Shell 主线程**，支持**面板内一键切换模型/思考强度**、**剪贴板随问 (`Super + Shift + Y`)**、**横向彩色小圆点轨迹**与**按命令/域名/文件范围隔离的分级工具审批**。
 
 <br/>
 
@@ -23,69 +23,66 @@
 ## 目录
 
 1. [核心特性一览](#1-核心特性一览)
-2. [横向彩色小圆点轨迹与交互式工具审批](#2-横向彩色小圆点轨迹与交互式工具审批)
-3. [四大智能后端与模型自动发现](#3-四大智能后端与模型自动发现)
+2. [横向彩色小圆点轨迹与分级工具审批](#2-横向彩色小圆点轨迹与分级工具审批)
+3. [四大智能后端与能力矩阵](#3-四大智能后端与能力矩阵)
 4. [真实桌面运行实拍](#4-真实桌面运行实拍)
-5. [系统架构与双向审批时序](#5-系统架构与双向审批时序)
-6. [快速安装与配置指南](#6-快速安装与配置指南)
-7. [快捷键与交互技巧](#7-快捷键与交互技巧)
-8. [开发与测试](#8-开发与测试)
+5. [桌面流畅性、会话状态机与安全边界设计](#5-桌面流畅性会话状态机与安全边界设计)
+6. [快速安装、打包与配置指南](#6-快速安装打包与配置指南)
+7. [全局快捷键与交互技巧](#7-全局快捷键与交互技巧)
+8. [模块化架构、开发与测试](#8-模块化架构开发与测试)
 
 ---
 
 ## 1. 核心特性一览
 
-* **🎨 原生 GNOME 50 界面与丝滑 Clutter 动效**
-  * **双标签无缝融合**：在通知栏左侧提供 `✦ 随问` 与 `通知` 分段胶囊切换，实时汇总系统未读通知角标；主动解除 GNOME 50 `DateMenuLayout` 冻结，确保首次展开、切换标签与流式输出时右侧日历零抖动。
-  * **微交互动画**：支持标签切换渐隐位移动画、消息气泡入场回弹、状态指示灯呼吸脉冲、平滑滚动以及底端悬浮圆形「`↓` 回到底部」按钮。
-  * **深浅色自适应**：实时监听 `org.gnome.desktop.interface` 主题切换，自动适配 Ubuntu 深色与浅色模式。
-* **🟢 横向彩色小圆点轨迹栏 (`Trace Dots`) + 按需折叠抽屉**
-  * 将「深度思考」「工具调用」与「权限审批」浓缩为标题下方仅 20px 高的**单行横向彩色小圆点**：
-    * **灰色小圆 (`●`)**：代表模型深度思考过程，点击即可展开/收起推理链路；
-    * **绿色小圆 (`●`)**：代表已批准或已执行完成的工具调用，每个工具对应一个独立小圆，点击可查看具体请求 URL、命令参数与耗时；
-    * **橙黄小圆 (`●`)**：代表待审批的敏感工具调用，自动弹出审批按钮，点击允许后**立即自动收拢为绿色小圆**，不挤占正文空间；
-    * **红色小圆 (`●`)**：代表已拒绝或执行报错的工具调用。
-* **📝 结构化 Markdown 与独立代码块卡片**
-  * 基于安全转义的 Pango Markup + `St.BoxLayout` 渲染标题、粗斜体、行内代码、列表、分割线，以及带语言标识和一键「复制代码（`✓ 已复制`）」按钮的独立代码块。
-* **🔌 四大后端引擎 + Provider/模型自动探测**
-  * 支持 **ZCode CLI**、**Codex CLI**、**Pi CLI** 以及 **自定义 OpenAI 兼容接口（OpenAI / DeepSeek / Ollama / vLLM / 本地代理）**。
-  * Libadwaita 首选项窗口自动扫描本机配置文件中的 Provider 与模型列表生成下拉框，并支持一键请求 `/v1/models` 在线测速与拉取模型。
+* **⚡ 面向 GNOME Shell 进程级流畅性的增量流式渲染**
+  * **冻结块增量 Markdown 引擎 (`ui/markdownRenderer.js`)**：流式输出时已完成段落与代码块固定不重建，仅原地刷新末尾活动块；长文多代码块回答零闪烁，流式中复制前序代码块的反馈状态不被打断。
+  * **脏标记按需刷新 + 隐藏态零重排**：区分 `dirty = {text, thinking, tools}` 与动态节流间隔；当通知栏关闭或处于「通知」标签时自动暂停 UI 排版，仅在 `✦ 随问` 标签上点亮状态圆点并在重新打开时一次性刷新。
+* **⌨️ 随手即达的桌面级快捷体验**
+  * **全局唤醒 (`Super + Shift + Q`)**：在任意窗口一键呼出或收起通知栏随问面板并自动聚焦输入框。
+  * **剪贴板 / 选中内容随问 (`Super + Shift + Y` 或面板 `📋` 按钮)**：自动读取系统剪贴板或主选区内容填入提问框，报错分析、翻译润色一步到位。
+  * **面板内一键切换模型与思考强度**：点击随问状态栏模型名称（`▾`），无需打开设置窗口即可就地切换引擎、模型与思考强度（`默认 / 快 / 标准 / 深入`）。
+* **🟢 横向彩色小圆点轨迹栏 (`Trace Dots`) + 确认式分级审批**
+  * 将「深度思考」「工具调用」与「权限审批」浓缩为标题下方仅 20px 高的单行横向圆点：
+    * **灰色小圆 (`●`)**：模型深度思考过程，点击展开/收起推理链路；
+    * **橙黄小圆 (`●`)**：待审批或正在发送授权确认的工具调用；
+    * **青绿小圆 (`●`)**：已确认送达授权或正在运行中的工具；
+    * **翠绿小圆 (`●`)**：收到 `tool_execution_end` 真正执行完成的工具（点击查看参数与耗时）；
+    * **红色小圆 (`●`)**：用户已拒绝或执行异常（含非零退出码）的工具调用。
+* **🔐 严格的权限与配置安全边界**
+  * **绝不篡改外部全局配置**：只读解析 `~/.zcode/v2/provider_config.json` 与 `~/.codex/config.toml`；ZCode 模型覆盖仅通过 `$XDG_RUNTIME_DIR/gnome-quick-chat` 下权限 `0600` 的每轮独立临时文件注入，并在回合结束时自动清理。
+  * **GNOME Keyring 密钥环加密存储**：自定义 OpenAI API Key 通过 `libsecret` (`gi://Secret`) 加密存入系统密钥环，自动迁移并清空旧版明文配置。
+  * **细粒度会话授权规则**：会话级放行严格绑定到具体命令（`Bash:cmd:<cmd>`）、目标域名（`WebFetch:host:<host>`）或目标文件（`Edit:file:<path>`）；对 `rm -rf`、`sudo`、`dd`、`mkfs` 及 `/etc/` 写入等高危操作**强制禁用会话级一键放行**。
 
 ---
 
-## 2. 横向彩色小圆点轨迹与交互式工具审批
-
-为了在紧凑的通知栏空间内兼顾强大的 Agent 工具能力（联网搜索/抓取、本地文件检索、终端命令执行）与清爽的阅读体验，**随问**设计了三态折叠小圆点交互：
+## 2. 横向彩色小圆点轨迹与分级工具审批
 
 <div align="center">
   <img src="docs/assets/trace-dots-interaction.svg" alt="横向彩色小圆点轨迹与折叠审批交互" width="96%"/>
 </div>
 
-| 圆点颜色 | 状态含义 | 鼠标悬停 (`Hover`) | 鼠标点击 (`Click`) |
+| 圆点颜色 | 状态机阶段 | 鼠标悬停 (`Hover`) | 鼠标点击 / 状态流转 |
 | :---: | :--- | :--- | :--- |
-| **⚪ 灰色小圆** | 模型深度思考 (`Thinking`) | 同行提示显示「思考过程（点击展开）」 | 展开/收起完整思考推理文本 |
-| **🟢 绿色小圆** | 工具已批准 / 执行完成 | 同行实时预览工具名与请求摘要（如 `WebFetch: https://...`） | 展开/收起该工具的完整参数、状态与耗时 |
-| **🟡 橙黄小圆** | 敏感工具等待用户授权 | 显示 `⚠️ 待审批: <工具名>` | 自动展开 `✓ 允许本次` / `✓ 始终允许` / `✕ 拒绝` 按钮；点选后自动收起并转为绿/红圆 |
-| **🔴 红色小圆** | 用户已拒绝 / 工具执行报错 | 显示工具名与错误摘要 | 展开查看拒绝记录或详细报错信息 |
+| **⚪ 灰色小圆** | `thinking` | 同行提示显示「思考过程（点击展开）」 | 展开/收起完整思考推理文本（折叠时流式追加不触发正文重绘） |
+| **🟡 橙黄小圆** | `pending_approval` / `sending_approval` | 显示 `⚠️ 待审批: <工具名>` | 展开审批抽屉；点击后先进入 `sending_approval` 校验管道写回，若未送达则保留抽屉提示重试 |
+| **🟢 青绿/翠绿** | `running` → `done` | 实时预览工具名与请求摘要 | 授权送达后先进入 `running`，待工具真实返回 `tool_execution_end` 后方转为完成态 |
+| **🔴 红色小圆** | `denied` / `error` | 显示工具名与异常摘要 | 展开查看拒绝记录、退出码或错误详情 |
 
 ---
 
-## 3. 四大智能后端与模型自动发现
+## 3. 四大智能后端与能力矩阵
 
-在 `gnome-extensions prefs quick-chat@lbg2002.github.io` 设置面板中，采用清晰的双分页 Libadwaita 布局（**「模型与引擎」** + **「界面与权限」**）：
+在 `gnome-extensions prefs quick-chat@lbg2002.github.io` 设置面板中，根据当前生效后端自动同步真实能力说明：
 
-| 后端引擎 | 适用场景 | 本地配置自动扫描路径 | 工具与会话能力 |
-| :--- | :--- | :--- | :--- |
-| **ZCode CLI** (`zcode`) | 本机安装 ZCode 桌面端或 CLI | `~/.zcode/config/provider/personal.json` | 通过 `zcodeBridge.cjs` 预加载实现无头模式交互式工具审批，支持 `--resume` 多轮会话续接 |
-| **Codex CLI** (`codex`) | 本机安装 OpenAI Codex CLI | `~/.codex/config.toml`、`~/.codex/models_cache.json` | 支持 `codex exec resume` 多轮会话及沙箱权限控制 |
-| **Pi CLI** (`pi`) | 本机安装 Pi Coding Agent | CLI 默认环境与自定义参数 | 常驻 `pi --mode rpc` 双向 JSON-RPC 流与工具白名单 |
-| **自定义 OpenAI API** (`openai`) | 直连 OpenAI / DeepSeek / Ollama / 本地代理 | 支持任意标准 `/v1/chat/completions` 接口 | 基于 `Soup 3.0` 原生 SSE 流式解析（含 `reasoning_content` 思考流），无需安装任何 CLI |
+| 后端引擎 | 工具执行 | 气泡内交互审批 | 多轮会话续接 | 思考流展示 | 权限与隔离实现 |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **ZCode CLI** (`zcode`) | ✓ | ✓ (分级范围规则) | ✓ (`--resume`) | ✓ | `zcodeBridge.cjs` 握手校验 (`protocolVersion: 1`) + `0600` 临时配置沙箱 |
+| **Codex CLI** (`codex`) | ✓ | — (CLI 沙箱策略) | ✓ (`exec resume`) | ✓ | 原生 `read-only` / `danger-full-access` 沙箱，支持并发 `item.id` 与退出码追踪 |
+| **Pi CLI** (`pi`) | ✓ | — (工具白名单) | ✓ (`--session-id`) | ✓ | 常驻 JSON-RPC 流 + 显式工具白名单 + 默认 5 分钟空闲进程自动回收 |
+| **OpenAI API** (`openai`) | — | — | ✓ (字符预算裁剪) | ✓ (`reasoning_content`) | `Soup 3.0` 原生 SSE 流（含非正常中断检测）+ GNOME Keyring 密钥存储 |
 
-### 三档 Agent 权限模式
-
-1. **纯问答 (`chat`)**：禁用本地工具，适合极速日常问答。
-2. **智能审批 Agent (`readonly`，默认推荐)**：完整开放联网抓取 (`WebFetch` / `WebSearch`)、本地文件检索 (`Read` / `Glob` / `Grep`)、终端命令 (`Bash`) 与技能 (`Skill` / `MCP`)；只读操作自动执行，敏感或外部操作通过小圆点抽屉由您交互式审批。
-3. **全自动 Agent (`full`)**：免审批自动执行一切工具（对应 ZCode `--mode yolo` / Codex `danger-full-access`），请仅在受控可信任务中开启。
+> **跨后端无缝续接**：当在同一对话中途切换模型或 CLI 引擎时，`SessionStore` 会通过完整模型签名 (`backend + provider + model + baseUrl`) 自动识别变更，并在新后端首轮提问时按字符预算自动注入近期上下文摘要，避免误恢复旧引擎会话 ID。
 
 ---
 
@@ -101,73 +98,69 @@
     <td width="50%" align="center">
       <img src="docs/assets/screenshot-markdown-code.jpg" alt="Markdown 与独立代码块渲染" width="100%"/>
       <br/>
-      <sub><b>图 2：思考过程折叠、Markdown 富文本排版与独立代码块一键复制</b></sub>
+      <sub><b>图 2：思考过程折叠、增量 Markdown 富文本排版与独立代码块一键复制</b></sub>
     </td>
   </tr>
 </table>
 
 ---
 
-## 5. 系统架构与双向审批时序
+## 5. 桌面流畅性、会话状态机与安全边界设计
 
 <div align="center">
   <img src="docs/assets/architecture.svg" alt="Quick Chat 系统架构图" width="96%"/>
 </div>
 
-### ZCode 无头模式交互式权限桥接原理 (`zcodeBridge.cjs`)
+### 统一回合状态机 (`core/turnController.js`)
 
-ZCode CLI 在 `-p --output-format stream-json` 无头模式下默认使用 `DenyPermissionBroker` 自动拒绝一切需授权的工具。本项目通过 Node `--require` 预加载 [zcodeBridge.cjs](zcodeBridge.cjs)，在进程启动期热替换 `DenyPermissionBroker.prototype.requestPermission`，打通 `stdout` 权限请求事件与 `stdin` 实时审批回执：
+每一轮请求均拥有独立的 `TurnContext`（独立 `turnId`、`Gio.Cancellable`、子进程句柄、临时文件列表与超时看门狗），严格遵循单次幂等结算：
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant User as 用户 (GNOME 通知栏)
-    participant Ext as extension.js (随问 UI)
-    participant Client as piClient.js (GJS 管道)
-    participant Bridge as zcodeBridge.cjs (预加载桥)
-    participant ZCode as ZCode CLI 核心引擎
-
-    User->>Ext: 输入问题（如“上网查今日紫金矿业股价”）
-    Ext->>Client: request("prompt", {message})
-    Client->>ZCode: 启动子进程 (node --require zcodeBridge.cjs zcode.cjs)
-    ZCode->>Bridge: 调用 WebFetch 触发 requestPermission()
-    Bridge-->>Client: stdout 输出 quickchat.permission_requested
-    Note over Client: 暂停 120s 超时看门狗，等待用户操作
-    Client-->>Ext: 归一化 permission_request 事件
-    Ext->>User: 点亮橙黄小圆 ● 并自动展开 [✓ 允许本次 | ✓ 始终允许 | ✕ 拒绝]
-    User->>Ext: 点击「✓ 允许本次」
-    Ext->>Ext: 审批框立即收起，小圆变为绿色 ●
-    Ext->>Client: request("permission_response", {decision: "allow"})
-    Client->>Bridge: stdin 写入 JSON 审批指令
-    Bridge->>ZCode: resolve({decision: "allow"}) 放行工具
-    ZCode-->>Client: 执行 WebFetch 并流式输出回答 (model.streaming)
-    Client-->>Ext: 实时渲染 Markdown 回答正文
+stateDiagram-v2
+    [*] --> starting: beginTurn()
+    starting --> streaming: markStreaming()
+    streaming --> awaiting_approval: enterApproval() 暂停看门狗
+    awaiting_approval --> streaming: leaveApproval() 恢复 120s 看门狗
+    starting --> cancelling: cancelActiveTurn()
+    streaming --> cancelling: cancelActiveTurn()
+    awaiting_approval --> cancelling: cancelActiveTurn()
+    cancelling --> completed: 幂等 finalizeTurn(aborted=true)
+    streaming --> completed: 正常结束 / 完整 [DONE]
+    streaming --> failed: 网络异常 / 超时 / 截断检测
 ```
+
+* **彻底杜绝取消后串流**：停止请求 A 后立即发送请求 B 时，A 的延迟异步回调因 `isCurrent(turnA) === false` 被严格丢弃，绝不污染请求 B 的卡片、取消器或会话落盘。
+* **优雅进程回收**：取消或关闭时优先发送 `SIGTERM` 等待子进程在 800ms 内清理子任务，超时后再回退 `SIGKILL`。
+* **异步追加式会话存储 (`core/sessionStore.js`)**：采用 `meta.json` + 追加式 `messages.jsonl` 异步写入（自动平滑迁移旧版 `.qc.json`），首屏仅分页挂载最近 24 条消息并提供顶部「`↑ 加载更早对话`」按需回溯。
 
 ---
 
-## 6. 快速安装与配置指南
+## 6. 快速安装、打包与配置指南
 
 ### 环境要求
 
-* **操作系统与桌面**：Ubuntu 26.04 LTS（或任何搭载 **GNOME Shell 50** 的 Linux 发行版）
-* **基础依赖**：`glib-compile-schemas`（Ubuntu 可通过 `sudo apt install libglib2.0-bin` 安装）
+* **桌面环境**：Ubuntu 26.04 LTS（或搭载 **GNOME Shell 50** 的 Linux 发行版）
+* **基础依赖**：`gjs`、`glib-compile-schemas`、`gir1.2-soup-3.0`（Ubuntu 26.04 默认已预装）
 * **智能后端（四选一即可）**：`ZCode`、`Codex CLI`、`Pi CLI`，或任意 **OpenAI 兼容 API 地址**
 
-### 一键安装
+### 原子化一键安装
 
 ```bash
 git clone https://github.com/lbg2002/gnome-quick-chat.git
 cd gnome-quick-chat
-bash install.sh
+./install.sh
 ```
 
-> **提示**：
-> 1. `install.sh` 会自动编译 GSettings Schema、复制扩展文件至 `~/.local/share/gnome-shell/extensions/quick-chat@lbg2002.github.io` 并写入启用列表。
-> 2. 在 **Wayland** 会话下，首次安装或更新 `extension.js` 后，请**注销并重新登录一次桌面**以让 GNOME Shell 进程加载扩展。
-> 3. 登录后点击屏幕顶部中间的**日期/时间**，即可在左侧看到 **「✦ 随问 | 通知」**。
+> `install.sh` 会在临时暂存目录完成全量文件装配与 `glib-compile-schemas --strict` 校验后再原子替换目标目录。Wayland 会话下首次安装或更新扩展代码后，请**注销并重新登录一次桌面**生效。
 
-### 打开设置窗口
+### 生成标准 GNOME 扩展压缩包
+
+```bash
+./pack.sh
+# 输出：dist/quick-chat@lbg2002.github.io.shell-extension.zip
+```
+
+### 打开设置中心
 
 点击随问面板右上角的 **「⚙」** 按钮，或在终端执行：
 
@@ -177,55 +170,68 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 
 ---
 
-## 7. 快捷键与交互技巧
+## 7. 全局快捷键与交互技巧
 
 | 操作 / 快捷键 | 功能说明 |
 | :--- | :--- |
-| **`Enter`** | 发送当前输入框中的问题 |
-| **`Shift + Enter`** | 在输入框内换行 |
-| **`↑` / `↓` 方向键** | 当输入框为空或正在浏览历史时，快速回溯上/下一条历史提问 |
-| **`Esc`** | 当模型正在思考或生成回答时，立即中止当前生成请求 |
-| **`Ctrl + N` / `Ctrl + L`** | 在空闲状态下快速开启新对话并清空上下文 |
-| **点击彩色小圆点 (`●`)** | 展开/切换查看模型思考过程（灰圆）或某次工具调用详情（绿/黄/红圆），再次点击收起 |
-| **向上滚动阅读长文** | 自动锁定视口防止流式输出强制跳底，并在底部中央浮现圆形 `↓` 按钮，点击一键回到底部 |
+| **`Super + Shift + Q`** | **全局呼出 / 收起**通知栏「✦ 随问」面板并自动聚焦输入框（可在设置中自定义） |
+| **`Super + Shift + Y`** | **剪贴板 / 选中内容随问**：自动唤醒面板并带入剪贴板或主选区文本 |
+| **点击状态栏模型名 (`▾`)** | 展开面板内**快速切换栏**，一键切换引擎、模型与思考强度（默认/快/标准/深入） |
+| **`Enter` / `Shift + Enter`** | 发送当前问题 / 在输入框内换行 |
+| **`↑` / `↓` 方向键** | 快速回溯上 / 下一条历史提问 |
+| **`Esc`** | 正在思考或生成时，立即安全中止当前回合 |
+| **`Ctrl + N` / `Ctrl + L`** | 空闲状态下快速开启新对话 |
+| **消息右上角 `↻`** | 一键重新生成该轮回答 |
 
 ---
 
-## 8. 开发与测试
+## 8. 模块化架构、开发与测试
 
-项目核心文件结构清晰，所有协议转换、Provider/模型目录解析与 Pango Markdown 转换均解耦在纯函数模块 [protocol.js](protocol.js) 中，便于独立运行单元测试：
+项目按职责清晰拆分为 UI 适配层、核心状态与存储层、纯函数协议层与桥接脚本：
 
 ```text
 .
-├── extension.js          # GNOME Shell 50 DateMenu 界面、动画、横向小圆点轨迹与交互逻辑
-├── piClient.js           # 多后端进程生命周期、PATH 探测、ZCode 配置沙箱与 Soup 3.0 SSE 客户端
-├── protocol.js           # 协议归一化、Provider/模型目录解析、Pango Markdown 与代码块解析器
-├── zcodeBridge.cjs       # ZCode CLI 无头模式双向权限审批预加载桥接脚本
-├── prefs.js              # Libadwaita 双分页设置中心（支持本地配置扫描与 /v1/models 在线拉取）
-├── stylesheet.css        # 深浅色自适应样式、小圆点状态配色与气泡样式
-├── metadata.json         # GNOME Shell 扩展元数据
-├── schemas/              # GSettings 配置 Schema 定义
-├── tests/                # Node.js 自动化单元测试套件
-├── docs/assets/          # README 架构图、交互示意图与实拍截图
-├── install.sh            # 一键安装并自动注册启用脚本
-└── uninstall.sh          # 一键卸载脚本
+├── extension.js               # 通知栏面板主控制器、全局快捷键、快速模型切换与脏标记调度
+├── piClient.js                # 四后端统一运行时、Soup 3.0 SSE、优雅进程回收与 0600 临时配置注入
+├── protocol.js                # 纯函数协议归一化、能力矩阵、范围权限规则、上下文预算与 Markdown 解析
+├── zcodeBridge.cjs            # ZCode 无头模式双向权限桥接（含版本握手与范围授权校验）
+├── prefs.js                   # Libadwaita 双分页设置中心（只读配置扫描、Keyring 密钥存储）
+├── core/
+│   ├── paths.js               # 统一数据目录与 $XDG_RUNTIME_DIR 0700/0600 私有临时文件管理
+│   ├── secretStore.js         # GNOME Keyring (libsecret) API Key 加密读写与明文自动迁移
+│   ├── backendDetect.js       # 设置页、快捷栏与运行时共享的统一 PATH 与模型目录探测
+│   ├── turnController.js      # 纯 JS 每轮独立 TurnContext 状态机与幂等结算器
+│   └── sessionStore.js        # 异步 meta.json + messages.jsonl 追加存储与旧版格式自动迁移
+├── ui/
+│   ├── dateMenuIntegration.js # GNOME Shell 50 DateMenu 私有结构隔离与安全挂载/卸载适配器
+│   └── markdownRenderer.js    # 冻结已完成块、原地刷新尾块的流式增量 Markdown 渲染器
+├── schemas/                   # GSettings XML Schema 定义
+├── tests/                     # Node.js 协议解析与并发状态机自动化测试套件
+├── .github/workflows/ci.yml   # GitHub Actions 语法检查、Schema 校验与单测流水线
+├── install.sh / uninstall.sh  # 原子化安装脚本与支持 --purge 彻底清理的卸载脚本
+└── pack.sh                    # gnome-extensions pack 标准打包脚本
 ```
 
-运行单元测试与 Schema 严格校验：
+运行语法检查、Schema 严格编译与全部自动化单元测试：
 
 ```bash
 npm test
-glib-compile-schemas --strict schemas/
+glib-compile-schemas --strict --dry-run schemas/
 ```
 
-查看运行日志：
+查看运行日志与内存监控建议：
 
 ```bash
+# 查看随问扩展实时日志
 journalctl --user -b -f | grep -Ei 'Quick Chat|quick-chat|gnome-shell'
+
+# 观察流式长回答期间 gnome-shell 进程的 CPU 与 RSS 内存变化
+pidstat -p "$(pgrep -n gnome-shell)" -u -r 1
 ```
 
 卸载扩展：
 
 ```bash
-bash uninstall.sh
+./uninstall.sh           # 仅移除扩展，保留历史对话记录
+./uninstall.sh --purge   # 移除扩展并彻底清理本地会话、临时文件与密钥环中的 API Key
 ```

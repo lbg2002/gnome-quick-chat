@@ -45,6 +45,194 @@ export function detailedMessages(messages) {
         .filter(m => m.text.length > 0 || m.thinking.length > 0);
 }
 
+export function getBackendCapabilities(backend) {
+    switch (backend) {
+        case 'zcode':
+            return {
+                supportsTools: true,
+                supportsApproval: true,
+                supportsResume: true,
+                supportsThinking: true,
+                supportsSkills: true,
+                supportsMcp: true,
+                modeLabels: [
+                    '纯问答 (禁用本地与联网工具)',
+                    '智能审批 Agent (推荐 · 敏感工具气泡内审批)',
+                    '全自动 Agent (免审批自动执行一切工具)',
+                ],
+                modeBadges: {chat: '纯问答', readonly: '智能审批', full: '全自动 Agent'},
+            };
+        case 'codex':
+            return {
+                supportsTools: true,
+                supportsApproval: false,
+                supportsResume: true,
+                supportsThinking: true,
+                supportsSkills: false,
+                supportsMcp: true,
+                modeLabels: [
+                    '纯问答 (受限只读沙箱 · 指示仅作答)',
+                    '只读沙箱 Agent (允许只读检索 · 无弹窗审批)',
+                    '全自动 Agent (无沙箱读写与执行命令)',
+                ],
+                modeBadges: {chat: '纯问答', readonly: '只读沙箱', full: '全自动 Agent'},
+            };
+        case 'pi':
+            return {
+                supportsTools: true,
+                supportsApproval: false,
+                supportsResume: true,
+                supportsThinking: true,
+                supportsSkills: false,
+                supportsMcp: false,
+                modeLabels: [
+                    '纯问答 (--no-tools 完全禁用工具)',
+                    '只读白名单 Agent (仅允许 read/grep/find/ls)',
+                    '全自动 Agent (允许 read/bash/edit/write)',
+                ],
+                modeBadges: {chat: '纯问答', readonly: '只读白名单', full: '全自动 Agent'},
+            };
+        default:
+            return {
+                supportsTools: false,
+                supportsApproval: false,
+                supportsResume: true,
+                supportsThinking: true,
+                supportsSkills: false,
+                supportsMcp: false,
+                modeLabels: [
+                    '纯问答 (HTTP 流式对话，不调用本机工具)',
+                    '纯问答 (OpenAI API 模式无本机工具)',
+                    '纯问答 (OpenAI API 模式无本机工具)',
+                ],
+                modeBadges: {chat: '', readonly: '', full: ''},
+            };
+    }
+}
+
+export function mapReasoningEffort(effort) {
+    switch (String(effort || 'default').trim()) {
+        case 'fast':
+            return 'low';
+        case 'standard':
+            return 'medium';
+        case 'deep':
+            return 'high';
+        default:
+            return '';
+    }
+}
+
+const DESTRUCTIVE_SHELL_RE = /(?:^|[;&|]\s*)(?:sudo|su|rm\s+-[a-zA-Z]*[rf]|mkfs|dd\s+|fdisk|parted|shutdown|reboot|chmod\s+-R|chown\s+-R|>\s*\/etc\/)/i;
+
+/**
+ * Computes graded, command/action-scoped session approval keys.
+ * Prevents broad tool-level `alwaysAllow` on dangerous tools like Bash/Edit/Write.
+ */
+export function computePermissionScope(toolName, summaryOrInput = '') {
+    const tool = String(toolName || '工具').trim();
+    const rawSummary = typeof summaryOrInput === 'string'
+        ? summaryOrInput.trim()
+        : String(summaryOrInput?.command || summaryOrInput?.url || summaryOrInput?.file_path || summaryOrInput?.path || '').trim();
+
+    const lower = tool.toLowerCase();
+    const isShell = lower === 'bash' || lower === 'sh' || lower.includes('shell') || lower.includes('exec') || lower.includes('repl');
+    const isFileMutate = lower === 'write' || lower === 'edit' || lower === 'multiedit' || lower === 'notebookedit' || lower === 'delete';
+
+    if (isShell) {
+        if (!rawSummary || DESTRUCTIVE_SHELL_RE.test(rawSummary)) {
+            return {
+                scopeKey: '',
+                allowSessionRule: false,
+                sessionRuleLabel: '',
+            };
+        }
+        // Scope strictly to the normalized command string (never all Bash commands!)
+        const normalizedCmd = rawSummary.replace(/\s+/g, ' ').slice(0, 120);
+        return {
+            scopeKey: `${tool}:cmd:${normalizedCmd}`,
+            allowSessionRule: true,
+            sessionRuleLabel: '✓ 本次会话允许该命令',
+        };
+    }
+
+    if (isFileMutate) {
+        if (!rawSummary || rawSummary.startsWith('/etc/') || rawSummary.startsWith('/usr/')) {
+            return {
+                scopeKey: '',
+                allowSessionRule: false,
+                sessionRuleLabel: '',
+            };
+        }
+        return {
+            scopeKey: `${tool}:file:${rawSummary}`,
+            allowSessionRule: true,
+            sessionRuleLabel: '✓ 本次会话允许修改该文件',
+        };
+    }
+
+    if (lower === 'webfetch' && rawSummary) {
+        const urlMatch = /^(?:url:\s*)?https?:\/\/([^/?#:\s]+)/i.exec(rawSummary);
+        const host = urlMatch ? urlMatch[1].toLowerCase() : '';
+        if (host) {
+            return {
+                scopeKey: `${tool}:host:${host}`,
+                allowSessionRule: true,
+                sessionRuleLabel: `✓ 允许访问 ${host}`,
+            };
+        }
+    }
+
+    return {
+        scopeKey: `tool:${tool}`,
+        allowSessionRule: true,
+        sessionRuleLabel: '✓ 本次会话始终允许',
+    };
+}
+
+export function buildModelSignature(backend, config = {}) {
+    if (backend === 'openai') {
+        const url = String(config.openaiBaseUrl || '').trim().replace(/\/+$/, '');
+        const mod = String(config.openaiModel || config.model || '').trim();
+        return `openai:${url}:${mod}`;
+    }
+    return `${backend}:${String(config.provider || '').trim()}:${String(config.model || '').trim()}`;
+}
+
+export function buildBudgetedContextMessages(messages, maxMessages = 24, maxChars = 28000) {
+    if (!Array.isArray(messages) || !messages.length) return [];
+    const selected = [];
+    let usedChars = 0;
+
+    for (let i = messages.length - 1; i >= 0 && selected.length < maxMessages; i--) {
+        const m = messages[i];
+        if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+        const txt = messageText(m).trim();
+        if (!txt) continue;
+        if (selected.length > 0 && usedChars + txt.length > maxChars) {
+            break;
+        }
+        selected.push({role: m.role, content: txt});
+        usedChars += txt.length;
+    }
+
+    selected.reverse();
+    return selected;
+}
+
+export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromptText, maxChars = 6000) {
+    const prior = buildBudgetedContextMessages(historyBeforePrompt, 8, maxChars);
+    if (!prior.length) return newPromptText;
+    const lines = prior.map(m => `${m.role === 'user' ? '用户' : '助手'}：${m.content}`);
+    return [
+        '[以下是当前随问会话的前序上下文，请自然承接回答最新问题]',
+        ...lines,
+        '',
+        '[最新问题]',
+        newPromptText,
+    ].join('\n');
+}
+
 export function buildArgs(config, sessionDir, sessionId) {
     const mode = config?.mode;
     const args = [
@@ -104,15 +292,22 @@ export function buildCodexArgs(config, workspace, prompt, resumeSessionId = '') 
     if (model) {
         common.push('-c', `model=${JSON.stringify(model)}`);
     }
+    const effort = mapReasoningEffort(config?.reasoningEffort);
+    if (effort) {
+        common.push('-c', `model_reasoning_effort=${JSON.stringify(effort)}`);
+    }
     if (mode === 'full') {
         common.push('-c', 'sandbox_mode="danger-full-access"', '-c', 'approval_policy="never"');
     } else {
         common.push('-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"');
     }
+    const effectivePrompt = mode === 'chat'
+        ? `[纯问答模式：请直接回答问题，不要执行本地命令或调用检索工具]\n${String(prompt ?? '')}`
+        : String(prompt ?? '');
     if (resumeSessionId) {
-        return [exec, 'exec', 'resume', ...common, resumeSessionId, String(prompt ?? '')];
+        return [exec, 'exec', 'resume', ...common, resumeSessionId, effectivePrompt];
     }
-    return [exec, 'exec', ...common, ...(workspace ? ['-C', workspace] : []), String(prompt ?? '')];
+    return [exec, 'exec', ...common, ...(workspace ? ['-C', workspace] : []), effectivePrompt];
 }
 
 export function parseZCodeProviderCatalog(personalConfigObj, builtinConfigObj = null) {
@@ -174,7 +369,7 @@ export function parseZCodeProviderCatalog(personalConfigObj, builtinConfigObj = 
     };
 }
 
-export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = '', model = ''} = {}) {
+export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = '', model = '', reasoningEffort = 'default'} = {}) {
     if (!personalConfigObj || typeof personalConfigObj !== 'object') return null;
     const cloned = JSON.parse(JSON.stringify(personalConfigObj));
     if (!cloned.config || typeof cloned.config !== 'object') {
@@ -184,8 +379,9 @@ export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = 
     const providers = catalog.providers;
     let rawProvider = String(provider ?? '').trim();
     let rawModel = String(model ?? '').trim();
+    const mappedEffort = mapReasoningEffort(reasoningEffort);
 
-    if (!rawProvider && !rawModel) {
+    if (!rawProvider && !rawModel && !mappedEffort) {
         return {configObj: cloned, providerId: '', modelId: ''};
     }
 
@@ -213,8 +409,13 @@ export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = 
             || null;
     }
 
-    const resolvedProviderId = matchedProvider ? matchedProvider.id : (rawProvider || providers[0]?.id || '');
-    const resolvedModelId = rawModel || matchedProvider?.models?.[0] || '';
+    const existingDefault = cloned.config.defaultModelSelection || {};
+    const resolvedProviderId = (rawProvider || rawModel)
+        ? (matchedProvider ? matchedProvider.id : (rawProvider || providers[0]?.id || ''))
+        : (existingDefault.providerId || providers[0]?.id || '');
+    const resolvedModelId = (rawProvider || rawModel)
+        ? (rawModel || matchedProvider?.models?.[0] || '')
+        : (existingDefault.modelId || matchedProvider?.models?.[0] || '');
 
     if (resolvedProviderId && resolvedModelId) {
         const rules = Array.isArray(cloned.config.providerConfigRules?.providerRules)
@@ -229,10 +430,16 @@ export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = 
                 rule.config.modelOrder.unshift(resolvedModelId);
             }
         }
+        const preservedOptions = existingDefault.options && typeof existingDefault.options === 'object'
+            ? {...existingDefault.options}
+            : {};
+        if (mappedEffort) {
+            preservedOptions.reasoningLevel = mappedEffort;
+        }
         cloned.config.defaultModelSelection = {
             providerId: resolvedProviderId,
             modelId: resolvedModelId,
-            options: {reasoningLevel: 'max'},
+            ...(Object.keys(preservedOptions).length > 0 ? {options: preservedOptions} : {}),
         };
     }
 
@@ -315,14 +522,15 @@ export function normalizeOpenAIEndpoint(baseUrl, resourcePath = '/chat/completio
         if (resourcePath === '/models') return raw;
         return raw.slice(0, -'/models'.length) + resourcePath;
     }
-    // Check if URL already has a version/API path like /v1, /v1beta, /api/v3, /compatible-mode/v1
-    try {
-        const u = new URL(raw);
-        if (!u.pathname || u.pathname === '/') {
+    // Check if URL already has a non-root path like /v1, /v1beta, /api/v3, /compatible-mode/v1 (portable across GJS & Node)
+    const pathMatch = /^https?:\/\/[^/?#]+(\/[^?#]*)?/i.exec(raw);
+    if (pathMatch) {
+        const pathname = pathMatch[1] || '';
+        if (!pathname || pathname === '/') {
             return `${raw}/v1${resourcePath}`;
         }
-    } catch (_) {
-        if (!raw.includes('/v1')) return `${raw}/v1${resourcePath}`;
+    } else if (!raw.includes('/v1')) {
+        return `${raw}/v1${resourcePath}`;
     }
     return `${raw}${resourcePath}`;
 }
@@ -383,6 +591,13 @@ export function normalizeEvent(backend, record) {
             }
             return null;
         }
+        if (type === 'quickchat.bridge_ready') {
+            return {
+                type: 'bridge_ready',
+                protocolVersion: Number(record.protocolVersion || 1),
+                patched: Boolean(record.patched),
+            };
+        }
         if (type === 'quickchat.permission_requested') {
             const p = record.payload || {};
             if (!p.requestId) return null;
@@ -390,14 +605,19 @@ export function normalizeEvent(backend, record) {
             if (!summary && p.input && typeof p.input === 'object') {
                 summary = p.input.command || p.input.url || p.input.file_path || p.input.path || p.input.pattern || p.input.query || p.input.title || '';
             }
+            const toolName = String(p.toolName || '工具');
+            const scope = computePermissionScope(toolName, summary || p.input || '');
             return {
                 type: 'permission_request',
                 requestId: String(p.requestId),
                 toolCallId: String(p.toolCallId || ''),
-                toolName: String(p.toolName || '工具'),
+                toolName,
                 riskLevel: String(p.riskLevel || 'medium'),
                 reason: String(p.reason || '该操作需要您的授权'),
                 summary: String(summary || ''),
+                scopeKey: p.scopeKey ? String(p.scopeKey) : scope.scopeKey,
+                allowSessionRule: typeof p.allowSessionRule === 'boolean' ? p.allowSessionRule : scope.allowSessionRule,
+                sessionRuleLabel: p.sessionRuleLabel ? String(p.sessionRuleLabel) : scope.sessionRuleLabel,
             };
         }
         if (type === 'permission.resolved' || type === 'permission.denied') {
@@ -477,11 +697,32 @@ export function normalizeEvent(backend, record) {
                 return {type: 'thinking_snapshot', text: item.text};
             }
             if (item.type === 'command_execution' || item.type === 'mcp_tool_call' || item.type === 'file_change') {
-                const label = item.command || item.tool_name || item.type;
+                const toolCallId = item.id ? String(item.id) : '';
+                const toolName = item.type === 'command_execution'
+                    ? 'Bash'
+                    : item.type === 'mcp_tool_call'
+                        ? String(item.tool_name || 'MCP')
+                        : 'FileChange';
+                const summary = String(item.command || item.tool_name || item.path || '');
                 if (type === 'item.completed') {
-                    return {type: 'tool_execution_end', toolName: String(label)};
+                    const isError = Boolean(
+                        (typeof item.exit_code === 'number' && item.exit_code !== 0) ||
+                        item.status === 'failed' ||
+                        item.error
+                    );
+                    const evt = {type: 'tool_execution_end', toolName, isError};
+                    if (toolCallId) evt.toolCallId = toolCallId;
+                    if (isError && typeof item.exit_code === 'number') {
+                        evt.detail = `退出码 ${item.exit_code}`;
+                    } else if (item.error) {
+                        evt.detail = String(item.error?.message || item.error);
+                    }
+                    return evt;
                 }
-                return {type: 'tool_execution_start', toolName: String(label)};
+                const evt = {type: 'tool_execution_start', toolName};
+                if (toolCallId) evt.toolCallId = toolCallId;
+                if (summary) evt.summary = summary;
+                return evt;
             }
             if (item.type === 'agent_message' && typeof item.text === 'string') {
                 if (type === 'item.completed') {
@@ -491,7 +732,7 @@ export function normalizeEvent(backend, record) {
             }
         }
         if (type === 'turn.completed') {
-            return {type: 'agent_settled', aborted: false};
+            return {type: 'turn_completed'};
         }
         if (type === 'turn.failed' || type === 'error') {
             const msg = record.error?.message || record.message || '执行失败';

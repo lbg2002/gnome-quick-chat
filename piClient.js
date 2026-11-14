@@ -3,255 +3,247 @@ import GLib from 'gi://GLib';
 import Soup from 'gi://Soup?version=3.0';
 import {
     buildArgs,
+    buildBudgetedContextMessages,
     buildCodexArgs,
+    buildCrossBackendPromptWithContext,
     buildZCodeArgs,
     buildZCodePersonalConfigOverride,
-    messageText,
+    mapReasoningEffort,
     normalizeEvent,
     normalizeOpenAIEndpoint,
     parseOpenAISSELine,
     stripAnsi,
 } from './protocol.js';
+import {
+    buildSearchPath,
+    detectEffectiveBackend,
+    findExecutableInDirs,
+    readJsonFileSync,
+} from './core/backendDetect.js';
+import {
+    getPrivateRuntimeDir,
+    removeFileQuietly,
+    writePrivateFileSync,
+} from './core/paths.js';
+import {SessionStore} from './core/sessionStore.js';
+import {TurnController} from './core/turnController.js';
 
-const Decoder = new TextDecoder('utf-8');
+export {buildSearchPath, findExecutableInDirs};
+
 const Encoder = new TextEncoder();
+const Decoder = new TextDecoder('utf-8');
 
-function prepareZCodePersonalConfigEnv(config) {
+/**
+ * Sends SIGTERM first, gives the CLI subprocess 800ms to flush & reap children cleanly,
+ * and falls back to SIGKILL (force_exit) only if it has not exited in time.
+ */
+function terminateSubprocessGracefully(proc) {
+    if (!proc) return;
+    let exited = false;
+    try {
+        proc.wait_async(null, (p, res) => {
+            exited = true;
+            try { p.wait_finish(res); } catch (_) {}
+        });
+    } catch (_) {}
+
+    try {
+        proc.send_signal(15); // SIGTERM
+    } catch (_) {
+        try { proc.force_exit(); } catch (__) {}
+        return;
+    }
+
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+        if (!exited) {
+            try { proc.force_exit(); } catch (_) {}
+        }
+        return GLib.SOURCE_REMOVE;
+    });
+}
+
+/**
+ * Generates an isolated, 0600-permission temporary ZCode personal provider config file
+ * inside XDG_RUNTIME_DIR/gnome-quick-chat without EVER modifying ~/.zcode/v2/provider_config.json.
+ */
+function createIsolatedZCodeConfigOverride(config) {
     const home = GLib.get_home_dir();
     const personalPath = GLib.build_filenamev([home, '.zcode', 'v2', 'provider_config.json']);
     if (!GLib.file_test(personalPath, GLib.FileTest.EXISTS)) {
-        return {env: {}, resolvedModel: config.model || '', resolvedProvider: config.provider || ''};
+        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
     }
-    try {
-        const [ok, raw] = GLib.file_get_contents(personalPath);
-        if (!ok || !raw) {
-            return {env: {}, resolvedModel: config.model || '', resolvedProvider: config.provider || ''};
-        }
-        const parsed = JSON.parse(Decoder.decode(raw));
-        const override = buildZCodePersonalConfigOverride(parsed, {
-            provider: config.provider || '',
-            model: config.model || '',
-        });
-        if (!override || (!override.providerId && !override.modelId)) {
-            return {env: {}, resolvedModel: config.model || '', resolvedProvider: config.provider || ''};
-        }
-        const runtimeDir = GLib.get_user_runtime_dir() || '/tmp';
-        const outPath = GLib.build_filenamev([runtimeDir, 'quick-chat-zcode-provider.json']);
-        GLib.file_set_contents(outPath, Encoder.encode(JSON.stringify(override.configObj, null, 2)));
+    const personalObj = readJsonFileSync(personalPath);
+    if (!personalObj) {
+        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
+    }
+
+    const desiredProvider = (config?.provider || '').trim();
+    const desiredModel = (config?.model || '').trim();
+    const reasoningEffort = (config?.reasoningEffort || 'default').trim();
+
+    if (!desiredProvider && !desiredModel && (!reasoningEffort || reasoningEffort === 'default')) {
+        const defSel = personalObj?.config?.defaultModelSelection;
         return {
-            env: {ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: outPath},
-            resolvedModel: override.modelId || config.model || '',
-            resolvedProvider: override.providerId || config.provider || '',
+            env: {},
+            tempFilePath: '',
+            resolvedProvider: defSel?.providerId || '',
+            resolvedModel: defSel?.modelId || '',
         };
-    } catch (_) {
-        return {env: {}, resolvedModel: config.model || '', resolvedProvider: config.provider || ''};
     }
-}
 
-function listNvmBinDirs(homeDir) {
-    const nvmNodeDir = GLib.build_filenamev([homeDir, '.nvm', 'versions', 'node']);
-    if (!GLib.file_test(nvmNodeDir, GLib.FileTest.IS_DIR)) return [];
-    const versions = [];
+    const override = buildZCodePersonalConfigOverride(personalObj, {
+        provider: desiredProvider,
+        model: desiredModel,
+        reasoningEffort,
+    });
+    if (!override || !override.configObj) {
+        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
+    }
+
     try {
-        const dir = GLib.Dir.open(nvmNodeDir, 0);
-        let name;
-        while ((name = dir.read_name()) !== null) {
-            const binDir = GLib.build_filenamev([nvmNodeDir, name, 'bin']);
-            if (GLib.file_test(binDir, GLib.FileTest.IS_DIR)) {
-                versions.push({name, binDir});
-            }
-        }
-        dir.close();
-    } catch (_) {}
-    versions.sort((a, b) => b.name.localeCompare(a.name, undefined, {numeric: true}));
-    return versions.map(v => v.binDir);
-}
-
-export function buildSearchPath(extraExecutable = '') {
-    const home = GLib.get_home_dir();
-    const sysPath = (GLib.getenv('PATH') || '/usr/local/bin:/usr/bin:/bin').split(':').filter(Boolean);
-    const dirs = [];
-    const pushDir = d => {
-        if (d && !dirs.includes(d) && GLib.file_test(d, GLib.FileTest.IS_DIR)) {
-            dirs.push(d);
-        }
-    };
-
-    if (extraExecutable && extraExecutable.startsWith('/')) {
-        pushDir(GLib.path_get_dirname(extraExecutable));
-        try {
-            const linkTarget = GLib.file_read_link(extraExecutable);
-            const resolved = linkTarget.startsWith('/')
-                ? linkTarget
-                : GLib.build_filenamev([GLib.path_get_dirname(extraExecutable), linkTarget]);
-            pushDir(GLib.path_get_dirname(resolved));
-        } catch (_) {}
+        const runtimeDir = getPrivateRuntimeDir();
+        const tempFilePath = GLib.build_filenamev([
+            runtimeDir,
+            `zcode-provider-${GLib.uuid_string_random()}.json`,
+        ]);
+        const bytes = Encoder.encode(JSON.stringify(override.configObj, null, 2));
+        writePrivateFileSync(tempFilePath, bytes);
+        return {
+            env: {ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: tempFilePath},
+            tempFilePath,
+            resolvedProvider: override.providerId,
+            resolvedModel: override.modelId,
+        };
+    } catch (err) {
+        console.warn(`[Quick Chat] Failed to write isolated ZCode config: ${err.message}`);
+        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
     }
-
-    for (const nvmBin of listNvmBinDirs(home)) pushDir(nvmBin);
-    pushDir(GLib.build_filenamev([home, '.local', 'bin']));
-    pushDir(GLib.build_filenamev([home, 'bin']));
-    pushDir(GLib.build_filenamev([home, '.opencode', 'bin']));
-    pushDir(GLib.build_filenamev([home, '.local', 'share', 'pnpm']));
-    pushDir(GLib.build_filenamev([home, '.bun', 'bin']));
-    pushDir(GLib.build_filenamev([home, '.npm-global', 'bin']));
-    pushDir(GLib.build_filenamev([home, '.volta', 'bin']));
-    pushDir(GLib.build_filenamev([home, '.cargo', 'bin']));
-    pushDir('/usr/local/bin');
-    for (const p of sysPath) pushDir(p);
-    return dirs;
-}
-
-export function findExecutableInDirs(nameOrPath, pathDirs) {
-    if (!nameOrPath) return null;
-    if (nameOrPath.includes('/')) {
-        return GLib.file_test(nameOrPath, GLib.FileTest.IS_EXECUTABLE) &&
-            !GLib.file_test(nameOrPath, GLib.FileTest.IS_DIR)
-            ? nameOrPath
-            : null;
-    }
-    for (const dir of pathDirs) {
-        const candidate = GLib.build_filenamev([dir, nameOrPath]);
-        if (GLib.file_test(candidate, GLib.FileTest.IS_EXECUTABLE) &&
-            !GLib.file_test(candidate, GLib.FileTest.IS_DIR)) {
-            return candidate;
-        }
-    }
-    return null;
 }
 
 export function resolveBackendRuntime(config) {
-    const requested = config.backend || 'auto';
+    const effective = detectEffectiveBackend(config.backend || 'auto', config.executable || 'pi', config.openaiBaseUrl || '');
     const rawExec = (config.executable || '').trim();
     const pathDirs = buildSearchPath(rawExec);
 
-    const resolvePi = () => {
+    if (effective === 'openai') {
+        const baseUrl = (config.openaiBaseUrl || '').trim();
+        if (!baseUrl) {
+            throw new Error('已选择「自定义 OpenAI 兼容 API」，请先在随问设置（⚙）中填写 API 地址 (Base URL)');
+        }
+        const modelId = (config.openaiModel || config.model || '').trim();
+        return {
+            backend: 'openai',
+            baseUrl,
+            chatUrl: normalizeOpenAIEndpoint(baseUrl, '/chat/completions'),
+            modelsUrl: normalizeOpenAIEndpoint(baseUrl, '/models'),
+            apiKey: (config.openaiApiKey || '').trim(),
+            modelId,
+            systemPrompt: (config.systemPrompt || '').trim(),
+            reasoningEffort: mapReasoningEffort(config.reasoningEffort),
+            label: modelId || 'OpenAI API',
+        };
+    }
+
+    if (effective === 'pi') {
         const exe = findExecutableInDirs(rawExec || 'pi', pathDirs);
-        if (!exe) return null;
+        if (!exe) {
+            throw new Error('未检测到 Pi CLI 可执行文件，请在设置中检查路径或切换后端');
+        }
         return {
             backend: 'pi',
             executable: exe,
             pathEnv: buildSearchPath(exe).join(':'),
             label: config.model || 'Pi',
         };
-    };
+    }
 
-    const resolveZCode = () => {
+    if (effective === 'zcode') {
         const bundledCjs = rawExec && rawExec.endsWith('.cjs') && GLib.file_test(rawExec, GLib.FileTest.EXISTS)
             ? rawExec
             : '/opt/ZCode/resources/glm/zcode.cjs';
-        if (GLib.file_test(bundledCjs, GLib.FileTest.EXISTS)) {
-            const builtinCfg = '/opt/ZCode/resources/config/provider/zcode-builtin.json';
-            const personalOverride = prepareZCodePersonalConfigEnv(config);
-            const baseEnv = {
-                ...(GLib.file_test(builtinCfg, GLib.FileTest.EXISTS)
-                    ? {
-                        ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtinCfg,
-                        ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: builtinCfg,
-                    }
-                    : {}),
-                ...personalOverride.env,
-            };
-            const effectiveModel = personalOverride.resolvedModel || config.model || '';
-            const label = effectiveModel ? `ZCode · ${effectiveModel}` : 'ZCode';
-
-            let bridgeArgs = [];
-            try {
-                const selfFile = Gio.File.new_for_uri(import.meta.url);
-                const selfDir = selfFile.get_parent()?.get_path();
-                if (selfDir) {
-                    const bridgePath = GLib.build_filenamev([selfDir, 'zcodeBridge.cjs']);
-                    if (GLib.file_test(bridgePath, GLib.FileTest.EXISTS)) {
-                        bridgeArgs = ['--require', bridgePath];
-                    }
-                }
-            } catch (_) {}
-
-            const nodeExe = findExecutableInDirs('node', pathDirs);
-            if (nodeExe) {
-                return {
-                    backend: 'zcode',
-                    executable: nodeExe,
-                    commandPrefix: [nodeExe, ...bridgeArgs, bundledCjs],
-                    extraEnv: baseEnv,
-                    pathEnv: buildSearchPath(nodeExe).join(':'),
-                    label,
-                };
-            }
-            const electronExe = '/opt/ZCode/zcode';
-            if (GLib.file_test(electronExe, GLib.FileTest.IS_EXECUTABLE)) {
-                return {
-                    backend: 'zcode',
-                    executable: electronExe,
-                    commandPrefix: [electronExe, ...bridgeArgs, bundledCjs],
-                    extraEnv: {...baseEnv, ELECTRON_RUN_AS_NODE: '1'},
-                    pathEnv: pathDirs.join(':'),
-                    label,
-                };
-            }
+        if (!GLib.file_test(bundledCjs, GLib.FileTest.EXISTS)) {
+            throw new Error('未检测到本机 ZCode CLI（/opt/ZCode/resources/glm/zcode.cjs）');
         }
-        return null;
-    };
 
-    const resolveCodex = () => {
+        const builtinCfg = '/opt/ZCode/resources/config/provider/zcode-builtin.json';
+        const baseEnv = GLib.file_test(builtinCfg, GLib.FileTest.EXISTS)
+            ? {
+                ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtinCfg,
+                ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: builtinCfg,
+            }
+            : {};
+
+        // Inspect personal config read-only to display accurate initial model label
+        const home = GLib.get_home_dir();
+        const personalObj = readJsonFileSync(GLib.build_filenamev([home, '.zcode', 'v2', 'provider_config.json']));
+        const preview = personalObj
+            ? buildZCodePersonalConfigOverride(personalObj, {
+                provider: config.provider || '',
+                model: config.model || '',
+                reasoningEffort: config.reasoningEffort || 'default',
+            })
+            : null;
+        const effectiveModel = preview?.modelId
+            || config.model
+            || personalObj?.config?.defaultModelSelection?.modelId
+            || '';
+        const label = effectiveModel || 'ZCode';
+
+        let bridgeArgs = [];
+        try {
+            const selfFile = Gio.File.new_for_uri(import.meta.url);
+            const selfDir = selfFile.get_parent()?.get_path();
+            if (selfDir) {
+                const bridgePath = GLib.build_filenamev([selfDir, 'zcodeBridge.cjs']);
+                if (GLib.file_test(bridgePath, GLib.FileTest.EXISTS)) {
+                    bridgeArgs = ['--require', bridgePath];
+                }
+            }
+        } catch (_) {}
+
+        const nodeExe = findExecutableInDirs('node', pathDirs);
+        if (nodeExe) {
+            return {
+                backend: 'zcode',
+                executable: nodeExe,
+                commandPrefix: [nodeExe, ...bridgeArgs, bundledCjs],
+                extraEnv: baseEnv,
+                pathEnv: buildSearchPath(nodeExe).join(':'),
+                label,
+            };
+        }
+
+        const electronExe = '/opt/ZCode/zcode';
+        if (GLib.file_test(electronExe, GLib.FileTest.IS_EXECUTABLE)) {
+            return {
+                backend: 'zcode',
+                executable: electronExe,
+                commandPrefix: [electronExe, ...bridgeArgs, bundledCjs],
+                extraEnv: {...baseEnv, ELECTRON_RUN_AS_NODE: '1'},
+                pathEnv: pathDirs.join(':'),
+                label,
+            };
+        }
+        throw new Error('找到 ZCode 脚本但缺少 Node 或 Electron 运行时');
+    }
+
+    if (effective === 'codex') {
         const customCodex = rawExec && rawExec !== 'pi' ? findExecutableInDirs(rawExec, pathDirs) : null;
         const codexExe = customCodex || findExecutableInDirs('codex', pathDirs);
-        if (!codexExe) return null;
+        if (!codexExe) {
+            throw new Error('未检测到本机 Codex CLI 可执行文件');
+        }
         return {
             backend: 'codex',
             executable: codexExe,
             pathEnv: buildSearchPath(codexExe).join(':'),
-            label: config.model ? `Codex · ${config.model}` : 'Codex',
+            label: config.model || 'Codex',
         };
-    };
-
-    const resolveOpenAI = () => {
-        const baseUrl = (config.openaiBaseUrl || '').trim();
-        if (!baseUrl) return null;
-        const chatUrl = normalizeOpenAIEndpoint(baseUrl, '/chat/completions');
-        const modelsUrl = normalizeOpenAIEndpoint(baseUrl, '/models');
-        const modelId = (config.openaiModel || config.model || '').trim();
-        return {
-            backend: 'openai',
-            chatUrl,
-            modelsUrl,
-            apiKey: (config.openaiApiKey || '').trim(),
-            modelId,
-            systemPrompt: (config.systemPrompt || '').trim(),
-            label: modelId ? `API · ${modelId}` : 'OpenAI API',
-        };
-    };
-
-    if (requested === 'openai') {
-        const r = resolveOpenAI();
-        if (!r) throw new Error('请在设置中填写自定义 OpenAI 接口地址（Base URL）');
-        return r;
-    }
-    if (requested === 'pi') {
-        const r = resolvePi();
-        if (!r) throw new Error(`未找到 Pi 可执行文件（${rawExec || 'pi'}）；请在设置中填写绝对路径或切换后端`);
-        return r;
-    }
-    if (requested === 'zcode') {
-        const r = resolveZCode();
-        if (!r) throw new Error('未找到 ZCode CLI（/opt/ZCode/resources/glm/zcode.cjs）');
-        return r;
-    }
-    if (requested === 'codex') {
-        const r = resolveCodex();
-        if (!r) throw new Error('未找到 Codex CLI（codex）');
-        return r;
     }
 
-    // 'auto' mode: prefer Pi -> ZCode -> Codex -> configured OpenAI API
-    const detected = resolvePi() || resolveZCode() || resolveCodex() || resolveOpenAI();
-    if (!detected) {
-        throw new Error('未检测到可用后端（Pi / ZCode / Codex / OpenAI API）；请在设置中配置');
-    }
-    return detected;
+    throw new Error('未检测到可用后端：请在设置中配置自定义 OpenAI API，或安装 ZCode / Codex / Pi');
 }
 
-// Owns child subprocesses or HTTP streams, never calls a shell or blocks waiting for network/model I/O.
 export class PiClient {
     constructor(onEvent, onExit) {
         this._event = onEvent;
@@ -261,10 +253,14 @@ export class PiClient {
         this._closed = false;
         this._writeQueue = [];
         this._stderrLines = [];
-        this._turnWatchdog = 0;
         this._httpSession = null;
-        this._alwaysAllowedTools = new Set();
-        this._turnStdin = null;
+        this._approvedScopes = new Set();
+        this._turns = new TurnController(evt => {
+            if (!this._closed) this._event(evt);
+        });
+        this._store = null;
+        this._piIdleTimer = 0;
+        this._piReclaimedIdle = false;
     }
 
     start(config, workspace, sessionDir, sessionId) {
@@ -276,16 +272,60 @@ export class PiClient {
         this._backend = this._runtime.backend;
 
         if (this._backend === 'pi') {
-            this._startPiRpc();
+            this._ensurePiProcessRunning();
         } else {
             if (this._backend === 'openai') {
                 this._httpSession = new Soup.Session({timeout: 120});
             }
-            this._startTranscriptBackend();
+            this._store = new SessionStore(sessionId);
         }
     }
 
-    _startPiRpc() {
+    updateApiKey(apiKey) {
+        if (this._config) this._config.openaiApiKey = String(apiKey || '').trim();
+        if (this._runtime && this._backend === 'openai') {
+            this._runtime.apiKey = String(apiKey || '').trim();
+        }
+    }
+
+    _clearPiIdleTimer() {
+        if (this._piIdleTimer) {
+            try { GLib.source_remove(this._piIdleTimer); } catch (_) {}
+            this._piIdleTimer = 0;
+        }
+    }
+
+    _schedulePiIdleReclaim() {
+        this._clearPiIdleTimer();
+        if (this._backend !== 'pi' || this._closed) return;
+        const minutes = Number(this._config?.piIdleMinutes ?? 5);
+        if (minutes <= 0) return;
+        this._piIdleTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, minutes * 60, () => {
+            this._piIdleTimer = 0;
+            if (!this._closed && this._process && this._pending.size === 0) {
+                this._reclaimPiIdleProcess();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _reclaimPiIdleProcess() {
+        if (!this._process) return;
+        this._piReclaimedIdle = true;
+        this._cancel?.cancel();
+        const proc = this._process;
+        this._process = null;
+        this._input = null;
+        this._stderr = null;
+        this._output = null;
+        terminateSubprocessGracefully(proc);
+    }
+
+    _ensurePiProcessRunning() {
+        this._clearPiIdleTimer();
+        if (this._process) return;
+        this._piReclaimedIdle = false;
+
         const launcher = new Gio.SubprocessLauncher({
             flags:
                 Gio.SubprocessFlags.STDIN_PIPE |
@@ -306,43 +346,7 @@ export class PiClient {
         this._output = this._process.get_stdin_pipe();
         this._readStdout();
         this._readStderr(this._stderr, this._cancel);
-    }
-
-    _modelSignature() {
-        return `${this._backend}:${this._config?.provider || ''}:${this._config?.model || ''}`;
-    }
-
-    _startTranscriptBackend() {
-        this._stateFile = GLib.build_filenamev([this._sessionDir, `${this._sessionId}.qc.json`]);
-        this._history = [];
-        this._remoteSessionId = '';
-        if (GLib.file_test(this._stateFile, GLib.FileTest.EXISTS)) {
-            try {
-                const [ok, raw] = GLib.file_get_contents(this._stateFile);
-                if (ok && raw) {
-                    const parsed = JSON.parse(Decoder.decode(raw));
-                    if (Array.isArray(parsed.messages)) this._history = parsed.messages;
-                    const sigMatches = !parsed.modelSignature || parsed.modelSignature === this._modelSignature();
-                    if (sigMatches && typeof parsed.remoteSessionId === 'string') {
-                        this._remoteSessionId = parsed.remoteSessionId;
-                    }
-                }
-            } catch (_) {}
-        }
-    }
-
-    _saveTranscriptState() {
-        if (!this._stateFile) return;
-        try {
-            const payload = JSON.stringify({
-                backend: this._backend,
-                modelSignature: this._modelSignature(),
-                remoteSessionId: this._remoteSessionId || '',
-                updatedAt: Date.now(),
-                messages: this._history,
-            });
-            GLib.file_set_contents(this._stateFile, Encoder.encode(payload));
-        } catch (_) {}
+        this._schedulePiIdleReclaim();
     }
 
     _formatStderrSuffix() {
@@ -386,7 +390,11 @@ export class PiClient {
         if (this._backend !== 'pi') {
             return this._requestTranscriptBackend(type, fields);
         }
-        if (!this._process) return Promise.reject(new Error('Pi 未启动'));
+        try {
+            this._ensurePiProcessRunning();
+        } catch (err) {
+            return Promise.reject(err);
+        }
         const id = `qc-${++this._sequence}`;
         const timeoutSeconds = type === 'prompt' ? 60 : type === 'abort' ? 25 : 20;
         return new Promise((resolve, reject) => {
@@ -402,19 +410,27 @@ export class PiClient {
         });
     }
 
-    _requestTranscriptBackend(type, fields = {}) {
+    async _requestTranscriptBackend(type, fields = {}) {
+        if (this._store) {
+            await this._store.load(this._backend, this._config);
+        }
+
         if (type === 'get_state') {
-            return Promise.resolve({
+            return {
                 backend: this._backend,
                 model: {id: this._runtime.label},
-            });
+            };
         }
         if (type === 'get_messages') {
-            return Promise.resolve({messages: this._history});
+            return {messages: this._store ? [...this._store.messages] : []};
         }
         if (type === 'abort') {
-            this._abortActiveTurn();
-            return Promise.resolve({aborted: true});
+            this._turns.cancelActiveTurn({
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                onTerminateProcess: proc => terminateSubprocessGracefully(proc),
+                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+            });
+            return {aborted: true};
         }
         if (type === 'permission_response') {
             return this._sendTurnPermissionResponse(fields);
@@ -425,16 +441,15 @@ export class PiClient {
             }
             return this._runSingleTurnSubprocess(fields.message || '');
         }
-        return Promise.resolve({});
+        return {};
     }
 
-    _sendTurnPermissionResponse({requestId = '', decision = 'deny', alwaysAllow = false, toolName = ''} = {}) {
-        if (alwaysAllow && toolName) {
-            this._alwaysAllowedTools.add(toolName);
-        }
-        if (!this._turnStdin) {
+    _sendTurnPermissionResponse({requestId = '', decision = 'deny', alwaysAllow = false, scopeKey = ''} = {}) {
+        const turn = this._turns.activeTurn;
+        if (!turn || turn.finalized || !turn.stdin) {
             return Promise.resolve({sent: false});
         }
+
         const payload = JSON.stringify({
             type: 'permission_response',
             requestId,
@@ -442,12 +457,19 @@ export class PiClient {
             alwaysAllow: Boolean(alwaysAllow),
         }) + '\n';
         const bytes = Encoder.encode(payload);
+
         return new Promise(resolve => {
             try {
-                this._turnStdin.write_all_async(bytes, GLib.PRIORITY_DEFAULT, this._turnCancel, (stream, res) => {
+                turn.stdin.write_all_async(bytes, GLib.PRIORITY_DEFAULT, turn.cancellable, (stream, res) => {
                     try {
                         stream.write_all_finish(res);
-                        stream.flush_async(GLib.PRIORITY_DEFAULT, this._turnCancel, () => {});
+                        stream.flush_async(GLib.PRIORITY_DEFAULT, turn.cancellable, () => {});
+                        if (this._turns.isCurrent(turn)) {
+                            if (decision === 'allow' && alwaysAllow && scopeKey) {
+                                this._approvedScopes.add(scopeKey);
+                            }
+                            this._turns.leaveApproval(turn, requestId);
+                        }
                         resolve({sent: true});
                     } catch (_) {
                         resolve({sent: false});
@@ -457,6 +479,38 @@ export class PiClient {
                 resolve({sent: false});
             }
         });
+    }
+
+    _attachTurnWatchdog(turn, timeoutSec, onTimeoutMessage) {
+        let timerId = 0;
+        const pause = () => {
+            if (timerId) {
+                try { GLib.source_remove(timerId); } catch (_) {}
+                timerId = 0;
+            }
+        };
+        const reset = () => {
+            pause();
+            if (!this._turns.isCurrent(turn)) return;
+            timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutSec, () => {
+                timerId = 0;
+                if (this._turns.isCurrent(turn)) {
+                    try { turn.cancellable?.cancel?.(); } catch (_) {}
+                    this._turns.finalizeTurn(turn, {
+                        errorText: onTimeoutMessage,
+                        aborted: false,
+                        onPersistAssistant: msg => this._store?.appendMessage(msg, this._backend, this._config),
+                        onTerminateProcess: proc => terminateSubprocessGracefully(proc),
+                        onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+                    });
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+        };
+        turn.pauseWatchdog = pause;
+        turn.resetWatchdog = reset;
+        turn.cleanupWatchdog = pause;
+        reset();
     }
 
     _discoverOpenAIModelAsync(cancellable) {
@@ -484,7 +538,7 @@ export class PiClient {
                         return;
                     }
                     this._runtime.modelId = firstId;
-                    this._runtime.label = `API · ${firstId}`;
+                    this._runtime.label = firstId;
                     resolve(firstId);
                 } catch (e) {
                     reject(new Error(`请在设置中填写模型 ID（自动拉取失败：${e.message}）`));
@@ -494,46 +548,42 @@ export class PiClient {
     }
 
     async _runOpenAITurn(promptText) {
-        if (this._turnActive) {
-            throw new Error('上一轮请求仍在执行中');
-        }
-        this._turnActive = true;
-        this._turnAborted = false;
-        this._turnCancel = new Gio.Cancellable();
+        const cancellable = new Gio.Cancellable();
+        const turn = this._turns.beginTurn({
+            backend: 'openai',
+            promptText,
+            cancellable,
+        });
 
-        this._history.push({role: 'user', content: promptText});
-        this._saveTranscriptState();
+        this._store?.appendMessage({role: 'user', content: promptText}, this._backend, this._config);
 
         let modelId;
         try {
-            modelId = await this._discoverOpenAIModelAsync(this._turnCancel);
+            modelId = await this._discoverOpenAIModelAsync(turn.cancellable);
         } catch (err) {
-            this._turnActive = false;
-            this._turnCancel = null;
+            this._turns.finalizeTurn(turn, {errorText: err.message});
             throw err;
         }
 
+        if (!this._turns.isCurrent(turn)) {
+            return {disposition: 'handled'};
+        }
+
         const apiMessages = [];
-        if (this._runtime.systemPrompt) {
-            apiMessages.push({role: 'system', content: this._runtime.systemPrompt});
-        } else {
-            apiMessages.push({
-                role: 'system',
-                content: '你是 Ubuntu 26 / GNOME 50 桌面顶栏中的「随问」AI 助手。请用清晰、简明、准确的中文回答问题。',
-            });
-        }
-        for (const m of this._history.slice(-30)) {
-            if (m && (m.role === 'user' || m.role === 'assistant')) {
-                const txt = messageText(m);
-                if (txt) apiMessages.push({role: m.role, content: txt});
-            }
-        }
+        apiMessages.push({
+            role: 'system',
+            content: this._runtime.systemPrompt ||
+                '你是 Ubuntu 26 / GNOME 50 桌面顶栏中的「随问」AI 助手。请用清晰、简明、准确的中文回答问题。',
+        });
+
+        const budgeted = buildBudgetedContextMessages(this._store?.messages || [], 24, 28000);
+        apiMessages.push(...budgeted);
 
         const msg = Soup.Message.new('POST', this._runtime.chatUrl);
         if (!msg) {
-            this._turnActive = false;
-            this._turnCancel = null;
-            throw new Error(`无效的 OpenAI 接口地址：${this._runtime.chatUrl}`);
+            const err = new Error(`无效的 OpenAI 接口地址：${this._runtime.chatUrl}`);
+            this._turns.finalizeTurn(turn, {errorText: err.message});
+            throw err;
         }
 
         const reqHeaders = msg.get_request_headers();
@@ -543,29 +593,25 @@ export class PiClient {
             reqHeaders.append('Authorization', `Bearer ${this._runtime.apiKey}`);
         }
 
-        const bodyBytes = Encoder.encode(JSON.stringify({
+        const reqBody = {
             model: modelId,
             stream: true,
             messages: apiMessages,
-        }));
-        msg.set_request_body_from_bytes('application/json', new GLib.Bytes(bodyBytes));
+        };
+        if (this._runtime.reasoningEffort) {
+            reqBody.reasoning_effort = this._runtime.reasoningEffort;
+        }
+        msg.set_request_body_from_bytes('application/json', new GLib.Bytes(Encoder.encode(JSON.stringify(reqBody))));
 
-        this._event({type: 'message_start', message: {role: 'assistant'}});
+        this._turns.markStreaming(turn);
+        this._turns.emitForTurn(turn, {type: 'message_start', modelId, message: {role: 'assistant'}});
+        this._attachTurnWatchdog(turn, 120, 'OpenAI 接口响应超时（120s）');
 
-        let streamedText = '';
-        let streamedThinking = '';
-        let nonSseLines = [];
+        const nonSseLines = [];
+        const settleOpenAI = (errorText = '') => {
+            if (!this._turns.isCurrent(turn)) return;
 
-        const finishOpenAITurn = (errorText = '') => {
-            if (this._turnWatchdog) {
-                GLib.source_remove(this._turnWatchdog);
-                this._turnWatchdog = 0;
-            }
-            this._turnActive = false;
-            this._turnCancel = null;
-            if (this._closed) return;
-
-            if (!streamedText && nonSseLines.length > 0 && !errorText) {
+            if (!turn.text && nonSseLines.length > 0 && !errorText) {
                 const joined = nonSseLines.join('\n').trim();
                 if (joined.startsWith('{')) {
                     try {
@@ -575,51 +621,36 @@ export class PiClient {
                         } else {
                             const content = obj.choices?.[0]?.message?.content;
                             if (typeof content === 'string' && content) {
-                                streamedText = content;
+                                turn.text = content;
+                                turn.sawDoneMarker = true;
                             }
                         }
                     } catch (_) {}
                 }
             }
 
-            if (streamedText) {
-                const parts = [];
-                if (streamedThinking) parts.push({type: 'thinking', thinking: streamedThinking});
-                parts.push({type: 'text', text: streamedText});
-                this._history.push({role: 'assistant', content: parts});
-                this._saveTranscriptState();
-                this._event({type: 'message_end', message: {role: 'assistant', content: parts}});
-            } else if (!this._turnAborted && errorText) {
-                this._event({
-                    type: 'message_end',
-                    message: {role: 'assistant', content: '', errorMessage: errorText},
-                });
+            // Detect abnormal SSE truncation (EOF without [DONE] marker)
+            if (!turn.aborted && !errorText && !turn.sawDoneMarker) {
+                if (!turn.text) {
+                    errorText = '响应连接意外中断（未收到完整流结束标记）';
+                } else {
+                    turn.text += '\n\n*(⚠️ 网络流提前中断，以上回答可能不完整)*';
+                }
             }
-            this._event({type: 'agent_settled', aborted: Boolean(this._turnAborted)});
-        };
 
-        const resetWatchdog = () => {
-            if (this._turnWatchdog) GLib.source_remove(this._turnWatchdog);
-            this._turnWatchdog = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 120, () => {
-                this._turnWatchdog = 0;
-                this._turnCancel?.cancel();
-                finishOpenAITurn('OpenAI 接口响应超时（120s）');
-                return GLib.SOURCE_REMOVE;
+            this._turns.finalizeTurn(turn, {
+                errorText,
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
             });
         };
-        resetWatchdog();
 
-        this._httpSession.send_async(msg, GLib.PRIORITY_DEFAULT, this._turnCancel, (sess, res) => {
-            if (this._closed) return;
+        this._httpSession.send_async(msg, GLib.PRIORITY_DEFAULT, turn.cancellable, (sess, res) => {
+            if (!this._turns.isCurrent(turn)) return;
             let baseStream;
             try {
                 baseStream = sess.send_finish(res);
             } catch (err) {
-                if (this._turnAborted) {
-                    finishOpenAITurn('');
-                } else {
-                    finishOpenAITurn(`请求失败：${err.message}`);
-                }
+                settleOpenAI(turn.aborted ? '' : `请求失败：${err.message}`);
                 return;
             }
 
@@ -629,7 +660,9 @@ export class PiClient {
             if (status < 200 || status >= 300) {
                 const errLines = [];
                 const readErr = () => {
-                    dataStream.read_line_async(GLib.PRIORITY_DEFAULT, this._turnCancel, (s, r) => {
+                    if (!this._turns.isCurrent(turn)) return;
+                    dataStream.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
+                        if (!this._turns.isCurrent(turn)) return;
                         try {
                             const [line] = s.read_line_finish_utf8(r);
                             if (line !== null) {
@@ -652,7 +685,7 @@ export class PiClient {
                         } else if (rawBody) {
                             detail = `${detail}: ${rawBody.slice(0, 160)}`;
                         }
-                        finishOpenAITurn(detail);
+                        settleOpenAI(detail);
                     });
                 };
                 readErr();
@@ -660,47 +693,39 @@ export class PiClient {
             }
 
             const readSseLine = () => {
-                if (this._closed || !this._turnActive) return;
-                dataStream.read_line_async(GLib.PRIORITY_DEFAULT, this._turnCancel, (s, r) => {
-                    if (this._closed) return;
+                if (!this._turns.isCurrent(turn)) return;
+                dataStream.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
+                    if (!this._turns.isCurrent(turn)) return;
                     try {
                         const [line] = s.read_line_finish_utf8(r);
                         if (line === null) {
-                            finishOpenAITurn('');
+                            settleOpenAI('');
                             return;
                         }
-                        resetWatchdog();
+                        turn.resetWatchdog?.();
                         const sse = parseOpenAISSELine(line);
                         if (sse) {
                             if (sse.error) {
-                                finishOpenAITurn(sse.error);
+                                settleOpenAI(sse.error);
                                 return;
                             }
                             if (sse.done) {
-                                finishOpenAITurn('');
+                                turn.sawDoneMarker = true;
+                                settleOpenAI('');
                                 return;
                             }
                             if (sse.thinkingDelta) {
-                                streamedThinking += sse.thinkingDelta;
-                                this._event({
-                                    type: 'message_update',
-                                    assistantMessageEvent: {type: 'thinking_delta', delta: sse.thinkingDelta},
-                                });
+                                this._turns.appendThinking(turn, sse.thinkingDelta);
                             }
                             if (sse.textDelta) {
-                                streamedText += sse.textDelta;
-                                this._event({
-                                    type: 'message_update',
-                                    assistantMessageEvent: {type: 'text_delta', delta: sse.textDelta},
-                                });
+                                this._turns.appendText(turn, sse.textDelta);
                             }
                         } else if (line.trim()) {
                             nonSseLines.push(line);
                         }
                         readSseLine();
                     } catch (err) {
-                        if (this._turnAborted) finishOpenAITurn('');
-                        else finishOpenAITurn(err.message);
+                        settleOpenAI(turn.aborted ? '' : err.message);
                     }
                 });
             };
@@ -711,13 +736,22 @@ export class PiClient {
     }
 
     _runSingleTurnSubprocess(promptText) {
-        if (this._turnProcess) {
-            return Promise.reject(new Error('上一轮请求仍在执行中'));
-        }
-        this._history.push({role: 'user', content: promptText});
-        this._saveTranscriptState();
+        const cancellable = new Gio.Cancellable();
+        const turn = this._turns.beginTurn({
+            backend: this._backend,
+            promptText,
+            cancellable,
+        });
 
+        const historyBeforePrompt = this._store ? [...this._store.messages] : [];
+        const remoteId = this._store?.remoteSessionId || '';
+        const effectiveCliPrompt = (!remoteId && historyBeforePrompt.length > 0)
+            ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptText)
+            : promptText;
+
+        this._store?.appendMessage({role: 'user', content: promptText}, this._backend, this._config);
         this._stderrLines = [];
+
         const launcher = new Gio.SubprocessLauncher({
             flags:
                 Gio.SubprocessFlags.STDIN_PIPE |
@@ -727,11 +761,19 @@ export class PiClient {
         launcher.set_cwd(this._workspace);
         launcher.setenv('PATH', this._runtime.pathEnv, true);
         launcher.setenv('NO_COLOR', '1', true);
+
+        const zcodeIsolated = this._backend === 'zcode'
+            ? createIsolatedZCodeConfigOverride(this._config)
+            : {env: {}, tempFilePath: ''};
+        if (zcodeIsolated.tempFilePath) {
+            turn.tempFiles.push(zcodeIsolated.tempFilePath);
+        }
+
         const turnExtraEnv = {
             ...(this._runtime.extraEnv || {}),
-            ...(this._backend === 'zcode' ? prepareZCodePersonalConfigEnv(this._config).env : {}),
-            ...(this._alwaysAllowedTools.size > 0
-                ? {QUICK_CHAT_AUTO_APPROVE_TOOLS: Array.from(this._alwaysAllowedTools).join(',')}
+            ...zcodeIsolated.env,
+            ...(this._approvedScopes.size > 0
+                ? {QUICK_CHAT_APPROVED_SCOPES: JSON.stringify(Array.from(this._approvedScopes))}
                 : {}),
         };
         for (const [k, v] of Object.entries(turnExtraEnv)) {
@@ -744,63 +786,62 @@ export class PiClient {
             commandPrefix: this._runtime.commandPrefix,
         };
         const argv = this._backend === 'zcode'
-            ? buildZCodeArgs(spawnConfig, promptText, this._remoteSessionId)
-            : buildCodexArgs(spawnConfig, this._workspace, promptText, this._remoteSessionId);
+            ? buildZCodeArgs(spawnConfig, effectiveCliPrompt, remoteId)
+            : buildCodexArgs(spawnConfig, this._workspace, effectiveCliPrompt, remoteId);
 
         try {
-            this._turnCancel = new Gio.Cancellable();
-            this._turnAborted = false;
-            this._turnProcess = launcher.spawnv(argv);
+            turn.process = launcher.spawnv(argv);
             if (this._backend === 'zcode') {
-                this._turnStdin = this._turnProcess.get_stdin_pipe();
+                turn.stdin = turn.process.get_stdin_pipe();
             } else {
-                this._turnStdin = null;
-                try { this._turnProcess.get_stdin_pipe()?.close(null); } catch (_) {}
+                try { turn.process.get_stdin_pipe()?.close(null); } catch (_) {}
             }
         } catch (error) {
-            this._turnProcess = null;
-            this._turnStdin = null;
+            this._turns.finalizeTurn(turn, {
+                errorText: error.message,
+                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+            });
             return Promise.reject(error);
         }
 
-        const stdout = new Gio.DataInputStream({base_stream: this._turnProcess.get_stdout_pipe()});
-        const stderr = new Gio.DataInputStream({base_stream: this._turnProcess.get_stderr_pipe()});
-        this._readStderr(stderr, this._turnCancel);
+        const stdout = new Gio.DataInputStream({base_stream: turn.process.get_stdout_pipe()});
+        const stderr = new Gio.DataInputStream({base_stream: turn.process.get_stderr_pipe()});
+        this._readStderr(stderr, turn.cancellable);
 
-        let streamedText = '';
-        let streamedThinking = '';
-        let finalError = '';
+        this._turns.markStreaming(turn);
+        this._attachTurnWatchdog(turn, 120, '响应超时（120s 无输出）');
+
         const seenPermissionIds = new Set();
 
-        const pauseTurnWatchdog = () => {
-            if (this._turnWatchdog) {
-                GLib.source_remove(this._turnWatchdog);
-                this._turnWatchdog = 0;
-            }
-        };
-
-        const resetTurnWatchdog = () => {
-            pauseTurnWatchdog();
-            this._turnWatchdog = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 120, () => {
-                this._turnWatchdog = 0;
-                finalError = '响应超时（120s 无输出）';
-                this._abortActiveTurn();
-                return GLib.SOURCE_REMOVE;
+        const settleSubprocess = (errOverride = '') => {
+            if (!this._turns.isCurrent(turn)) return;
+            const errMsg = errOverride
+                || turn.error
+                || (!turn.text && !turn.aborted && this._stderrLines.length
+                    ? this._stderrLines.slice(-2).join(' ')
+                    : '');
+            this._turns.finalizeTurn(turn, {
+                errorText: errMsg,
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                onTerminateProcess: proc => terminateSubprocessGracefully(proc),
+                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
             });
         };
-        resetTurnWatchdog();
 
         const readNextLine = () => {
-            if (this._closed || !this._turnProcess) return;
-            stdout.read_line_async(GLib.PRIORITY_DEFAULT, this._turnCancel, (stream, res) => {
-                if (this._closed) return;
+            if (!this._turns.isCurrent(turn)) return;
+            stdout.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (stream, res) => {
+                if (!this._turns.isCurrent(turn)) return;
                 try {
                     const [line] = stream.read_line_finish_utf8(res);
                     if (line === null) {
-                        this._finishTurnSubprocess(streamedText, streamedThinking, finalError);
+                        settleSubprocess('');
                         return;
                     }
-                    resetTurnWatchdog();
+                    if (turn.state !== 'awaiting_approval') {
+                        turn.resetWatchdog?.();
+                    }
+
                     const trimmed = line.trim();
                     let record = null;
                     if (trimmed.startsWith('{')) {
@@ -809,67 +850,82 @@ export class PiClient {
                     if (record) {
                         const norm = normalizeEvent(this._backend, record);
                         if (norm) {
-                            if (norm.type === 'permission_request') {
-                                if (!seenPermissionIds.has(norm.requestId)) {
-                                    seenPermissionIds.add(norm.requestId);
-                                    pauseTurnWatchdog();
-                                    this._event(norm);
-                                }
-                            } else if (norm.type === 'session_bound' && norm.sessionId) {
-                                this._remoteSessionId = norm.sessionId;
-                                this._saveTranscriptState();
-                            } else if (norm.type === 'turn_result') {
-                                if (norm.sessionId) this._remoteSessionId = norm.sessionId;
-                                if (norm.text && !streamedText) {
-                                    streamedText = norm.text;
-                                    this._event({
-                                        type: 'message_end',
-                                        message: {role: 'assistant', content: streamedText},
+                            if (norm.type === 'bridge_ready') {
+                                if (!norm.patched && this._config?.mode === 'readonly') {
+                                    this._turns.emitForTurn(turn, {
+                                        type: 'bridge_warning',
+                                        message: '当前 ZCode 版本未命中交互审批钩子，敏感工具可能被默认拦截',
                                     });
                                 }
+                            } else if (norm.type === 'permission_request') {
+                                if (!seenPermissionIds.has(norm.requestId)) {
+                                    seenPermissionIds.add(norm.requestId);
+                                    this._turns.enterApproval(turn, norm.requestId);
+                                    this._turns.emitForTurn(turn, norm);
+                                }
+                            } else if (norm.type === 'permission_resolved') {
+                                this._turns.leaveApproval(turn, norm.requestId);
+                                this._turns.emitForTurn(turn, norm);
+                            } else if (norm.type === 'session_bound' && norm.sessionId) {
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                            } else if (norm.type === 'turn_completed') {
+                                turn.sawDoneMarker = true;
+                            } else if (norm.type === 'turn_result') {
+                                if (norm.sessionId) {
+                                    this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                                }
+                                if (norm.text && !turn.text) {
+                                    turn.text = norm.text;
+                                }
                             } else if (norm.type === 'text_snapshot') {
-                                const delta = norm.text.startsWith(streamedText)
-                                    ? norm.text.slice(streamedText.length)
+                                const delta = norm.text.startsWith(turn.text)
+                                    ? norm.text.slice(turn.text.length)
                                     : norm.text;
-                                streamedText = norm.text;
+                                turn.text = norm.text;
                                 if (delta) {
-                                    this._event({
+                                    this._turns.emitForTurn(turn, {
                                         type: 'message_update',
                                         assistantMessageEvent: {type: 'text_delta', delta},
                                     });
                                 }
                             } else if (norm.type === 'thinking_snapshot') {
-                                const delta = norm.text.startsWith(streamedThinking)
-                                    ? norm.text.slice(streamedThinking.length)
+                                const delta = norm.text.startsWith(turn.thinking)
+                                    ? norm.text.slice(turn.thinking.length)
                                     : norm.text;
-                                streamedThinking = norm.text;
+                                turn.thinking = norm.text;
                                 if (delta) {
-                                    this._event({
+                                    this._turns.emitForTurn(turn, {
                                         type: 'message_update',
                                         assistantMessageEvent: {type: 'thinking_delta', delta},
                                     });
                                 }
                             } else {
                                 if (norm.sessionId) {
-                                    this._remoteSessionId = norm.sessionId;
+                                    this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
                                 }
                                 if (norm.type === 'message_update') {
                                     const ev = norm.assistantMessageEvent;
-                                    if (ev?.type === 'text_delta') streamedText += ev.delta || '';
-                                    if (ev?.type === 'thinking_delta') streamedThinking += ev.delta || '';
+                                    if (ev?.type === 'text_delta') turn.text += ev.delta || '';
+                                    if (ev?.type === 'thinking_delta') turn.thinking += ev.delta || '';
+                                    this._turns.emitForTurn(turn, norm);
+                                } else if (norm.type === 'message_end' && norm.message) {
+                                    if (typeof norm.message.content === 'string' && norm.message.content) {
+                                        turn.text = norm.message.content;
+                                    }
+                                    if (norm.message.errorMessage) {
+                                        turn.error = norm.message.errorMessage;
+                                    }
+                                    // Defer final `message_end` emission to `finalizeTurn` so it fires exactly once!
+                                } else {
+                                    this._turns.emitForTurn(turn, norm);
                                 }
-                                if (norm.type === 'message_end' && norm.message) {
-                                    if (norm.message.content) streamedText = norm.message.content;
-                                    if (norm.message.errorMessage) finalError = norm.message.errorMessage;
-                                }
-                                this._event(norm);
                             }
                         }
                     }
                     readNextLine();
                 } catch (err) {
-                    if (!this._closed && !this._turnAborted) {
-                        this._finishTurnSubprocess(streamedText, streamedThinking, err.message);
+                    if (!turn.aborted) {
+                        settleSubprocess(err.message);
                     }
                 }
             });
@@ -877,58 +933,6 @@ export class PiClient {
 
         readNextLine();
         return Promise.resolve({disposition: 'streaming'});
-    }
-
-    _finishTurnSubprocess(streamedText, streamedThinking, finalError) {
-        if (this._turnWatchdog) {
-            GLib.source_remove(this._turnWatchdog);
-            this._turnWatchdog = 0;
-        }
-        const proc = this._turnProcess;
-        this._turnProcess = null;
-        this._turnCancel = null;
-
-        if (this._closed) return;
-
-        if (streamedText) {
-            const contentParts = [];
-            if (streamedThinking) contentParts.push({type: 'thinking', thinking: streamedThinking});
-            contentParts.push({type: 'text', text: streamedText});
-            this._history.push({role: 'assistant', content: contentParts});
-            this._saveTranscriptState();
-            this._event({
-                type: 'message_end',
-                message: {role: 'assistant', content: contentParts},
-            });
-        } else if (!this._turnAborted && (finalError || this._stderrLines.length)) {
-            const errMsg = finalError || this._stderrLines.slice(-2).join(' ');
-            this._event({
-                type: 'message_end',
-                message: {role: 'assistant', content: '', errorMessage: errMsg},
-            });
-        }
-
-        try { proc?.force_exit(); } catch (_) {}
-        this._event({type: 'agent_settled', aborted: Boolean(this._turnAborted)});
-    }
-
-    _abortActiveTurn() {
-        this._turnAborted = true;
-        this._turnActive = false;
-        if (this._turnWatchdog) {
-            GLib.source_remove(this._turnWatchdog);
-            this._turnWatchdog = 0;
-        }
-        this._turnCancel?.cancel();
-        const proc = this._turnProcess;
-        this._turnProcess = null;
-        if (proc) {
-            try { proc.send_signal(15); } catch (_) {}
-            try { proc.force_exit(); } catch (_) {}
-        }
-        if (!this._closed) {
-            this._event({type: 'agent_settled', aborted: true});
-        }
     }
 
     _writeNext() {
@@ -940,7 +944,7 @@ export class PiClient {
             try {
                 stream.write_all_finish(result);
             } catch (error) {
-                if (!this._closed) this._fail(error);
+                if (!this._closed && !this._piReclaimedIdle) this._fail(error);
                 return;
             }
             this._writeNext();
@@ -950,10 +954,11 @@ export class PiClient {
     _readStdout() {
         if (this._closed || !this._input) return;
         this._input.read_line_async(GLib.PRIORITY_DEFAULT, this._cancel, (stream, result) => {
-            if (this._closed) return;
+            if (this._closed || this._piReclaimedIdle) return;
             try {
                 const [line] = stream.read_line_finish_utf8(result);
                 if (line === null) {
+                    if (this._piReclaimedIdle) return;
                     const detail = this._formatStderrSuffix();
                     this._fail(new Error(`Pi 已退出${detail || '；请检查安装、模型及日志'}`));
                     return;
@@ -971,13 +976,19 @@ export class PiClient {
                     GLib.source_remove(p.timeout);
                     if (record.success) p.resolve(record.data ?? {});
                     else p.reject(new Error(record.error || `Pi 请求失败：${record.command}`));
+                    if (this._pending.size === 0) {
+                        this._schedulePiIdleReclaim();
+                    }
                 } else if (record.type !== 'response') {
                     this._refreshPromptTimeouts();
+                    if (record.type === 'agent_end') {
+                        this._schedulePiIdleReclaim();
+                    }
                     this._event(record);
                 }
                 this._readStdout();
             } catch (error) {
-                if (!this._closed) this._fail(error);
+                if (!this._closed && !this._piReclaimedIdle) this._fail(error);
             }
         });
     }
@@ -991,13 +1002,12 @@ export class PiClient {
     close() {
         if (this._closed) return;
         this._closed = true;
-        this._turnActive = false;
-        if (this._turnWatchdog) {
-            GLib.source_remove(this._turnWatchdog);
-            this._turnWatchdog = 0;
-        }
+        this._clearPiIdleTimer();
+        this._turns.dispose(
+            proc => terminateSubprocessGracefully(proc),
+            files => files.forEach(removeFileQuietly)
+        );
         this._cancel?.cancel();
-        this._turnCancel?.cancel();
         try { this._httpSession?.abort(); } catch (_) {}
         this._httpSession = null;
         for (const p of this._pending.values()) {
@@ -1007,14 +1017,7 @@ export class PiClient {
         this._pending.clear();
         this._writeQueue = [];
 
-        const terminateCleanly = proc => {
-            if (!proc) return;
-            try { proc.send_signal(15); } catch (_) {}
-            try { proc.force_exit(); } catch (_) {}
-        };
-        terminateCleanly(this._turnProcess);
-        terminateCleanly(this._process);
-        this._turnProcess = null;
+        terminateSubprocessGracefully(this._process);
         this._process = null;
     }
 }

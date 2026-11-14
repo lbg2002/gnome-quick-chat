@@ -1,21 +1,29 @@
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {PiClient} from './piClient.js';
 import {
+    computePermissionScope,
     detailedMessages,
-    escapePango,
+    getBackendCapabilities,
     messageText,
     messageThinking,
-    parseMarkdownBlocks,
 } from './protocol.js';
+import {getDataDir, getSessionsDir} from './core/paths.js';
+import {loadOpenAIApiKey} from './core/secretStore.js';
+import {detectEffectiveBackend, loadLocalBackendCatalog} from './core/backendDetect.js';
+import {DateMenuIntegration} from './ui/dateMenuIntegration.js';
+import {renderCardBodyIncremental} from './ui/markdownRenderer.js';
 
 const V = Clutter.Orientation.VERTICAL;
 const H = Clutter.Orientation.HORIZONTAL;
+const HISTORY_PAGE_SIZE = 24;
 
 const QUICK_PROMPTS = [
     {label: '💡 解释命令或报错', prompt: '请帮我解释下面这段 Linux 命令或终端报错的含义，并给出解决建议：\n'},
@@ -36,9 +44,9 @@ function button(label, callback, styleClass = 'button qc-button', tooltip = '') 
     return b;
 }
 
-function wrapLabel(text, style = '', useMarkup = false) {
+function wrapLabel(text, style = '') {
     const label = new St.Label({
-        text: useMarkup ? '' : text,
+        text: text ?? '',
         style_class: style,
         x_expand: true,
         y_align: Clutter.ActorAlign.START,
@@ -48,27 +56,7 @@ function wrapLabel(text, style = '', useMarkup = false) {
     ct.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
     ct.ellipsize = Pango.EllipsizeMode.NONE;
     ct.selectable = false;
-    if (useMarkup) {
-        try {
-            ct.use_markup = true;
-            ct.set_markup(text);
-        } catch (_) {
-            ct.use_markup = false;
-            label.text = text;
-        }
-    }
     return label;
-}
-
-function setLabelMarkupSafe(label, pangoMarkup, rawFallback) {
-    const ct = label.clutter_text;
-    try {
-        ct.use_markup = true;
-        ct.set_markup(pangoMarkup);
-    } catch (_) {
-        ct.use_markup = false;
-        label.text = rawFallback ?? pangoMarkup;
-    }
 }
 
 function formatNowTime() {
@@ -82,22 +70,24 @@ export default class QuickChat extends Extension {
         this._generation = 0;
         this._timers = new Set();
         this._sourceSignals = new Map();
+        this._registeredKeybindings = new Set();
         this._promptHistory = [];
         this._historyIndex = -1;
         this._draftInput = '';
         this._userScrolledUp = false;
         this._needsReconnect = false;
+        this._lastStatusState = '';
+        this._lastStatusText = '';
+        this._hasPendingBackgroundRender = false;
+        this._hasUnreadBackgroundReply = false;
+        this._allHistoryMessages = [];
+        this._historyStartIndex = 0;
+        this._loadMoreBtn = null;
+        this._modelPickerOpen = false;
 
         this._settings = this.getSettings();
-        this._date = Main.panel.statusArea.dateMenu;
-        this._native = this._date?._messageList;
-        this._parent = this._native?.get_parent();
-        if (!this._parent || this._parent.name !== 'calendarArea') {
-            console.warn('[Quick Chat] Unsupported date menu; no UI changes made.');
-            return;
-        }
+        this._dateIntegration = new DateMenuIntegration();
 
-        this._index = this._parent.get_children().indexOf(this._native);
         this._wrapper = new St.BoxLayout({
             orientation: V,
             style_class: 'qc-wrapper',
@@ -115,47 +105,55 @@ export default class QuickChat extends Extension {
         this._wrapper.add_child(this._chat);
         this._buildChat();
 
-        // Keep native notification actor intact inside wrapper and restore on disable.
-        this._parent.remove_child(this._native);
-        this._native.add_style_class_name('qc-native-clean');
-        this._wrapper.add_child(this._native);
-        this._parent.insert_child_at_index(this._wrapper, this._index);
-
-        this._nativeVisibleGuard = this._native.connect('notify::visible', () => {
-            if (this._enabled && this._tab === 'ai' && this._native.visible) {
-                this._native.visible = false;
-            }
-        });
+        const mounted = this._dateIntegration.mount(
+            this._wrapper,
+            () => this._enabled && this._tab === 'ai'
+        );
+        if (!mounted) {
+            try { this._wrapper.destroy(); } catch (_) {}
+            this._wrapper = null;
+            return;
+        }
 
         this._tab = this._getSettingString('default-tab', 'ai') === 'notifications' ? 'notifications' : 'ai';
         this._setTab(this._tab, false, false);
 
-        this._menuSignal = this._date.menu.connect('open-state-changed', (_, open) => {
+        const dateMenu = this._dateIntegration.dateMenu;
+        this._menuSignal = dateMenu.menu.connect('open-state-changed', (_, open) => {
             if (open) {
                 this._syncThemeStyle();
                 this._updateNotificationBadge();
                 if (this._tab === 'ai') {
+                    this._flushPendingBackgroundWork();
+                    if (this._client) {
+                        loadOpenAIApiKey(this._settings).then(k => this._client?.updateApiKey?.(k)).catch(() => {});
+                    }
                     this._ensureClient();
                     this._scheduleTimeout(40, () => {
                         if (this._enabled && this._tab === 'ai') this._entry?.grab_key_focus();
                     });
+                } else {
+                    this._updateAiTabBadge();
                 }
+            } else if (this._modelPickerOpen) {
+                this._toggleModelPicker(false);
             }
         });
 
         this._sessionSignal = Main.sessionMode.connect('updated', () => {
             // Never expose the transcript on the lock screen or greeter.
             if (Main.sessionMode.isLocked || Main.sessionMode.isGreeter) {
-                this._wrapper.hide();
+                this._wrapper?.hide();
                 this._stopClient();
             } else {
-                this._wrapper.show();
+                this._wrapper?.show();
                 this._setTab(this._tab, false, false);
             }
         });
 
         this._connectSettingsSignals();
         this._connectNotificationSignals();
+        this._registerGlobalKeybindings();
         this._syncThemeStyle();
         this._applyDimensions();
     }
@@ -185,6 +183,16 @@ export default class QuickChat extends Extension {
 
     _markdownEnabled() {
         return this._getSettingBool('render-markdown', true);
+    }
+
+    _isChatVisible() {
+        return Boolean(
+            this._enabled &&
+            this._dateIntegration?.dateMenu?.menu?.isOpen &&
+            this._tab === 'ai' &&
+            !Main.sessionMode.isLocked &&
+            !Main.sessionMode.isGreeter
+        );
     }
 
     _scheduleTimeout(ms, fn) {
@@ -221,11 +229,120 @@ export default class QuickChat extends Extension {
         } catch (_) {}
     }
 
+    _registerGlobalKeybindings() {
+        this._unregisterGlobalKeybindings();
+        const addBinding = (keyName, handler) => {
+            if (!this._hasKey(keyName)) return;
+            const shortcuts = this._settings.get_strv(keyName);
+            if (!shortcuts || !shortcuts.length || !shortcuts[0]) return;
+            try {
+                Main.wm.addKeybinding(
+                    keyName,
+                    this._settings,
+                    Meta.KeyBindingFlags.NONE,
+                    Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW | Shell.ActionMode.POPUP,
+                    handler
+                );
+                this._registeredKeybindings.add(keyName);
+            } catch (err) {
+                console.warn(`[Quick Chat] Failed to bind ${keyName}: ${err.message}`);
+            }
+        };
+
+        addBinding('toggle-shortcut', () => this._toggleQuickChatPanel());
+        addBinding('clipboard-shortcut', () => this._triggerClipboardAsk());
+    }
+
+    _unregisterGlobalKeybindings() {
+        for (const keyName of this._registeredKeybindings) {
+            try {
+                Main.wm.removeKeybinding(keyName);
+            } catch (_) {}
+        }
+        this._registeredKeybindings.clear();
+    }
+
+    _toggleQuickChatPanel() {
+        if (!this._enabled || Main.sessionMode.isLocked || Main.sessionMode.isGreeter) return;
+        const menu = this._dateIntegration?.dateMenu?.menu;
+        if (!menu) return;
+        if (menu.isOpen && this._tab === 'ai') {
+            menu.close();
+            return;
+        }
+        if (!menu.isOpen) {
+            menu.open(true);
+        }
+        this._setTab('ai', true, true);
+        this._scheduleTimeout(50, () => {
+            if (this._enabled && this._tab === 'ai') {
+                this._entry?.grab_key_focus();
+            }
+        });
+    }
+
+    _triggerClipboardAsk(openPanelFirst = true) {
+        if (!this._enabled || Main.sessionMode.isLocked || Main.sessionMode.isGreeter) return;
+        const menu = this._dateIntegration?.dateMenu?.menu;
+        if (openPanelFirst && menu && !menu.isOpen) {
+            menu.open(true);
+        }
+        if (this._tab !== 'ai') {
+            this._setTab('ai', true, true);
+        }
+
+        const clip = St.Clipboard.get_default();
+        const applyClipText = raw => {
+            const trimmed = String(raw || '').trim();
+            if (!trimmed || !this._enabled) return;
+            const clipped = trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}…` : trimmed;
+            const prompt = `请帮我分析、解释或处理以下内容：\n${clipped}`;
+            this._entry.set_text(prompt);
+            this._entry.grab_key_focus();
+            this._entry.clutter_text.set_cursor_position(-1);
+        };
+
+        clip.get_text(St.ClipboardType.CLIPBOARD, (_, text) => {
+            if (text && text.trim()) {
+                applyClipText(text);
+                return;
+            }
+            clip.get_text(St.ClipboardType.PRIMARY, (__, primaryText) => {
+                if (primaryText && primaryText.trim()) {
+                    applyClipText(primaryText);
+                } else {
+                    this._entry?.grab_key_focus();
+                }
+            });
+        });
+    }
+
     _buildTopTabs() {
         this._tabs = new St.BoxLayout({orientation: H, style_class: 'qc-tabs', y_align: Clutter.ActorAlign.CENTER});
         const tabGroup = new St.BoxLayout({orientation: H, style_class: 'qc-tab-group'});
 
-        this._aiTab = button('✦ 随问', () => this._setTab('ai'), 'qc-tab-button', '切换到随问助手');
+        this._aiTab = new St.Button({
+            style_class: 'qc-tab-button',
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            accessible_name: '切换到随问助手',
+        });
+        const aiContent = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-tab-content',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        aiContent.add_child(new St.Label({text: '✦ 随问', y_align: Clutter.ActorAlign.CENTER}));
+        this._aiBadge = new St.Label({
+            text: '●',
+            style_class: 'qc-ai-tab-dot',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        aiContent.add_child(this._aiBadge);
+        this._aiTab.set_child(aiContent);
+        this._aiTab.connect('clicked', () => this._setTab('ai'));
         tabGroup.add_child(this._aiTab);
 
         this._notificationTab = new St.Button({
@@ -260,7 +377,7 @@ export default class QuickChat extends Extension {
         this._tabs.add_child(this._reconnectButton);
 
         this._settingsButton = button('⚙', () => {
-            this._date.menu.close();
+            this._dateIntegration?.dateMenu?.menu?.close();
             this.openPreferences();
         }, 'qc-icon-button', '随问设置');
         this._tabs.add_child(this._settingsButton);
@@ -268,11 +385,65 @@ export default class QuickChat extends Extension {
         this._wrapper.add_child(this._tabs);
     }
 
+    _updateAiTabBadge() {
+        if (!this._aiBadge) return;
+        const hasPendingApproval = Boolean(
+            this._live?.toolNodes?.some(n => n.status === 'pending_approval')
+        );
+        for (const cls of ['qc-ai-dot-busy', 'qc-ai-dot-pending', 'qc-ai-dot-unread']) {
+            this._aiBadge.remove_style_class_name(cls);
+        }
+
+        if (this._tab === 'ai' && this._dateIntegration?.dateMenu?.menu?.isOpen) {
+            this._aiBadge.visible = false;
+            return;
+        }
+
+        if (hasPendingApproval) {
+            this._aiBadge.text = '!';
+            this._aiBadge.add_style_class_name('qc-ai-dot-pending');
+            this._aiBadge.visible = true;
+        } else if (this._busy) {
+            this._aiBadge.text = '●';
+            this._aiBadge.add_style_class_name('qc-ai-dot-busy');
+            this._aiBadge.visible = true;
+        } else if (this._hasUnreadBackgroundReply) {
+            this._aiBadge.text = '●';
+            this._aiBadge.add_style_class_name('qc-ai-dot-unread');
+            this._aiBadge.visible = true;
+        } else {
+            this._aiBadge.visible = false;
+        }
+    }
+
+    _flushPendingBackgroundWork() {
+        this._hasUnreadBackgroundReply = false;
+        this._updateAiTabBadge();
+        if (!this._hasPendingBackgroundRender) return;
+        this._hasPendingBackgroundRender = false;
+        for (const card of this._cardList || []) {
+            if (card.dirty?.text || card.dirty?.thinking || card.dirty?.tools) {
+                card.flushRender?.(true);
+            }
+        }
+        this._scrollBottom(false);
+    }
+
     _buildChat() {
         const header = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-header',
             y_align: Clutter.ActorAlign.CENTER,
+        });
+
+        this._statusBtn = new St.Button({
+            style_class: 'qc-status-btn',
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            x_expand: true,
+            x_align: Clutter.ActorAlign.FILL,
+            accessible_name: '点击快速切换模型与后端',
         });
         const statusBox = new St.BoxLayout({
             orientation: H,
@@ -288,11 +459,36 @@ export default class QuickChat extends Extension {
         this._status = wrapLabel('未连接', 'qc-status');
         this._status.y_align = Clutter.ActorAlign.CENTER;
         statusBox.add_child(this._status);
-        header.add_child(statusBox);
+
+        this._modelChevron = new St.Label({
+            text: '▾',
+            style_class: 'qc-status-chevron',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        statusBox.add_child(this._modelChevron);
+        this._statusBtn.set_child(statusBox);
+        this._statusBtn.connect('clicked', () => this._toggleModelPicker());
+        header.add_child(this._statusBtn);
+
+        this._clipAskBtn = button(
+            '📋',
+            () => this._triggerClipboardAsk(false),
+            'qc-button-subtle',
+            '读取剪贴板内容并提问'
+        );
+        header.add_child(this._clipAskBtn);
 
         this._newButton = button('＋ 新对话', () => this._newSession(), 'qc-button-subtle', '开启新对话');
         header.add_child(this._newButton);
         this._chat.add_child(header);
+
+        this._modelPickerBox = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-model-picker',
+            x_expand: true,
+            visible: false,
+        });
+        this._chat.add_child(this._modelPickerBox);
 
         this._scrollStack = new St.Widget({
             style_class: 'qc-scroll-stack',
@@ -378,6 +574,169 @@ export default class QuickChat extends Extension {
         this._live = null;
     }
 
+    _toggleModelPicker(forceState) {
+        if (!this._modelPickerBox) return;
+        const nextOpen = typeof forceState === 'boolean' ? forceState : !this._modelPickerOpen;
+        this._modelPickerOpen = nextOpen;
+        if (this._modelChevron) {
+            this._modelChevron.text = nextOpen ? '▴' : '▾';
+        }
+        if (!nextOpen) {
+            this._modelPickerBox.visible = false;
+            this._dateIntegration?.nudgeLayout();
+            return;
+        }
+        this._populateModelPicker();
+        this._modelPickerBox.visible = true;
+        this._dateIntegration?.nudgeLayout();
+    }
+
+    _populateModelPicker() {
+        if (!this._modelPickerBox) return;
+        this._modelPickerBox.destroy_all_children();
+
+        const configuredBackend = this._getSettingString('backend', 'auto') || 'auto';
+        const effectiveBackend = detectEffectiveBackend(
+            configuredBackend,
+            this._getSettingString('pi-path', 'pi'),
+            this._getSettingString('openai-base-url', '')
+        );
+
+        // Row 1: Backend switcher chips
+        const backendRow = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-picker-row',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        backendRow.add_child(new St.Label({
+            text: '引擎:',
+            style_class: 'qc-picker-label',
+            y_align: Clutter.ActorAlign.CENTER,
+        }));
+
+        const backendChoices = [
+            {id: 'auto', label: '自动'},
+            {id: 'zcode', label: 'ZCode'},
+            {id: 'codex', label: 'Codex'},
+            {id: 'pi', label: 'Pi'},
+            {id: 'openai', label: 'OpenAI'},
+        ];
+        for (const item of backendChoices) {
+            const active = configuredBackend === item.id;
+            const chip = button(
+                item.label,
+                () => {
+                    this._settings.set_string('backend', item.id);
+                    this._populateModelPicker();
+                },
+                active ? 'qc-picker-chip qc-picker-chip-active' : 'qc-picker-chip',
+                `切换到 ${item.label}`
+            );
+            backendRow.add_child(chip);
+        }
+        this._modelPickerBox.add_child(backendRow);
+
+        // Row 2: Discovered Models for effectiveBackend
+        const catalog = loadLocalBackendCatalog(effectiveBackend);
+        const curProvider = this._getSettingString('provider', '').trim();
+        const curModel = effectiveBackend === 'openai'
+            ? this._getSettingString('openai-model', '').trim()
+            : this._getSettingString('model', '').trim();
+
+        const modelEntries = [];
+        const seen = new Set();
+        for (const prov of catalog.providers) {
+            for (const m of prov.models) {
+                const key = `${prov.id}::${m}`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    modelEntries.push({providerId: prov.id, providerName: prov.name, modelId: m});
+                }
+            }
+        }
+
+        if (modelEntries.length > 0) {
+            const modelsWrap = new St.BoxLayout({
+                orientation: V,
+                style_class: 'qc-picker-models',
+                x_expand: true,
+            });
+
+            // Group up to 10 models in compact 2-per-row layout
+            const topEntries = modelEntries.slice(0, 10);
+            for (let i = 0; i < topEntries.length; i += 2) {
+                const line = new St.BoxLayout({orientation: H, style_class: 'qc-picker-row', x_expand: true});
+                for (const entry of topEntries.slice(i, i + 2)) {
+                    const isSelected = entry.modelId === curModel && (!curProvider || entry.providerId === curProvider);
+                    const suffix = catalog.providers.length > 1 ? ` (${entry.providerName || entry.providerId})` : '';
+                    const lbl = `${isSelected ? '✓ ' : ''}${entry.modelId}${suffix}`;
+                    const mBtn = button(
+                        lbl,
+                        () => {
+                            this._settings.set_string('provider', entry.providerId);
+                            this._settings.set_string('model', entry.modelId);
+                            this._toggleModelPicker(false);
+                        },
+                        isSelected ? 'qc-picker-model-btn qc-picker-chip-active' : 'qc-picker-model-btn',
+                        lbl
+                    );
+                    mBtn.x_expand = true;
+                    line.add_child(mBtn);
+                }
+                modelsWrap.add_child(line);
+            }
+            this._modelPickerBox.add_child(modelsWrap);
+        } else {
+            const hint = wrapLabel(
+                effectiveBackend === 'openai'
+                    ? `当前自定义模型：${curModel || '自动发现'}（可在设置中在线拉取列表）`
+                    : '未检测到预设模型列表，将使用后端默认模型。',
+                'qc-picker-empty'
+            );
+            this._modelPickerBox.add_child(hint);
+        }
+
+        // Row 3: Reasoning effort quick selector + link to full settings
+        const footerRow = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-picker-row',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        footerRow.add_child(new St.Label({
+            text: '思考:',
+            style_class: 'qc-picker-label',
+            y_align: Clutter.ActorAlign.CENTER,
+        }));
+        const curEffort = this._getSettingString('reasoning-effort', 'default') || 'default';
+        for (const ef of [
+            {id: 'default', label: '默认'},
+            {id: 'fast', label: '快'},
+            {id: 'standard', label: '标准'},
+            {id: 'deep', label: '深入'},
+        ]) {
+            const efBtn = button(
+                ef.label,
+                () => {
+                    if (this._hasKey('reasoning-effort')) {
+                        this._settings.set_string('reasoning-effort', ef.id);
+                    }
+                    this._populateModelPicker();
+                },
+                curEffort === ef.id ? 'qc-picker-chip qc-picker-chip-active' : 'qc-picker-chip',
+                `思考强度：${ef.label}`
+            );
+            footerRow.add_child(efBtn);
+        }
+        footerRow.add_child(new St.Widget({x_expand: true}));
+        const moreBtn = button('更多设置…', () => {
+            this._toggleModelPicker(false);
+            this._dateIntegration?.dateMenu?.menu?.close();
+            this.openPreferences();
+        }, 'qc-picker-chip', '打开完整设置页面');
+        footerRow.add_child(moreBtn);
+        this._modelPickerBox.add_child(footerRow);
+    }
+
     _buildEmptyState() {
         if (this._empty) {
             try { this._empty.destroy(); } catch (_) {}
@@ -388,12 +747,16 @@ export default class QuickChat extends Extension {
             x_expand: true,
         });
         const title = wrapLabel('有什么想问的？', 'qc-empty-title');
+
+        const effBackend = detectEffectiveBackend(
+            this._getSettingString('backend', 'auto'),
+            this._getSettingString('pi-path', 'pi'),
+            this._getSettingString('openai-base-url', '')
+        );
+        const caps = getBackendCapabilities(effBackend);
         const mode = this._getSettingString('agent-mode', 'readonly');
-        const modeDesc = mode === 'full'
-            ? '当前：全自动 Agent 模式（自动执行联网、命令与文件工具，免手动审批）'
-            : mode === 'readonly'
-                ? '当前：智能审批 Agent 模式（支持联网/命令/文件工具，敏感操作弹窗审批）'
-                : '当前：纯问答模式（无工具调用，轻量快速响应）';
+        const modeIdx = mode === 'full' ? 2 : mode === 'readonly' ? 1 : 0;
+        const modeDesc = `当前模式：${caps.modeLabels[modeIdx] || caps.modeLabels[1]}`;
         const subtitle = wrapLabel(modeDesc, 'qc-empty-subtitle');
         card.add_child(title);
         card.add_child(subtitle);
@@ -511,6 +874,8 @@ export default class QuickChat extends Extension {
         watch('panel-width', () => this._applyDimensions());
         watch('panel-height', () => this._applyDimensions());
         watch('render-markdown', () => this._rerenderAllMessages());
+        watch('toggle-shortcut', () => this._registerGlobalKeybindings());
+        watch('clipboard-shortcut', () => this._registerGlobalKeybindings());
 
         const onBackendConfigChanged = () => {
             if (!this._enabled) return;
@@ -529,6 +894,8 @@ export default class QuickChat extends Extension {
             'openai-api-key',
             'openai-model',
             'system-prompt',
+            'reasoning-effort',
+            'pi-idle-minutes',
             'agent-mode',
             'workspace',
         ]) {
@@ -607,17 +974,6 @@ export default class QuickChat extends Extension {
         }
     }
 
-    _unfreezeDateMenuLayout() {
-        const bin = this._parent?.get_parent?.();
-        const lm = bin?.layout_manager;
-        if (lm) {
-            const wasFrozen = Boolean(lm._frozen);
-            if (wasFrozen) lm._frozen = false;
-            try { lm.layout_changed(); } catch (_) {}
-            try { bin.queue_relayout(); } catch (_) {}
-        }
-    }
-
     _applyDimensions() {
         if (!this._wrapper || !this._chat || !this._scroll) return;
         const width = this._getSettingInt('panel-width', 460);
@@ -625,7 +981,7 @@ export default class QuickChat extends Extension {
         this._wrapper.set_width(width);
         this._chat.set_width(Math.max(300, width - 16));
         this._scroll.set_height(height);
-        this._unfreezeDateMenuLayout();
+        this._dateIntegration?.nudgeLayout();
     }
 
     _setTab(tab, connect = true, animate = true) {
@@ -634,20 +990,24 @@ export default class QuickChat extends Extension {
         this._tab = tab;
 
         const showAi = tab === 'ai';
+        const nativeList = this._dateIntegration?.nativeMessageList;
         const showNotif = tab === 'notifications' && Main.sessionMode.hasNotifications && !Main.sessionMode.isGreeter;
 
         if (showAi) {
-            try { this._native?._messageView?.collapse?.(); } catch (_) {}
+            this._dateIntegration?.collapseNativeMessageExpansion();
+        } else if (this._modelPickerOpen) {
+            this._toggleModelPicker(false);
         }
 
         this._chat.visible = showAi;
-        this._native.visible = showNotif;
+        if (nativeList) nativeList.visible = showNotif;
         this._aiTab.set_checked?.(showAi);
-        this._notificationTab.set_checked?.( tab === 'notifications');
+        this._notificationTab.set_checked?.(tab === 'notifications');
 
         if (showAi) {
             this._aiTab.add_style_pseudo_class('checked');
             this._notificationTab.remove_style_pseudo_class('checked');
+            this._flushPendingBackgroundWork();
             if (connect) {
                 this._ensureClient();
                 this._entry?.grab_key_focus();
@@ -655,11 +1015,12 @@ export default class QuickChat extends Extension {
         } else {
             this._notificationTab.add_style_pseudo_class('checked');
             this._aiTab.remove_style_pseudo_class('checked');
+            this._updateAiTabBadge();
         }
 
-        this._unfreezeDateMenuLayout();
+        this._dateIntegration?.nudgeLayout();
 
-        const targetActor = showAi ? this._chat : (showNotif ? this._native : null);
+        const targetActor = showAi ? this._chat : (showNotif ? nativeList : null);
         if (animate && changed && targetActor && this._animEnabled()) {
             targetActor.opacity = 0;
             targetActor.translation_y = 7;
@@ -677,7 +1038,18 @@ export default class QuickChat extends Extension {
 
     _setStatusIndicator(state, text) {
         if (!this._status || !this._statusDot) return;
-        this._status.text = text;
+        const nextText = String(text ?? '');
+        if (this._lastStatusText !== nextText) {
+            this._lastStatusText = nextText;
+            this._status.text = nextText;
+        }
+
+        // Cache state so token deltas do NOT cancel/restart the 680ms pulse animation 20+ times/sec!
+        if (this._lastStatusState === state) {
+            return;
+        }
+        this._lastStatusState = state;
+
         this._statusDot.remove_style_class_name('qc-dot-ready');
         this._statusDot.remove_style_class_name('qc-dot-busy');
         this._statusDot.remove_style_class_name('qc-dot-error');
@@ -707,16 +1079,19 @@ export default class QuickChat extends Extension {
         }
     }
 
-    _config() {
+    async _loadRuntimeConfig() {
+        const apiKey = await loadOpenAIApiKey(this._settings);
         return {
             backend: this._getSettingString('backend', 'auto').trim() || 'auto',
             executable: this._getSettingString('pi-path', 'pi').trim() || 'pi',
             provider: this._getSettingString('provider', '').trim(),
             model: this._getSettingString('model', '').trim(),
             openaiBaseUrl: this._getSettingString('openai-base-url', '').trim(),
-            openaiApiKey: this._getSettingString('openai-api-key', '').trim(),
+            openaiApiKey: apiKey,
             openaiModel: this._getSettingString('openai-model', '').trim(),
             systemPrompt: this._getSettingString('system-prompt', '').trim(),
+            reasoningEffort: this._getSettingString('reasoning-effort', 'default').trim() || 'default',
+            piIdleMinutes: this._getSettingInt('pi-idle-minutes', 5),
             mode: this._getSettingString('agent-mode', 'readonly').trim() || 'readonly',
             workspace: this._getSettingString('workspace', '').trim(),
         };
@@ -733,17 +1108,17 @@ export default class QuickChat extends Extension {
             return;
         }
         const generation = ++this._generation;
-        const config = this._config();
         this._ready = false;
         this._setStatusIndicator('busy', '正在连接智能后端…');
 
         try {
-            const root = GLib.build_filenamev([GLib.get_user_data_dir(), 'gnome-quick-chat']);
-            const sessions = GLib.build_filenamev([root, 'sessions']);
+            const config = await this._loadRuntimeConfig();
+            if (!this._enabled || generation !== this._generation) return;
+
+            const root = getDataDir();
+            const sessions = getSessionsDir();
             const defaultHome = GLib.get_home_dir() || GLib.build_filenamev([root, 'workspace']);
             const work = config.workspace || defaultHome;
-            GLib.mkdir_with_parents(root, 0o700);
-            GLib.mkdir_with_parents(sessions, 0o700);
             if (!GLib.file_test(work, GLib.FileTest.IS_DIR)) {
                 GLib.mkdir_with_parents(work, 0o700);
             }
@@ -774,19 +1149,6 @@ export default class QuickChat extends Extension {
             const data = await client.request('get_messages');
             if (!this._enabled || generation !== this._generation) return;
 
-            this._clearMessages();
-            for (const msg of detailedMessages(data.messages)) {
-                const card = this._addMessage(msg.role, msg.text, {
-                    animate: false,
-                    thinking: msg.thinking || '',
-                });
-                if (msg.role === 'user' && msg.text) {
-                    this._recordPromptHistory(msg.text);
-                }
-                card?.flushRender?.();
-            }
-
-            this._ready = true;
             const backendTag = state.backend === 'openai'
                 ? 'OpenAI API'
                 : state.backend === 'zcode'
@@ -795,14 +1157,13 @@ export default class QuickChat extends Extension {
                         ? 'Codex'
                         : 'Pi';
             this._modelLabel = state.model?.id || config.model || backendTag;
-            const modeSuffix = state.backend === 'openai'
-                ? ''
-                : config.mode === 'full'
-                    ? ' · 全自动 Agent'
-                    : config.mode === 'readonly'
-                        ? ' · 智能审批'
-                        : ' · 纯问答';
-            this._idleStatus = `${this._modelLabel}${modeSuffix}`;
+
+            this._renderInitialHistory(detailedMessages(data.messages));
+
+            this._ready = true;
+            const caps = getBackendCapabilities(state.backend);
+            const badge = caps.modeBadges?.[config.mode] || '';
+            this._idleStatus = badge ? `${this._modelLabel} · ${badge}` : this._modelLabel;
             this._setStatusIndicator('ready', this._idleStatus);
             this._setBusy(false);
             this._scrollBottom(true);
@@ -811,6 +1172,86 @@ export default class QuickChat extends Extension {
             this._stopClient();
             this._setStatusIndicator('error', `连接失败：${error.message}`);
         }
+    }
+
+    _renderInitialHistory(allDetailed) {
+        this._clearMessages();
+        this._allHistoryMessages = Array.isArray(allDetailed) ? allDetailed : [];
+        for (const msg of this._allHistoryMessages) {
+            if (msg.role === 'user' && msg.text) {
+                this._recordPromptHistory(msg.text);
+            }
+        }
+        if (!this._allHistoryMessages.length) {
+            this._historyStartIndex = 0;
+            return;
+        }
+
+        this._historyStartIndex = Math.max(0, this._allHistoryMessages.length - HISTORY_PAGE_SIZE);
+        this._syncLoadMoreHistoryButton();
+
+        const recentSlice = this._allHistoryMessages.slice(this._historyStartIndex);
+        for (const msg of recentSlice) {
+            this._addMessage(msg.role, msg.text, {
+                animate: false,
+                thinking: msg.thinking || '',
+                scrollOnAdd: false,
+            });
+        }
+    }
+
+    _syncLoadMoreHistoryButton() {
+        if (this._historyStartIndex <= 0) {
+            if (this._loadMoreBtn) {
+                try { this._loadMoreBtn.destroy(); } catch (_) {}
+                this._loadMoreBtn = null;
+            }
+            return;
+        }
+        const remaining = this._historyStartIndex;
+        const label = `↑ 加载更早的 ${Math.min(HISTORY_PAGE_SIZE, remaining)} 条对话（剩余 ${remaining} 条）`;
+        if (!this._loadMoreBtn) {
+            this._loadMoreBtn = button(
+                label,
+                () => this._prependOlderHistoryBatch(),
+                'qc-load-more-btn',
+                '加载更早的历史对话'
+            );
+            this._messages.insert_child_at_index(this._loadMoreBtn, 0);
+        } else {
+            this._loadMoreBtn.label = label;
+        }
+    }
+
+    _prependOlderHistoryBatch() {
+        if (this._historyStartIndex <= 0 || !this._messages) return;
+        const adj = this._scroll?.vadjustment;
+        const prevUpper = adj ? adj.upper : 0;
+        const prevValue = adj ? adj.value : 0;
+
+        const nextStart = Math.max(0, this._historyStartIndex - HISTORY_PAGE_SIZE);
+        const slice = this._allHistoryMessages.slice(nextStart, this._historyStartIndex);
+        this._historyStartIndex = nextStart;
+        this._syncLoadMoreHistoryButton();
+
+        const baseInsertIdx = this._loadMoreBtn ? 1 : 0;
+        slice.forEach((msg, offset) => {
+            this._addMessage(msg.role, msg.text, {
+                animate: false,
+                thinking: msg.thinking || '',
+                insertIndex: baseInsertIdx + offset,
+                scrollOnAdd: false,
+            });
+        });
+
+        // Preserve viewport scroll anchor after prepending above
+        this._scheduleTimeout(20, () => {
+            if (!adj) return;
+            const deltaUpper = Math.max(0, adj.upper - prevUpper);
+            this._programmaticScroll = true;
+            adj.value = prevValue + deltaUpper;
+            this._programmaticScroll = false;
+        });
     }
 
     _recordPromptHistory(text) {
@@ -829,6 +1270,9 @@ export default class QuickChat extends Extension {
         }
         this._live = null;
         this._cardList = [];
+        this._allHistoryMessages = [];
+        this._historyStartIndex = 0;
+        this._loadMoreBtn = null;
         this._empty = null;
         this._messages.destroy_all_children();
         this._buildEmptyState();
@@ -861,69 +1305,27 @@ export default class QuickChat extends Extension {
     }
 
     _renderCardBody(card) {
-        const {bodyBox, role} = card;
-        const rawText = card.text || '';
-        bodyBox.destroy_all_children();
+        const hasPendingApproval = card.toolNodes?.some(
+            n => n.status === 'pending_approval' || n.status === 'sending_approval'
+        );
+        const placeholderText = hasPendingApproval
+            ? '请在上方展开的审批栏中选择是否允许执行…'
+            : card.activeTool
+                ? `正在执行 ${card.toolNodes?.at(-1)?.toolName || '工具'}…`
+                : card.thinking
+                    ? '正在整理回答…'
+                    : '…';
 
-        if (!rawText) {
-            const hasPendingApproval = card.toolNodes?.some(n => n.status === 'pending_approval');
-            const waitText = hasPendingApproval
-                ? '请在上方展开的审批栏中选择是否允许执行…'
-                : card.activeTool
-                    ? `正在执行 ${card.toolNodes?.at(-1)?.toolName || '工具'}…`
-                    : card.thinking
-                        ? '正在整理回答…'
-                        : '…';
-            const placeholder = wrapLabel(waitText, 'qc-message-text');
-            bodyBox.add_child(placeholder);
-            return;
-        }
-
-        if (role === 'user' || !this._markdownEnabled()) {
-            bodyBox.add_child(wrapLabel(rawText, 'qc-message-text', false));
-            return;
-        }
-
-        const blocks = parseMarkdownBlocks(rawText);
-        if (!blocks.length) {
-            bodyBox.add_child(wrapLabel(rawText, 'qc-message-text', false));
-            return;
-        }
-
-        for (const block of blocks) {
-            if (block.type === 'code') {
-                const codeCard = new St.BoxLayout({
-                    orientation: V,
-                    style_class: 'qc-code-block',
-                    x_expand: true,
-                });
-                const codeHeader = new St.BoxLayout({
-                    orientation: H,
-                    style_class: 'qc-code-header',
-                    y_align: Clutter.ActorAlign.CENTER,
-                });
-                const langLabel = new St.Label({
-                    text: block.lang || 'code',
-                    style_class: 'qc-code-lang',
-                    x_expand: true,
-                    y_align: Clutter.ActorAlign.CENTER,
-                });
-                codeHeader.add_child(langLabel);
+        renderCardBodyIncremental(card, {
+            markdownEnabled: this._markdownEnabled(),
+            placeholderText,
+            onCreateCodeCopyButton: getCodeTextFn => {
                 const codeCopyBtn = button('复制代码', () => {
-                    this._copyWithFeedback(codeCopyBtn, () => block.code, '复制代码');
+                    this._copyWithFeedback(codeCopyBtn, getCodeTextFn, '复制代码');
                 }, 'qc-copy-btn', '复制代码片段');
-                codeHeader.add_child(codeCopyBtn);
-                codeCard.add_child(codeHeader);
-
-                const codeBody = wrapLabel(block.code || ' ', 'qc-code-text', false);
-                codeCard.add_child(codeBody);
-                bodyBox.add_child(codeCard);
-            } else {
-                const lbl = wrapLabel('', 'qc-message-text', false);
-                setLabelMarkupSafe(lbl, block.pango, block.raw);
-                bodyBox.add_child(lbl);
-            }
-        }
+                return codeCopyBtn;
+            },
+        });
     }
 
     _syncToolNodeDotStyle(card, node) {
@@ -938,7 +1340,7 @@ export default class QuickChat extends Extension {
         ]) {
             btn.remove_style_class_name(cls);
         }
-        if (node.status === 'pending_approval') {
+        if (node.status === 'pending_approval' || node.status === 'sending_approval') {
             btn.add_style_class_name('qc-dot-tool-pending');
         } else if (node.status === 'denied' || node.status === 'error') {
             btn.add_style_class_name('qc-dot-tool-error');
@@ -981,9 +1383,11 @@ export default class QuickChat extends Extension {
             }
         }
 
-        const pendingNode = tools.find(n => n.status === 'pending_approval');
+        const pendingNode = tools.find(n => n.status === 'pending_approval' || n.status === 'sending_approval');
         if (pendingNode) {
-            card.traceHintLabel.text = `⚠️ 待审批: ${pendingNode.toolName}`;
+            card.traceHintLabel.text = pendingNode.status === 'sending_approval'
+                ? `⏳ 正在发送授权: ${pendingNode.toolName}`
+                : `⚠️ 待审批: ${pendingNode.toolName}`;
             return;
         }
         const runningNode = tools.find(n => n.status === 'running');
@@ -1055,7 +1459,8 @@ export default class QuickChat extends Extension {
         }
 
         card.detailDrawer.visible = true;
-        if (node.status === 'pending_approval') {
+        const isAwaiting = node.status === 'pending_approval' || node.status === 'sending_approval';
+        if (isAwaiting) {
             card.detailDrawer.add_style_class_name('qc-drawer-pending');
         } else {
             card.detailDrawer.remove_style_class_name('qc-drawer-pending');
@@ -1063,18 +1468,22 @@ export default class QuickChat extends Extension {
 
         const durSuffix = node.duration > 0 ? ` (${(node.duration / 1000).toFixed(1)}s)` : '';
         let statusTitle = `🔧 ${node.toolName}`;
-        if (node.status === 'pending_approval') {
+        if (node.status === 'sending_approval') {
+            statusTitle = `⏳ 正在发送授权：${node.toolName}…`;
+        } else if (node.status === 'pending_approval') {
             statusTitle = `🛡️ 请求授权调用：${node.toolName}`;
         } else if (node.status === 'running') {
-            statusTitle = `⏳ 正在执行：${node.toolName}`;
+            statusTitle = node.approvalState
+                ? `⏳ 已授权，正在执行：${node.toolName}`
+                : `⏳ 正在执行：${node.toolName}`;
         } else if (node.status === 'denied') {
             statusTitle = `✕ 已拒绝调用：${node.toolName}`;
         } else if (node.status === 'error') {
             statusTitle = `⚠️ 执行异常：${node.toolName}${durSuffix}`;
         } else if (node.approvalState === 'always') {
-            statusTitle = `✓ 已始终允许：${node.toolName}${durSuffix}`;
+            statusTitle = `✓ 已按范围授权执行：${node.toolName}${durSuffix}`;
         } else if (node.approvalState === 'allowed') {
-            statusTitle = `✓ 已批准执行：${node.toolName}${durSuffix}`;
+            statusTitle = `✓ 已批准并完成：${node.toolName}${durSuffix}`;
         } else {
             statusTitle = `✓ 已执行工具：${node.toolName}${durSuffix}`;
         }
@@ -1087,11 +1496,18 @@ export default class QuickChat extends Extension {
             card.drawerSummary.visible = false;
         }
 
-        const extraInfo = node.status === 'pending_approval'
-            ? (node.reason && node.reason !== node.summary ? node.reason : '')
-            : (node.detail && node.detail !== node.summary ? node.detail : '');
-        if (extraInfo) {
-            card.drawerBody.text = extraInfo;
+        const extraLines = [];
+        if (node.deliveryError) {
+            extraLines.push(`⚠️ ${node.deliveryError}`);
+        }
+        if (isAwaiting) {
+            if (node.reason && node.reason !== node.summary) extraLines.push(node.reason);
+        } else if (node.detail && node.detail !== node.summary) {
+            extraLines.push(node.detail);
+        }
+
+        if (extraLines.length > 0) {
+            card.drawerBody.text = extraLines.join('\n');
             card.drawerBody.visible = true;
         } else if (!card.drawerSummary.visible) {
             card.drawerBody.text = `工具名称：${node.toolName}`;
@@ -1100,11 +1516,28 @@ export default class QuickChat extends Extension {
             card.drawerBody.visible = false;
         }
 
-        card.drawerActions.visible = node.status === 'pending_approval';
+        card.drawerActions.visible = isAwaiting;
+        if (isAwaiting) {
+            const buttonsInteractive = node.status === 'pending_approval';
+            card.allowBtn.reactive = buttonsInteractive;
+            card.denyBtn.reactive = buttonsInteractive;
+            if (node.allowSessionRule === false) {
+                card.alwaysBtn.visible = false;
+            } else {
+                card.alwaysBtn.visible = true;
+                card.alwaysBtn.reactive = buttonsInteractive;
+                card.alwaysBtn.label = node.sessionRuleLabel || '✓ 本次会话允许';
+            }
+        }
     }
 
     _addMessage(role, text, options = {}) {
-        const {animate = true, thinking = ''} = options;
+        const {
+            animate = true,
+            thinking = '',
+            insertIndex = -1,
+            scrollOnAdd = true,
+        } = options;
         this._empty?.hide();
 
         const box = new St.BoxLayout({
@@ -1138,12 +1571,20 @@ export default class QuickChat extends Extension {
             box,
             text: text || '',
             thinking: thinking || '',
+            thinkingHadContent: Boolean(thinking && thinking.trim()),
             toolNodes: [],
             selectedNodeId: null,
             hoveredNodeId: null,
             activeTool: false,
             renderTimer: 0,
+            renderState: null,
+            dirty: {text: true, thinking: Boolean(thinking), tools: Boolean(thinking)},
         };
+
+        if (role === 'assistant') {
+            const retryBtn = button('↻', () => this._retryForAssistantCard(card), 'qc-copy-btn', '重新生成该回答');
+            top.add_child(retryBtn);
+        }
 
         const copyBtn = button('复制', () => {
             this._copyWithFeedback(copyBtn, () => card.text, '复制');
@@ -1215,7 +1656,7 @@ export default class QuickChat extends Extension {
                 style_class: 'qc-drawer-header',
                 y_align: Clutter.ActorAlign.CENTER,
             });
-            const drawerTitle = wrapLabel('', 'qc-drawer-title', false);
+            const drawerTitle = wrapLabel('', 'qc-drawer-title');
             drawerTitle.x_expand = true;
             drawerHeader.add_child(drawerTitle);
 
@@ -1226,11 +1667,11 @@ export default class QuickChat extends Extension {
             drawerHeader.add_child(drawerCloseBtn);
             detailDrawer.add_child(drawerHeader);
 
-            const drawerSummary = wrapLabel('', 'qc-approval-summary', false);
+            const drawerSummary = wrapLabel('', 'qc-approval-summary');
             drawerSummary.visible = false;
             detailDrawer.add_child(drawerSummary);
 
-            const drawerBody = wrapLabel('', 'qc-drawer-body', false);
+            const drawerBody = wrapLabel('', 'qc-drawer-body');
             drawerBody.visible = false;
             detailDrawer.add_child(drawerBody);
 
@@ -1247,10 +1688,10 @@ export default class QuickChat extends Extension {
                 '允许本次工具调用'
             );
             const alwaysBtn = button(
-                '✓ 始终允许',
+                '✓ 本次会话允许',
                 () => this._submitActiveToolDecision(card, 'allow', true),
                 'qc-approval-btn qc-approval-always',
-                '当前会话始终允许该工具'
+                '当前会话对同类范围授权'
             );
             const denyBtn = button(
                 '✕ 拒绝',
@@ -1276,6 +1717,9 @@ export default class QuickChat extends Extension {
             card.drawerSummary = drawerSummary;
             card.drawerBody = drawerBody;
             card.drawerActions = drawerActions;
+            card.allowBtn = allowBtn;
+            card.alwaysBtn = alwaysBtn;
+            card.denyBtn = denyBtn;
         }
 
         const bodyBox = new St.BoxLayout({
@@ -1286,31 +1730,77 @@ export default class QuickChat extends Extension {
         box.add_child(bodyBox);
         card.bodyBox = bodyBox;
 
-        card.flushRender = () => {
+        card.flushRender = (forceAll = false) => {
             if (card.renderTimer) {
                 this._clearTimer(card.renderTimer);
                 card.renderTimer = 0;
             }
-            this._updateCardActivity(card);
-            this._renderCardBody(card);
+            if (!this._isChatVisible() && !forceAll && card === this._live) {
+                this._hasPendingBackgroundRender = true;
+                this._updateAiTabBadge();
+                return;
+            }
+            if (forceAll || card.dirty.tools || (card.dirty.thinking && card.selectedNodeId === 'thinking')) {
+                this._updateCardActivity(card);
+                card.dirty.tools = false;
+                card.dirty.thinking = false;
+            }
+            if (forceAll || card.dirty.text) {
+                this._renderCardBody(card);
+                card.dirty.text = false;
+            }
         };
 
         card.scheduleRender = () => {
-            this._updateCardActivity(card);
+            if (!this._isChatVisible()) {
+                this._hasPendingBackgroundRender = true;
+                this._updateAiTabBadge();
+                return;
+            }
+            if (card.dirty.tools) {
+                this._updateCardActivity(card);
+                card.dirty.tools = false;
+            }
+            if (!card.dirty.text && !(card.dirty.thinking && card.selectedNodeId === 'thinking')) {
+                return;
+            }
             if (card.renderTimer) return;
-            card.renderTimer = this._scheduleTimeout(45, () => {
+
+            const len = card.text.length;
+            const intervalMs = len > 4000 ? 110 : len > 1500 ? 75 : 48;
+            card.renderTimer = this._scheduleTimeout(intervalMs, () => {
                 card.renderTimer = 0;
-                this._renderCardBody(card);
+                if (!this._isChatVisible()) {
+                    this._hasPendingBackgroundRender = true;
+                    this._updateAiTabBadge();
+                    return;
+                }
+                if (card.dirty.tools || (card.dirty.thinking && card.selectedNodeId === 'thinking')) {
+                    this._updateCardActivity(card);
+                    card.dirty.tools = false;
+                    card.dirty.thinking = false;
+                }
+                if (card.dirty.text) {
+                    this._renderCardBody(card);
+                    card.dirty.text = false;
+                }
                 this._scrollBottom(false);
             });
         };
 
-        card.flushRender();
-        this._messages.add_child(box);
-        if (!this._cardList) this._cardList = [];
-        this._cardList.push(card);
+        card.flushRender(true);
 
-        if (animate && this._animEnabled()) {
+        if (insertIndex >= 0) {
+            this._messages.insert_child_at_index(box, insertIndex);
+            if (!this._cardList) this._cardList = [];
+            this._cardList.unshift(card);
+        } else {
+            this._messages.add_child(box);
+            if (!this._cardList) this._cardList = [];
+            this._cardList.push(card);
+        }
+
+        if (animate && this._animEnabled() && this._isChatVisible()) {
             box.opacity = 0;
             box.translation_y = 9;
             this._easeActor(box, {
@@ -1321,17 +1811,34 @@ export default class QuickChat extends Extension {
             });
         }
 
-        this._scrollBottom(role === 'user');
+        if (scrollOnAdd) {
+            this._scrollBottom(role === 'user');
+        }
         return card;
+    }
+
+    _retryForAssistantCard(assistantCard) {
+        if (this._busy || !this._cardList) return;
+        const idx = this._cardList.indexOf(assistantCard);
+        for (let i = (idx >= 0 ? idx - 1 : this._cardList.length - 1); i >= 0; i--) {
+            const c = this._cardList[i];
+            if (c?.role === 'user' && c.text?.trim()) {
+                this._entry.set_text(c.text.trim());
+                this._send();
+                return;
+            }
+        }
     }
 
     _rerenderAllMessages() {
         for (const card of this._cardList || []) {
-            card.flushRender?.();
+            card.renderState = null;
+            card.flushRender?.(true);
         }
     }
 
     _scrollBottom(force = false) {
+        if (!this._isChatVisible() && !force) return;
         if (force) {
             this._userScrolledUp = false;
             this._updateJumpBottomVisibility();
@@ -1370,11 +1877,15 @@ export default class QuickChat extends Extension {
         if (this._sendButton) this._sendButton.visible = !busy;
         if (this._stopButton) this._stopButton.visible = busy;
         if (this._newButton) this._newButton.reactive = !busy;
+        this._updateAiTabBadge();
     }
 
     async _send() {
         const text = this._entry.get_text().trim();
         if (!text || this._busy) return;
+        if (this._modelPickerOpen) {
+            this._toggleModelPicker(false);
+        }
         if (!this._ready) {
             await this._ensureClient();
             if (!this._ready) return;
@@ -1423,12 +1934,11 @@ export default class QuickChat extends Extension {
             node = card.toolNodes.find(n => n.toolCallId && n.toolCallId === toolCallId);
         }
         if (!node && toolName && toolName !== '工具') {
-            // Match an active node of the same toolName that hasn't bound a conflicting toolCallId yet
             for (let i = card.toolNodes.length - 1; i >= 0; i--) {
                 const cand = card.toolNodes[i];
                 if (
                     cand.toolName === toolName &&
-                    (cand.status === 'running' || cand.status === 'pending_approval') &&
+                    (cand.status === 'running' || cand.status === 'pending_approval' || cand.status === 'sending_approval') &&
                     (!toolCallId || !cand.toolCallId || cand.toolCallId === toolCallId)
                 ) {
                     node = cand;
@@ -1440,6 +1950,7 @@ export default class QuickChat extends Extension {
         if (!node) {
             const index = card.toolNodes.length + 1;
             const id = `tool_${index}_${Date.now()}`;
+            const defaultScope = computePermissionScope(toolName || '工具', info.summary || '');
             node = {
                 id,
                 index,
@@ -1452,6 +1963,12 @@ export default class QuickChat extends Extension {
                 duration: 0,
                 status: 'running',
                 approvalState: '',
+                scopeKey: info.scopeKey ?? defaultScope.scopeKey,
+                allowSessionRule: typeof info.allowSessionRule === 'boolean'
+                    ? info.allowSessionRule
+                    : defaultScope.allowSessionRule,
+                sessionRuleLabel: info.sessionRuleLabel || defaultScope.sessionRuleLabel,
+                deliveryError: '',
                 dotBtn: null,
             };
 
@@ -1496,6 +2013,15 @@ export default class QuickChat extends Extension {
         if (info.detail) {
             node.detail = info.detail;
         }
+        if (typeof info.scopeKey === 'string' && info.scopeKey) {
+            node.scopeKey = info.scopeKey;
+        }
+        if (typeof info.allowSessionRule === 'boolean') {
+            node.allowSessionRule = info.allowSessionRule;
+        }
+        if (info.sessionRuleLabel) {
+            node.sessionRuleLabel = info.sessionRuleLabel;
+        }
         if (typeof info.duration === 'number' && info.duration > 0) {
             node.duration = info.duration;
         }
@@ -1510,23 +2036,63 @@ export default class QuickChat extends Extension {
         if (!target) return;
 
         const allow = decision === 'allow';
-        target.status = allow ? 'done' : 'denied';
-        target.approvalState = allow ? (alwaysAllow ? 'always' : 'allowed') : 'denied';
+        const effectiveAlwaysAllow = Boolean(allow && alwaysAllow && target.allowSessionRule !== false && target.scopeKey);
 
-        if (allow && alwaysAllow && target.toolName) {
+        // Transition explicitly to `sending_approval` until delivery is confirmed!
+        target.status = 'sending_approval';
+        target.deliveryError = '';
+        card.dirty.tools = true;
+        if (!card.text) card.dirty.text = true;
+        card.scheduleRender();
+        this._setStatusIndicator('busy', `正在发送 ${target.toolName} 授权指令…`);
+
+        let sent = false;
+        try {
+            const res = await this._client?.request('permission_response', {
+                requestId: target.requestId,
+                decision,
+                alwaysAllow: effectiveAlwaysAllow,
+                scopeKey: effectiveAlwaysAllow ? target.scopeKey : '',
+                toolName: target.toolName,
+            });
+            sent = Boolean(res?.sent);
+        } catch (_) {
+            sent = false;
+        }
+
+        if (!this._enabled) return;
+
+        if (!sent) {
+            // Delivery failed — revert to pending_approval and surface retry prompt!
+            target.status = 'pending_approval';
+            target.deliveryError = '授权指令未送达后端进程，请点击按钮重试';
+            card.selectedNodeId = target.id;
+            card.dirty.tools = true;
+            card.flushRender(true);
+            this._setStatusIndicator('error', `⚠️ ${target.toolName} 授权未送达，请重试`);
+            return;
+        }
+
+        // Delivery confirmed! Move to `running` (only turns green `done` when tool_execution_end arrives) or `denied`
+        target.status = allow ? 'running' : 'denied';
+        target.approvalState = allow ? (effectiveAlwaysAllow ? 'always' : 'allowed') : 'denied';
+
+        if (effectiveAlwaysAllow && target.scopeKey) {
             for (const other of card.toolNodes) {
-                if (other.status === 'pending_approval' && other.toolName === target.toolName) {
-                    other.status = 'done';
+                if (other.status === 'pending_approval' && other.scopeKey === target.scopeKey) {
+                    other.status = 'running';
                     other.approvalState = 'always';
                 }
             }
         }
 
-        // Auto-advance to next pending approval if any, otherwise collapse drawer into the green circle
         const nextPending = card.toolNodes.find(n => n.status === 'pending_approval');
         card.selectedNodeId = nextPending ? nextPending.id : null;
         card.activeTool = allow || Boolean(nextPending);
+        card.dirty.tools = true;
+        if (!card.text) card.dirty.text = true;
         card.scheduleRender();
+        this._updateAiTabBadge();
 
         this._setStatusIndicator(
             'busy',
@@ -1536,42 +2102,50 @@ export default class QuickChat extends Extension {
                     ? `已授权 ${target.toolName}，正在执行…`
                     : `已拒绝 ${target.toolName}，正在继续…`
         );
-
-        try {
-            await this._client?.request('permission_response', {
-                requestId: target.requestId,
-                decision,
-                alwaysAllow,
-                toolName: target.toolName,
-            });
-        } catch (_) {}
     }
 
     _onEvent(event) {
+        if (event.type === 'bridge_warning' && event.message) {
+            this._setStatusIndicator('busy', `⚠️ ${event.message}`);
+            return;
+        }
+
         if (event.type === 'message_start' && event.message?.role === 'assistant') {
             if (event.modelId) {
-                const prefix = (this._idleStatus || '').split(' · ')[0] || '随问';
-                this._idleStatus = `${prefix} · ${event.modelId}`;
+                const suffix = (this._idleStatus || '').includes(' · ')
+                    ? ` · ${(this._idleStatus || '').split(' · ').slice(1).join(' · ')}`
+                    : '';
                 this._modelLabel = event.modelId;
+                this._idleStatus = `${event.modelId}${suffix}`;
             }
             if (this._live && this._live.text && !this._live.text.endsWith('\n')) {
                 this._live.text += '\n\n';
+                this._live.dirty.text = true;
             }
         }
+
         if (event.type === 'message_update') {
             const delta = event.assistantMessageEvent;
             if (delta?.type === 'thinking_delta' && delta.delta) {
                 const card = this._ensureLiveCard();
                 card.thinking += delta.delta;
+                card.dirty.thinking = true;
+                if (!card.thinkingHadContent && card.thinking.trim()) {
+                    card.thinkingHadContent = true;
+                    card.dirty.tools = true;
+                    if (!card.text) card.dirty.text = true;
+                }
                 this._setStatusIndicator('busy', '深度思考中…');
                 card.scheduleRender();
             } else if (delta?.type === 'text_delta' && delta.delta) {
                 const card = this._ensureLiveCard();
                 card.text += delta.delta;
+                card.dirty.text = true;
                 this._setStatusIndicator('busy', '正在生成回答…');
                 card.scheduleRender();
             }
         }
+
         if (event.type === 'tool_execution_start') {
             const card = this._ensureLiveCard();
             const node = this._findOrCreateToolNode(card, {
@@ -1579,13 +2153,16 @@ export default class QuickChat extends Extension {
                 toolName: event.toolName || '工具',
                 summary: event.summary || '',
             });
-            if (node && node.status !== 'pending_approval' && node.status !== 'denied') {
-                node.status = node.approvalState ? 'done' : 'running';
+            if (node && node.status !== 'pending_approval' && node.status !== 'sending_approval' && node.status !== 'denied') {
+                node.status = 'running';
             }
             card.activeTool = true;
+            card.dirty.tools = true;
+            if (!card.text) card.dirty.text = true;
             this._setStatusIndicator('busy', `正在执行工具：${node?.toolName || event.toolName || '工具'}`);
             card.scheduleRender();
         }
+
         if (event.type === 'permission_request') {
             const card = this._ensureLiveCard();
             const node = this._findOrCreateToolNode(card, {
@@ -1594,6 +2171,9 @@ export default class QuickChat extends Extension {
                 toolName: event.toolName || '工具',
                 summary: event.summary || '',
                 reason: event.reason || '',
+                scopeKey: event.scopeKey || '',
+                allowSessionRule: event.allowSessionRule,
+                sessionRuleLabel: event.sessionRuleLabel || '',
             });
             if (node) {
                 node.status = 'pending_approval';
@@ -1601,28 +2181,35 @@ export default class QuickChat extends Extension {
                 card.selectedNodeId = node.id;
             }
             card.activeTool = true;
+            card.dirty.tools = true;
+            if (!card.text) card.dirty.text = true;
             this._setStatusIndicator('busy', `⚠️ 等待您审批工具：${node?.toolName || event.toolName || '工具'}`);
+            this._updateAiTabBadge();
             card.scheduleRender();
             this._scrollBottom(true);
         }
+
         if (event.type === 'permission_resolved') {
             if (this._live?.toolNodes) {
                 const node = this._live.toolNodes.find(
                     n => (event.requestId && n.requestId === event.requestId) ||
                          (event.toolCallId && n.toolCallId === event.toolCallId)
                 );
-                if (node && node.status === 'pending_approval') {
+                if (node && (node.status === 'pending_approval' || node.status === 'sending_approval')) {
                     const allow = event.decision !== 'deny';
-                    node.status = allow ? 'done' : 'denied';
+                    node.status = allow ? 'running' : 'denied';
                     node.approvalState = allow ? 'allowed' : 'denied';
                     if (this._live.selectedNodeId === node.id) {
                         const nextPending = this._live.toolNodes.find(n => n.status === 'pending_approval');
                         this._live.selectedNodeId = nextPending ? nextPending.id : null;
                     }
                 }
+                this._live.dirty.tools = true;
+                this._updateAiTabBadge();
                 this._live.scheduleRender();
             }
         }
+
         if (event.type === 'tool_execution_end') {
             if (this._live?.toolNodes) {
                 let node = null;
@@ -1632,7 +2219,7 @@ export default class QuickChat extends Extension {
                 if (!node) {
                     for (let i = this._live.toolNodes.length - 1; i >= 0; i--) {
                         const cand = this._live.toolNodes[i];
-                        if (cand.status === 'running' || cand.status === 'done') {
+                        if (cand.status === 'running' && (!event.toolName || cand.toolName === event.toolName)) {
                             node = cand;
                             break;
                         }
@@ -1648,11 +2235,13 @@ export default class QuickChat extends Extension {
                     }
                 }
                 this._live.activeTool = this._live.toolNodes.some(
-                    n => n.status === 'running' || n.status === 'pending_approval'
+                    n => n.status === 'running' || n.status === 'pending_approval' || n.status === 'sending_approval'
                 );
+                this._live.dirty.tools = true;
                 this._live.scheduleRender();
             }
         }
+
         if (event.type === 'tool_batch_end') {
             if (this._live?.toolNodes) {
                 for (const node of this._live.toolNodes) {
@@ -1661,9 +2250,11 @@ export default class QuickChat extends Extension {
                     }
                 }
                 this._live.activeTool = false;
+                this._live.dirty.tools = true;
                 this._live.scheduleRender();
             }
         }
+
         if (event.type === 'message_end' && event.message?.role === 'assistant') {
             const text = messageText(event.message);
             const thinking = messageThinking(event.message);
@@ -1672,13 +2263,21 @@ export default class QuickChat extends Extension {
                 if (text) {
                     if (!card.text) {
                         card.text = text;
+                        card.dirty.text = true;
                     } else if (!card.text.includes(text)) {
                         card.text = `${card.text.trimEnd()}\n\n${text}`;
+                        card.dirty.text = true;
                     }
                 }
-                if (thinking && !card.thinking) card.thinking = thinking;
+                if (thinking && !card.thinking) {
+                    card.thinking = thinking;
+                    card.thinkingHadContent = true;
+                    card.dirty.thinking = true;
+                    card.dirty.tools = true;
+                }
                 if (event.message.errorMessage && !card.text) {
                     card.text = `⚠️ ${event.message.errorMessage}`;
+                    card.dirty.text = true;
                     card.box.add_style_class_name('qc-message-error');
                 }
                 card.activeTool = false;
@@ -1689,11 +2288,13 @@ export default class QuickChat extends Extension {
             }
             this._scrollBottom(false);
         }
+
         if (event.type === 'agent_settled' || (event.type === 'agent_end' && event.willRetry === undefined)) {
+            const finishedText = this._live?.text || '';
             if (this._live) {
                 if (this._live.toolNodes) {
                     for (const node of this._live.toolNodes) {
-                        if (node.status === 'pending_approval') {
+                        if (node.status === 'pending_approval' || node.status === 'sending_approval') {
                             node.status = 'denied';
                             node.approvalState = 'denied';
                             if (this._live.selectedNodeId === node.id) {
@@ -1705,10 +2306,26 @@ export default class QuickChat extends Extension {
                     }
                 }
                 this._live.activeTool = false;
+                this._live.dirty.tools = true;
+                this._live.dirty.text = true;
                 this._live.flushRender();
             }
+
+            if (!this._isChatVisible() && !event.aborted && finishedText) {
+                this._hasUnreadBackgroundReply = true;
+                if (
+                    !this._dateIntegration?.dateMenu?.menu?.isOpen &&
+                    this._getSettingBool('notify-on-complete', false)
+                ) {
+                    const preview = finishedText.replace(/\s+/g, ' ').trim().slice(0, 72);
+                    try {
+                        Main.notify('随问 · 回答已完成', preview || '点击顶部时间栏查看完整回答');
+                    } catch (_) {}
+                }
+            }
+
             this._setBusy(false);
-            if (!this._status.text.startsWith('错误：')) {
+            if (!this._lastStatusText.startsWith('错误：')) {
                 if (event.aborted) {
                     this._setStatusIndicator('ready', '已停止生成');
                 } else {
@@ -1716,6 +2333,7 @@ export default class QuickChat extends Extension {
                 }
             }
             this._live = null;
+            this._updateAiTabBadge();
             if (this._needsReconnect) {
                 this._needsReconnect = false;
                 this._reconnectNow();
@@ -1744,6 +2362,9 @@ export default class QuickChat extends Extension {
 
     _newSession() {
         if (this._busy) return;
+        if (this._modelPickerOpen) {
+            this._toggleModelPicker(false);
+        }
         this._stopClient();
         this._settings.set_string('session-id', GLib.uuid_string_random());
         this._clearMessages();
@@ -1764,6 +2385,7 @@ export default class QuickChat extends Extension {
 
     disable() {
         this._enabled = false;
+        this._unregisterGlobalKeybindings();
         this._stopClient();
 
         for (const timerId of this._timers) {
@@ -1783,8 +2405,12 @@ export default class QuickChat extends Extension {
             this._vadjValueSig = this._vadjUpperSig = 0;
         }
 
-        if (this._menuSignal) this._date?.menu?.disconnect(this._menuSignal);
-        if (this._sessionSignal) Main.sessionMode.disconnect(this._sessionSignal);
+        if (this._menuSignal) {
+            try { this._dateIntegration?.dateMenu?.menu?.disconnect(this._menuSignal); } catch (_) {}
+        }
+        if (this._sessionSignal) {
+            try { Main.sessionMode.disconnect(this._sessionSignal); } catch (_) {}
+        }
         this._menuSignal = this._sessionSignal = 0;
 
         for (const sig of this._settingSignals || []) {
@@ -1809,29 +2435,16 @@ export default class QuickChat extends Extension {
         }
         this._sourceSignals.clear();
 
-        if (this._native && this._nativeVisibleGuard) {
-            try { this._native.disconnect(this._nativeVisibleGuard); } catch (_) {}
-            this._nativeVisibleGuard = 0;
-        }
+        this._dateIntegration?.unmount(this._wrapper);
+        this._dateIntegration = null;
 
-        if (this._wrapper) {
-            if (this._native && this._native.get_parent() === this._wrapper) {
-                this._wrapper.remove_child(this._native);
-                this._native.remove_style_class_name('qc-native-clean');
-                this._parent.insert_child_at_index(this._native, this._index);
-                this._native.opacity = 255;
-                this._native.translation_y = 0;
-                this._native.visible = Main.sessionMode.hasNotifications && !Main.sessionMode.isGreeter;
-            }
-            this._unfreezeDateMenuLayout();
-            this._wrapper.destroy();
-        }
-
-        this._wrapper = this._native = this._parent = this._chat = this._date = null;
-        this._sendButton = this._stopButton = this._newButton = this._reconnectButton = null;
+        this._wrapper = this._chat = null;
+        this._sendButton = this._stopButton = this._newButton = this._clipAskBtn = this._reconnectButton = null;
+        this._statusBtn = this._modelChevron = this._modelPickerBox = this._loadMoreBtn = null;
         this._entry = this._scroll = this._scrollStack = this._messages = this._jumpBottomBtn = null;
-        this._status = this._statusDot = this._notifBadge = null;
+        this._status = this._statusDot = this._notifBadge = this._aiBadge = null;
         this._cardList = null;
+        this._allHistoryMessages = [];
         this._settings = null;
     }
 }
