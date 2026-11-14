@@ -12,78 +12,82 @@
 
   <!-- Layer 1: GNOME Shell 50 UI & Preferences -->
   <rect x="26" y="28" width="250" height="364" rx="14" fill="#1f222d" stroke="#3b4254" stroke-width="1.3"/>
-  <text x="151" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">GNOME Shell 50 前端层</text>
+  <text x="151" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">GNOME Shell 50 视图与首选项层</text>
 
-  <rect x="42" y="74" width="218" height="92" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="56" y="96" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">extension.js + stylesheet.css</text>
-  <text x="56" y="117" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• DateMenu 左栏「✦ 随问 | 通知」</text>
-  <text x="56" y="135" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 横向彩色小圆点轨迹与折叠审批</text>
-  <text x="56" y="153" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• Pango Markdown + 代码块一键复制</text>
+  <rect x="42" y="72" width="218" height="108" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
+  <text x="56" y="93" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">extension.js + ui/*</text>
+  <text x="56" y="112" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• dateMenuIntegration 安全挂载隔离</text>
+  <text x="56" y="129" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• markdownRenderer 冻结块增量流式排版</text>
+  <text x="56" y="146" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 全局快捷键与面板内一键切模型/思考</text>
+  <text x="56" y="163" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 脏标记节流 + 面板隐藏态零重排</text>
 
-  <rect x="42" y="182" width="218" height="92" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="56" y="204" fill="#a3be8c" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">prefs.js (Libadwaita)</text>
-  <text x="56" y="225" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 双分页：「模型与引擎」「界面与权限」</text>
-  <text x="56" y="243" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 自动扫描本机 Provider 与模型下拉框</text>
-  <text x="56" y="261" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 在线 /v1/models 一键测试与拉取</text>
+  <rect x="42" y="192" width="218" height="94" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
+  <text x="56" y="213" fill="#a3be8c" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">prefs.js (Libadwaita)</text>
+  <text x="56" y="233" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 双分页：「模型与引擎」「界面与权限」</text>
+  <text x="56" y="250" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 只读扫描本机 Provider 与能力矩阵</text>
+  <text x="56" y="267" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 在线 /v1/models 测速拉取与下拉选择</text>
 
-  <rect x="42" y="290" width="218" height="82" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="56" y="312" fill="#ebcb8b" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">GSettings Schema</text>
-  <text x="56" y="333" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 配置实时监听与空闲热重连</text>
-  <text x="56" y="351" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 锁屏保护与会话 ID 持久化恢复</text>
+  <rect x="42" y="298" width="218" height="78" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
+  <text x="56" y="319" fill="#ebcb8b" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">GSettings + secretStore.js</text>
+  <text x="56" y="339" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• GNOME Keyring (libsecret) 密钥加密</text>
+  <text x="56" y="356" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 配置实时监听、锁屏保护与平滑迁移</text>
 
-  <!-- Layer 2: Protocol & Client Router -->
+  <!-- Layer 2: Core State Machine, Storage & Protocol -->
   <rect x="330" y="28" width="246" height="364" rx="14" fill="#1f222d" stroke="#3b4254" stroke-width="1.3"/>
-  <text x="453" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">统一协议与多后端调度层</text>
+  <text x="453" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">核心状态机、存储与协议层</text>
 
-  <rect x="346" y="78" width="214" height="134" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="360" y="100" fill="#81a1c1" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">piClient.js</text>
-  <text x="360" y="122" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 自动探测 nvm / ~/.local/bin PATH</text>
-  <text x="360" y="140" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• Gio.Subprocess 异步双向管道</text>
-  <text x="360" y="158" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• Soup 3.0 原生 SSE 流式客户端</text>
-  <text x="360" y="176" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 审批挂起时自动暂停超时看门狗</text>
-  <text x="360" y="194" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• ZCode Personal 配置沙箱覆写</text>
+  <rect x="346" y="72" width="214" height="106" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
+  <text x="360" y="93" fill="#81a1c1" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">core/turnController + store</text>
+  <text x="360" y="112" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 每轮独立 TurnContext 杜绝取消串流</text>
+  <text x="360" y="129" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 异步 messages.jsonl 追加与分页回溯</text>
+  <text x="360" y="146" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 跨后端切换按字符预算自动摘要续接</text>
+  <text x="360" y="163" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• backendDetect 共享 PATH/模型探测</text>
 
-  <rect x="346" y="232" width="214" height="140" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="360" y="254" fill="#b48ead" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">protocol.js</text>
-  <text x="360" y="276" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 归一化四端流式事件 (normalizeEvent)</text>
-  <text x="360" y="294" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 解析 ZCode / Codex 本地模型目录</text>
-  <text x="360" y="312" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 智能纠正填反的 Provider / Model</text>
-  <text x="360" y="330" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• Markdown → 安全 Pango XML 转换</text>
-  <text x="360" y="348" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11">• 三档权限映射 (chat/readonly/full)</text>
+  <rect x="346" y="190" width="214" height="90" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
+  <text x="360" y="211" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">piClient.js + core/paths.js</text>
+  <text x="360" y="230" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4">• SIGTERM → SIGKILL 优雅进程回收</text>
+  <text x="360" y="247" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4">• $XDG_RUNTIME_DIR 0600 临时沙箱</text>
+  <text x="360" y="264" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4">• Soup 3.0 SSE 截断检测与看门狗</text>
+
+  <rect x="346" y="292" width="214" height="84" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
+  <text x="360" y="313" fill="#b48ead" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">protocol.js</text>
+  <text x="360" y="332" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 四端流式事件归一化与范围权限规则</text>
+  <text x="360" y="349" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 高危破坏性命令拦截 (禁会话级放行)</text>
+  <text x="360" y="366" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• Markdown → 安全 Pango XML 转换</text>
 
   <!-- Layer 3: 4 Backend Engines -->
   <rect x="630" y="28" width="304" height="364" rx="14" fill="#1f222d" stroke="#3b4254" stroke-width="1.3"/>
-  <text x="782" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">四大智能后端引擎</text>
+  <text x="782" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">四大可插拔智能后端</text>
 
   <!-- Engine 1: ZCode + zcodeBridge.cjs -->
   <rect x="646" y="72" width="272" height="86" rx="10" fill="#22322c" stroke="#2ec27e" stroke-width="1.2"/>
   <text x="660" y="93" fill="#57e389" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">1. ZCode CLI + zcodeBridge.cjs</text>
-  <text x="660" y="112" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• --require 预加载拦截 DenyPermissionBroker</text>
-  <text x="660" y="129" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 支持 WebFetch / Bash / Read / MCP 双向审批</text>
-  <text x="660" y="146" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 自动修复 Built-in Provider 路径与多轮续接</text>
+  <text x="660" y="112" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.3">• protocolVersion:1 握手 + 恢复 defineProperty</text>
+  <text x="660" y="129" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.3">• 按命令/域名/文件范围授权与送达回执确认</text>
+  <text x="660" y="146" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.3">• 只读解析 v2 配置 + --resume 多轮续接</text>
 
   <!-- Engine 2: Codex CLI -->
   <rect x="646" y="170" width="272" height="64" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
   <text x="660" y="191" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">2. Codex CLI (codex exec --json)</text>
-  <text x="660" y="210" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 读取 ~/.codex/config.toml 与模型缓存</text>
-  <text x="660" y="225" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 支持 thread_id 多轮会话恢复与沙箱控制</text>
+  <text x="660" y="210" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 只读解析 config.toml 与 models_cache.json</text>
+  <text x="660" y="225" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 并发 item.id 追踪、退出码检测与沙箱控制</text>
 
   <!-- Engine 3: Pi CLI -->
   <rect x="646" y="246" width="272" height="56" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
   <text x="660" y="267" fill="#ebcb8b" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">3. Pi Agent CLI (pi --mode rpc)</text>
-  <text x="660" y="286" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 常驻 JSON-RPC 流与工具白名单控制</text>
+  <text x="660" y="286" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 常驻 JSON-RPC + 工具白名单 + 5m 空闲回收</text>
 
   <!-- Engine 4: Custom OpenAI API -->
   <rect x="646" y="314" width="272" height="64" rx="10" fill="#252c3d" stroke="#3584e4" stroke-width="1.2"/>
   <text x="660" y="335" fill="#7dcfff" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">4. 自定义 OpenAI 兼容 API</text>
   <text x="660" y="354" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 直连 OpenAI / DeepSeek / Ollama / 本地代理</text>
-  <text x="660" y="369" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 零 CLI 依赖，原生支持 reasoning_content</text>
+  <text x="660" y="369" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• Keyring 密钥保护，原生支持 reasoning_content</text>
 
   <!-- Connecting Arrows -->
-  <line x1="276" y1="120" x2="342" y2="120" stroke="#6893d4" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
-  <line x1="276" y1="228" x2="342" y2="280" stroke="#6893d4" stroke-width="2" marker-end="url(#arrow)"/>
-  <line x1="560" y1="115" x2="642" y2="115" stroke="#4ad68d" stroke-width="2" marker-end="url(#arrowGreen)" marker-start="url(#arrowGreen)"/>
-  <line x1="560" y1="150" x2="642" y2="200" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
-  <line x1="560" y1="175" x2="642" y2="274" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
-  <line x1="560" y1="200" x2="642" y2="344" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="276" y1="125" x2="342" y2="125" stroke="#6893d4" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <line x1="276" y1="238" x2="342" y2="238" stroke="#6893d4" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="560" y1="198" x2="642" y2="115" stroke="#4ad68d" stroke-width="2" marker-end="url(#arrowGreen)" marker-start="url(#arrowGreen)"/>
+  <line x1="560" y1="220" x2="642" y2="200" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="560" y1="242" x2="642" y2="274" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="560" y1="264" x2="642" y2="344" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
 </svg>

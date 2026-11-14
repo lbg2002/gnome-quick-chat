@@ -8,13 +8,26 @@
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-26.04_LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Backends](https://img.shields.io/badge/Engines-ZCode_%7C_Codex_%7C_Pi_%7C_OpenAI_API-2ec27e)](#3-四大智能后端与能力矩阵)
 [![Tests](https://img.shields.io/badge/Unit_&_State_Tests-14_Passed-success)](#8-模块化架构开发与测试)
+[![Interactive Demo](https://img.shields.io/badge/▶_在线交互式动画演示-1080p_60fps-f5a623)](https://lbg2002.github.io/gnome-quick-chat/)
 
 点击屏幕顶部中央的「时间 / 日期」（或按下全局快捷键 **`Super + Shift + Q`**），即可在通知栏左栏无缝切换 **「✦ 随问 | 通知」**，右侧原生日历与世界时钟保持原样。  
 纯原生 `GJS` / `St` / `Clutter` 构建，**零 WebView 内存开销**、**增量流式 Markdown 渲染不阻塞 GNOME Shell 主线程**，支持**面板内一键切换模型/思考强度**、**剪贴板随问 (`Super + Shift + Y`)**、**横向彩色小圆点轨迹**与**按命令/域名/文件范围隔离的分级工具审批**。
 
 <br/>
 
-<img src="docs/assets/hero-overview.svg" alt="Quick Chat · 随问 界面总览" width="96%"/>
+<a href="https://lbg2002.github.io/gnome-quick-chat/" target="_blank">
+  <img src="docs/assets/intro-showcase.gif" alt="Quick Chat · 随问 12 页架构与特性介绍动画（点击打开 1080p 交互式播放器）" width="98%"/>
+</a>
+
+<sub>🎬 <b>12 幕架构与交互全览动画</b> · 点击上方动图或访问 <a href="https://lbg2002.github.io/gnome-quick-chat/"><b>在线 1080p 60fps 交互式播放器</b></a>（支持进度条拖拽、<code>←/→</code> 翻页、<code>Space</code> 暂停与 <code>F</code> 全屏演示；本地源码：<a href="docs/index.html"><code>docs/index.html</code></a>）</sub>
+
+<br/><br/>
+
+<details>
+  <summary><b>🖼️ 展开查看高清矢量界面结构总览图 (SVG)</b></summary>
+  <br/>
+  <img src="docs/assets/hero-overview.svg" alt="Quick Chat · 随问 界面总览" width="96%"/>
+</details>
 
 </div>
 
