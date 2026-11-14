@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 310" width="100%" height="100%">
+  <defs>
+    <linearGradient id="cardBg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#272830"/>
+      <stop offset="100%" stop-color="#212229"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="980" height="310" rx="16" fill="#161820"/>
+
+  <!-- ================= CARD 1: COLLAPSED DEFAULT STATE ================= -->
+  <rect x="20" y="20" width="296" height="270" rx="14" fill="url(#cardBg)" stroke="#393b46" stroke-width="1.2"/>
+  <rect x="34" y="34" width="94" height="22" rx="6" fill="#2e3440"/>
+  <text x="81" y="49" fill="#88c0d0" font-family="Noto Sans CJK SC, sans-serif" font-size="11" font-weight="700" text-anchor="middle">① 默认收起态</text>
+  <text x="34" y="76" fill="#e5e9f0" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="700">零冗余占用，正文空间最大化</text>
+
+  <!-- Simulated Bubble Inside Card 1 -->
+  <rect x="34" y="92" width="268" height="178" rx="11" fill="#2f3038" stroke="#41434f" stroke-width="1"/>
+  <text x="46" y="112" fill="#d8dee9" font-family="Inter, sans-serif" font-size="11" font-weight="700">gpt-6-luna</text>
+  <text x="112" y="112" fill="#7c818c" font-family="Inter, sans-serif" font-size="10.5">11:20</text>
+
+  <!-- Horizontal Dots Row -->
+  <circle cx="53" cy="130" r="6.5" fill="#8c939e" stroke="#c5cad3" stroke-width="1.4"/>
+  <circle cx="71" cy="130" r="6.5" fill="#2ec27e" stroke="#6ee7b7" stroke-width="1.4"/>
+  <circle cx="89" cy="130" r="6.5" fill="#2ec27e" stroke="#6ee7b7" stroke-width="1.4"/>
+  <text x="103" y="134" fill="#9498a6" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">思考 · 2 项工具（点击小圆查看）</text>
+
+  <!-- Direct Body Text right under dots -->
+  <text x="46" y="162" fill="#eceff4" font-family="Noto Sans CJK SC, sans-serif" font-size="12">今天 A 股休市，紫金矿业 (<tspan font-weight="700">601899</tspan>)</text>
+  <text x="46" y="182" fill="#eceff4" font-family="Noto Sans CJK SC, sans-serif" font-size="12">最近收盘价为 <tspan fill="#57e389" font-weight="700">26.38 元/股</tspan>。</text>
+  <rect x="46" y="198" width="244" height="56" rx="7" fill="#1e1f25"/>
+  <text x="56" y="218" fill="#8fbcbb" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">● 灰色小圆 = 深度思考过程</text>
+  <text x="56" y="238" fill="#a3be8c" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">● 绿色小圆 = 已批准/已完成的工具调用</text>
+
+  <!-- ================= CARD 2: PENDING APPROVAL STATE ================= -->
+  <rect x="342" y="20" width="296" height="270" rx="14" fill="url(#cardBg)" stroke="#393b46" stroke-width="1.2"/>
+  <rect x="356" y="34" width="106" height="22" rx="6" fill="#3d3522"/>
+  <text x="409" y="49" fill="#f5c211" font-family="Noto Sans CJK SC, sans-serif" font-size="11" font-weight="700" text-anchor="middle">② 敏感工具审批态</text>
+  <text x="356" y="76" fill="#e5e9f0" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="700">自动弹出审批，点完即收拢为绿圆</text>
+
+  <!-- Simulated Bubble Inside Card 2 -->
+  <rect x="356" y="92" width="268" height="178" rx="11" fill="#2f3038" stroke="#41434f" stroke-width="1"/>
+  <text x="368" y="112" fill="#d8dee9" font-family="Inter, sans-serif" font-size="11" font-weight="700">gpt-6-luna</text>
+
+  <!-- Horizontal Dots Row with Amber Pending Dot Selected -->
+  <circle cx="375" cy="130" r="6.5" fill="#8c939e" stroke="#c5cad3" stroke-width="1.4"/>
+  <circle cx="393" cy="130" r="6.5" fill="#2ec27e" stroke="#6ee7b7" stroke-width="1.4"/>
+  <circle cx="411" cy="130" r="7.5" fill="#f5c211" stroke="#ffffff" stroke-width="2.2"/>
+  <text x="425" y="134" fill="#f5c211" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="700">⚠️ 待审批: Bash</text>
+
+  <!-- Pending Approval Drawer -->
+  <rect x="368" y="144" width="244" height="86" rx="8" fill="#353122" stroke="#7a6623" stroke-width="1"/>
+  <text x="378" y="161" fill="#ffeaa7" font-family="Noto Sans CJK SC, sans-serif" font-size="11" font-weight="700">🛡️ 请求授权调用：Bash</text>
+  <rect x="378" y="167" width="224" height="20" rx="4" fill="#1e1f24"/>
+  <text x="384" y="181" fill="#e5e9f0" font-family="JetBrains Mono, monospace" font-size="10.5">code ~/pythondoc/private/QuickChat</text>
+
+  <!-- Approval Buttons -->
+  <rect x="378" y="195" width="68" height="24" rx="6" fill="#2ec27e"/>
+  <text x="412" y="211" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="10" font-weight="700" text-anchor="middle">✓ 允许本次</text>
+  <rect x="452" y="195" width="68" height="24" rx="6" fill="#3584e4"/>
+  <text x="486" y="211" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="10" font-weight="700" text-anchor="middle">✓ 始终允许</text>
+  <rect x="526" y="195" width="52" height="24" rx="6" fill="#4c262a" stroke="#a5373f" stroke-width="1"/>
+  <text x="552" y="211" fill="#ff7b63" font-family="Noto Sans CJK SC, sans-serif" font-size="10" font-weight="700" text-anchor="middle">✕ 拒绝</text>
+
+  <text x="368" y="250" fill="#9da1ae" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">点击「允许」后抽屉自动关闭，黄圆变绿圆</text>
+
+  <!-- ================= CARD 3: CLICK TO INSPECT STATE ================= -->
+  <rect x="664" y="20" width="296" height="270" rx="14" fill="url(#cardBg)" stroke="#393b46" stroke-width="1.2"/>
+  <rect x="678" y="34" width="106" height="22" rx="6" fill="#233930"/>
+  <text x="731" y="49" fill="#57e389" font-family="Noto Sans CJK SC, sans-serif" font-size="11" font-weight="700" text-anchor="middle">③ 按需点击查看态</text>
+  <text x="678" y="76" fill="#e5e9f0" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="700">点灰圆看思考 · 点绿圆看工具详情</text>
+
+  <!-- Simulated Bubble Inside Card 3 -->
+  <rect x="678" y="92" width="268" height="178" rx="11" fill="#2f3038" stroke="#41434f" stroke-width="1"/>
+  <text x="690" y="112" fill="#d8dee9" font-family="Inter, sans-serif" font-size="11" font-weight="700">gpt-6-luna</text>
+
+  <!-- Horizontal Dots Row with Grey Thinking Dot Selected -->
+  <circle cx="697" cy="130" r="7.5" fill="#8c939e" stroke="#ffffff" stroke-width="2.2"/>
+  <circle cx="715" cy="130" r="6.5" fill="#2ec27e" stroke="#6ee7b7" stroke-width="1.4"/>
+  <circle cx="733" cy="130" r="6.5" fill="#2ec27e" stroke="#6ee7b7" stroke-width="1.4"/>
+  <text x="747" y="134" fill="#c0c5ce" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">思考过程（点击灰圆收起）</text>
+
+  <!-- Expanded Thinking Drawer -->
+  <rect x="690" y="144" width="244" height="72" rx="8" fill="#23242a" stroke="#3f414d" stroke-width="1"/>
+  <text x="700" y="161" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="11" font-weight="700">💭 思考过程</text>
+  <rect x="892" y="149" width="34" height="15" rx="4" fill="#383a44"/>
+  <text x="909" y="160" fill="#b8bcc8" font-family="Noto Sans CJK SC, sans-serif" font-size="9" text-anchor="middle">收起</text>
+  <text x="700" y="182" fill="#a5aab6" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">1. 先通过 WebFetch 获取 601899 行情；</text>
+  <text x="700" y="200" fill="#a5aab6" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">2. 核对交易日状态并整理收盘价结论。</text>
+
+  <text x="690" y="238" fill="#eceff4" font-family="Noto Sans CJK SC, sans-serif" font-size="11.5">今天 A 股休市，紫金矿业收盘价 26.38 元…</text>
+  <text x="690" y="256" fill="#88c0d0" font-family="Noto Sans CJK SC, sans-serif" font-size="10">💡 再次点击同一小圆即可随时折叠收起</text>
+</svg>

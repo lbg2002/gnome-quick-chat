@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.quick-chat" path="/org/gnome/shell/extensions/quick-chat/">
+    <key name="backend" type="s">
+      <default>'auto'</default>
+      <summary>Backend engine (auto, pi, zcode, codex, openai)</summary>
+    </key>
+    <key name="pi-path" type="s">
+      <default>'pi'</default>
+      <summary>Executable name or absolute path</summary>
+    </key>
+    <key name="provider" type="s">
+      <default>''</default>
+      <summary>Model provider override</summary>
+    </key>
+    <key name="model" type="s">
+      <default>''</default>
+      <summary>Model identifier override</summary>
+    </key>
+    <key name="openai-base-url" type="s">
+      <default>''</default>
+      <summary>OpenAI-compatible API Base URL</summary>
+    </key>
+    <key name="openai-api-key" type="s">
+      <default>''</default>
+      <summary>OpenAI-compatible API Key</summary>
+    </key>
+    <key name="openai-model" type="s">
+      <default>''</default>
+      <summary>OpenAI-compatible Model ID</summary>
+    </key>
+    <key name="system-prompt" type="s">
+      <default>''</default>
+      <summary>Custom system prompt for OpenAI-compatible backend</summary>
+    </key>
+    <key name="agent-mode" type="s">
+      <default>'readonly'</default>
+      <summary>Agent permission mode (chat, readonly, full)</summary>
+    </key>
+    <key name="workspace" type="s">
+      <default>''</default>
+      <summary>Custom workspace path</summary>
+    </key>
+    <key name="session-id" type="s">
+      <default>''</default>
+      <summary>Current active session ID</summary>
+    </key>
+    <key name="panel-width" type="i">
+      <range min="340" max="680"/>
+      <default>460</default>
+      <summary>Chat panel width in logical pixels</summary>
+    </key>
+    <key name="panel-height" type="i">
+      <range min="280" max="640"/>
+      <default>380</default>
+      <summary>Chat scroll area height in logical pixels</summary>
+    </key>
+    <key name="default-tab" type="s">
+      <default>'ai'</default>
+      <summary>Default tab when session starts (ai or notifications)</summary>
+    </key>
+    <key name="enable-animations" type="b">
+      <default>true</default>
+      <summary>Enable smooth UI transitions and animations</summary>
+    </key>
+    <key name="render-markdown" type="b">
+      <default>true</default>
+      <summary>Render Markdown formatting and code blocks</summary>
+    </key>
+  </schema>
+</schemalist>

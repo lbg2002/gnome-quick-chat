@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 560" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14161d"/>
+      <stop offset="50%" stop-color="#1c202b"/>
+      <stop offset="100%" stop-color="#12151e"/>
+    </linearGradient>
+    <linearGradient id="panelBg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2a2a30"/>
+      <stop offset="100%" stop-color="#232328"/>
+    </linearGradient>
+    <linearGradient id="userBubble" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#233d63"/>
+      <stop offset="100%" stop-color="#1e3454"/>
+    </linearGradient>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="120%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <filter id="btnShadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- Background Canvas -->
+  <rect width="980" height="560" rx="18" fill="url(#bgGrad)"/>
+
+  <!-- GNOME Top Bar -->
+  <rect x="0" y="0" width="980" height="34" rx="18" fill="#0d0e12"/>
+  <rect x="0" y="16" width="980" height="18" fill="#0d0e12"/>
+  <circle cx="24" cy="17" r="5" fill="#ffffff" opacity="0.85"/>
+  <rect x="36" y="14" width="22" height="6" rx="3" fill="#ffffff" opacity="0.4"/>
+  <!-- Top Bar Center Clock Pill -->
+  <rect x="415" y="4" width="150" height="26" rx="13" fill="#2f313a"/>
+  <text x="490" y="21" fill="#ffffff" font-family="Noto Sans CJK SC, Inter, sans-serif" font-size="12.5" font-weight="700" text-anchor="middle">11月14日  11:20</text>
+  <!-- Top Bar Right System Indicators -->
+  <text x="945" y="21" fill="#d8dee9" font-family="Inter, sans-serif" font-size="12" text-anchor="end">Wi-Fi  🔊  🔋 98%</text>
+
+  <!-- GNOME DateMenu Popover Container -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="46" width="840" height="492" rx="22" fill="url(#panelBg)" stroke="#3e3f47" stroke-width="1.2"/>
+  </g>
+
+  <!-- Vertical Divider between Left Column (Quick Chat) and Right Column (Calendar) -->
+  <line x1="558" y1="62" x2="558" y2="522" stroke="#393a42" stroke-width="1"/>
+
+  <!-- ================= LEFT COLUMN: QUICK CHAT ================= -->
+  <!-- Segmented Tab Switcher -->
+  <rect x="88" y="62" width="166" height="36" rx="12" fill="#34353d" stroke="#454650" stroke-width="1"/>
+  <!-- Active Tab: 随问 -->
+  <rect x="92" y="65" width="82" height="30" rx="9" fill="#484a54"/>
+  <text x="133" y="85" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="700" text-anchor="middle">✦ 随问</text>
+  <!-- Inactive Tab: 通知 8 -->
+  <text x="200" y="85" fill="#b0b3be" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="600" text-anchor="middle">通知</text>
+  <rect x="220" y="72" width="22" height="16" rx="8" fill="#3584e4"/>
+  <text x="231" y="84" fill="#ffffff" font-family="Inter, sans-serif" font-size="10.5" font-weight="700" text-anchor="middle">8</text>
+
+  <!-- Settings Gear Button -->
+  <rect x="506" y="62" width="34" height="34" rx="10" fill="#34353d" stroke="#454650" stroke-width="1"/>
+  <text x="523" y="84" fill="#d8dee9" font-family="sans-serif" font-size="15" text-anchor="middle">⚙</text>
+
+  <!-- Status Header Row -->
+  <rect x="88" y="108" width="452" height="38" rx="12" fill="#31323a" stroke="#3f404a" stroke-width="1"/>
+  <circle cx="106" cy="127" r="4.5" fill="#2ec27e"/>
+  <text x="118" y="131" fill="#d5d7df" font-family="Inter, Noto Sans CJK SC, sans-serif" font-size="12.5" font-weight="600">ZCode · gpt-6-luna · 智能审批</text>
+  <rect x="462" y="114" width="70" height="26" rx="8" fill="#3e4049"/>
+  <text x="497" y="131" fill="#e5e7ef" font-family="Noto Sans CJK SC, sans-serif" font-size="11.5" font-weight="600" text-anchor="middle">＋ 新对话</text>
+
+  <!-- User Message Bubble -->
+  <rect x="112" y="156" width="428" height="58" rx="14" fill="url(#userBubble)" stroke="#3864a0" stroke-width="1"/>
+  <text x="126" y="175" fill="#c0d6f5" font-family="Noto Sans CJK SC, sans-serif" font-size="11.5" font-weight="700">我</text>
+  <text x="145" y="175" fill="#8aa9d6" font-family="Inter, sans-serif" font-size="11">11:18</text>
+  <rect x="494" y="162" width="36" height="18" rx="5" fill="#2e4d7a"/>
+  <text x="512" y="174" fill="#d8e6fa" font-family="Noto Sans CJK SC, sans-serif" font-size="10" font-weight="600" text-anchor="middle">复制</text>
+  <text x="126" y="200" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="13.5" font-weight="600">上网查一下今天紫金矿业的 A 股股价，并用脚本算一下市盈率</text>
+
+  <!-- Assistant Message Card -->
+  <rect x="88" y="224" width="444" height="248" rx="14" fill="#32333b" stroke="#42434e" stroke-width="1"/>
+  <text x="102" y="244" fill="#dcdfe8" font-family="Inter, sans-serif" font-size="11.5" font-weight="700">gpt-6-luna</text>
+  <text x="172" y="244" fill="#888b96" font-family="Inter, sans-serif" font-size="11">11:18</text>
+  <rect x="484" y="230" width="36" height="18" rx="5" fill="#41434d"/>
+  <text x="502" y="242" fill="#d8dbe4" font-family="Noto Sans CJK SC, sans-serif" font-size="10" font-weight="600" text-anchor="middle">复制</text>
+
+  <!-- ★ Horizontal Colored Small Circle Trace Bar (横向小圆点轨迹栏) ★ -->
+  <g transform="translate(102, 255)">
+    <!-- Grey Dot: Thinking -->
+    <circle cx="8" cy="9" r="7" fill="#8c939e" stroke="#c5cad3" stroke-width="1.5"/>
+    <!-- Green Dot 1: WebFetch #1 -->
+    <circle cx="28" cy="9" r="7" fill="#2ec27e" stroke="#6ee7b7" stroke-width="1.5"/>
+    <!-- Green Dot 2: WebFetch #2 (Selected with white ring) -->
+    <circle cx="48" cy="9" r="7.5" fill="#2ec27e" stroke="#ffffff" stroke-width="2.2"/>
+    <!-- Green Dot 3: Bash -->
+    <circle cx="68" cy="9" r="7" fill="#2ec27e" stroke="#6ee7b7" stroke-width="1.5"/>
+    <!-- Inline Trace Caption -->
+    <text x="84" y="13" fill="#9da1ae" font-family="Inter, Noto Sans CJK SC, sans-serif" font-size="11">灰:思考 · 绿:3 项工具（点击小圆查看详情）</text>
+  </g>
+
+  <!-- Collapsible Detail Drawer (Shown when a small circle is clicked) -->
+  <rect x="102" y="278" width="416" height="54" rx="9" fill="#25262c" stroke="#3e404a" stroke-width="1"/>
+  <text x="112" y="295" fill="#57e389" font-family="Noto Sans CJK SC, Inter, sans-serif" font-size="11.5" font-weight="700">✓ 已批准执行：WebFetch (0.4s)</text>
+  <rect x="474" y="283" width="36" height="16" rx="4" fill="#383a44"/>
+  <text x="492" y="294" fill="#b8bcc8" font-family="Noto Sans CJK SC, sans-serif" font-size="9.5" text-anchor="middle">收起</text>
+  <rect x="112" y="302" width="396" height="22" rx="5" fill="#1b1c21"/>
+  <text x="120" y="317" fill="#d0d4e0" font-family="JetBrains Mono, monospace" font-size="11">https://finance.yahoo.com/quote/601899.SS/</text>
+
+  <!-- Assistant Markdown & Code Body -->
+  <text x="102" y="354" fill="#f0f2f8" font-family="Noto Sans CJK SC, sans-serif" font-size="13">紫金矿业 (<tspan font-weight="700" fill="#ffffff">601899.SS</tspan>) 最新收盘价为 <tspan font-weight="700" fill="#57e389">26.38 元/股</tspan>（周五收盘）：</text>
+
+  <!-- Code Block Card -->
+  <rect x="102" y="366" width="416" height="92" rx="9" fill="#1d1e24" stroke="#363842" stroke-width="1"/>
+  <rect x="102" y="366" width="416" height="24" rx="9" fill="#282a32"/>
+  <text x="114" y="382" fill="#9aa0ae" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="700">bash</text>
+  <rect x="456" y="369" width="54" height="18" rx="5" fill="#3a3c46"/>
+  <text x="483" y="381" fill="#d8dbe4" font-family="Noto Sans CJK SC, sans-serif" font-size="9.5" font-weight="600" text-anchor="middle">复制代码</text>
+  <text x="114" y="408" fill="#7dcfff" font-family="JetBrains Mono, monospace" font-size="11.5">Price: 26.38 CNY | EPS (TTM): 1.35 CNY</text>
+  <text x="114" y="428" fill="#bb9af7" font-family="JetBrains Mono, monospace" font-size="11.5">PE (TTM) = 26.38 / 1.35 ≈ 19.54x</text>
+  <text x="114" y="448" fill="#9ece6a" font-family="JetBrains Mono, monospace" font-size="11.5"># 支持联网抓取、本地文件检索与终端命令交互式审批</text>
+
+  <!-- Floating Bottom Jump-to-Bottom Circular Button -->
+  <g filter="url(#btnShadow)">
+    <circle cx="310" cy="456" r="16" fill="#2d2e36" stroke="#585b68" stroke-width="1.2"/>
+    <path d="M305 454 L310 459 L315 454 M310 449 L310 459" stroke="#ffffff" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Bottom Input Row -->
+  <rect x="88" y="484" width="382" height="38" rx="12" fill="#202127" stroke="#3584e4" stroke-width="1.6"/>
+  <text x="102" y="508" fill="#7c808d" font-family="Noto Sans CJK SC, sans-serif" font-size="12.5">输入问题（Enter 发送，↑↓ 历史，Esc 停止）…</text>
+  <rect x="478" y="484" width="62" height="38" rx="11" fill="#3584e4"/>
+  <text x="509" y="508" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="700" text-anchor="middle">发送</text>
+
+  <!-- ================= RIGHT COLUMN: NATIVE GNOME CALENDAR ================= -->
+  <text x="580" y="84" fill="#9ea2ae" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="700">星期六</text>
+  <text x="580" y="114" fill="#dcdfe8" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="700">2026年11月14日</text>
+
+  <text x="588" y="156" fill="#c0c3ce" font-family="sans-serif" font-size="13">◀</text>
+  <text x="734" y="156" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">十一月</text>
+  <text x="880" y="156" fill="#c0c3ce" font-family="sans-serif" font-size="13" text-anchor="end">▶</text>
+
+  <!-- Calendar Grid Headers -->
+  <g fill="#7c808d" font-family="Noto Sans CJK SC, sans-serif" font-size="12" text-anchor="middle">
+    <text x="592" y="192">一</text>
+    <text x="639" y="192">二</text>
+    <text x="686" y="192">三</text>
+    <text x="733" y="192">四</text>
+    <text x="780" y="192">五</text>
+    <text x="827" y="192">六</text>
+    <text x="874" y="192">日</text>
+  </g>
+
+  <!-- Calendar Dates -->
+  <g fill="#d5d8e2" font-family="Inter, sans-serif" font-size="12.5" text-anchor="middle">
+    <text x="592" y="226" fill="#5e616d">26</text><text x="639" y="226" fill="#5e616d">27</text><text x="686" y="226" fill="#5e616d">28</text><text x="733" y="226" fill="#5e616d">29</text><text x="780" y="226" fill="#5e616d">30</text><text x="827" y="226" fill="#5e616d">31</text><text x="874" y="226">01</text>
+    <text x="592" y="260">02</text><text x="639" y="260">03</text><text x="686" y="260">04</text><text x="733" y="260">05</text><text x="780" y="260">06</text><text x="827" y="260">07</text><text x="874" y="260">08</text>
+    <text x="592" y="294">09</text><text x="639" y="294">10</text><text x="686" y="294">11</text><text x="733" y="294">12</text><text x="780" y="294">13</text>
+    <circle cx="827" cy="290" r="15" fill="#3584e4"/>
+    <text x="827" y="294" fill="#ffffff" font-weight="700">14</text>
+    <text x="874" y="294">15</text>
+    <text x="592" y="328">16</text><text x="639" y="328">17</text><text x="686" y="328">18</text><text x="733" y="328">19</text><text x="780" y="328">20</text><text x="827" y="328">21</text><text x="874" y="328">22</text>
+    <text x="592" y="362">23</text><text x="639" y="362">24</text><text x="686" y="362">25</text><text x="733" y="362">26</text><text x="780" y="362">27</text><text x="827" y="362">28</text><text x="874" y="362">29</text>
+  </g>
+
+  <!-- Today Events Card -->
+  <rect x="578" y="396" width="312" height="72" rx="14" fill="#32333b"/>
+  <text x="594" y="422" fill="#a8acb8" font-family="Noto Sans CJK SC, sans-serif" font-size="12.5" font-weight="700">今天</text>
+  <text x="594" y="448" fill="#858996" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-style="italic">无事件</text>
+
+  <!-- World Clocks Button -->
+  <rect x="578" y="480" width="312" height="42" rx="12" fill="#32333b"/>
+  <text x="594" y="506" fill="#c5c8d4" font-family="Noto Sans CJK SC, sans-serif" font-size="13" font-weight="600">添加世界时钟…</text>
+</svg>
