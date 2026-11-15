@@ -86,7 +86,8 @@ function replaceFileAsync(filePath, contentStr) {
             null,
             (src, res) => {
                 try {
-                    const [ok] = src.replace_contents_finish(res);
+                    const ret = src.replace_contents_finish(res);
+                    const ok = Array.isArray(ret) ? ret[0] : ret;
                     if (ok === false) {
                         reject(new Error(`原子替换文件返回失败：${filePath}`));
                         return;
@@ -129,7 +130,8 @@ function appendLineAsync(filePath, lineStr) {
                 outStream.write_all_async(bytes, GLib.PRIORITY_DEFAULT, null, (stream, wRes) => {
                     let writeError = null;
                     try {
-                        const [ok] = stream.write_all_finish(wRes);
+                        const ret = stream.write_all_finish(wRes);
+                        const ok = Array.isArray(ret) ? ret[0] : ret;
                         if (ok === false) {
                             writeError = new Error(`追加写入未完成：${filePath}`);
                         }

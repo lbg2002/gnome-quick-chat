@@ -7,12 +7,12 @@ import Gio from 'gi://Gio';
 
 import {BackendRegistry, MemorySettingsStore} from '../core/backendRegistry.js';
 import {detectBackendSelection} from '../core/backendDetect.js';
-import {parseUrlPortable, evaluateToolPermission} from '../core/permissionPolicy.js';
+import {parseUrlPortable, evaluatePermissionPolicy} from '../core/permissionPolicy.js';
 import {inspectEndpointSecurity, normalizeEndpointKeyIdentity, shouldStripAuthOnRedirect} from '../core/secretPolicy.js';
 import {buildRuntimeContextSignature, buildBudgetedContextMessages} from '../core/contextManager.js';
 import {SessionStore} from '../core/sessionStore.js';
-import {StreamingMarkdownParser} from '../core/markdownParser.js';
-import {HistoryWindowController, RenderScheduler} from '../core/renderScheduler.js';
+import {StreamingMarkdownParser} from '../core/markdownStreamParser.js';
+import {HistoryWindowController, computeAdaptiveRenderDelayMs} from '../core/renderScheduler.js';
 import {matchSlashCommands, applyQuickActionToDraft} from '../core/quickActions.js';
 import {AttachmentManager, extractCopiedFilePaths} from '../core/attachmentManager.js';
 import {BackgroundNotificationGate, resolveNotificationClickTarget} from '../core/notificationPolicy.js';
@@ -47,19 +47,26 @@ assert(normalizeEndpointKeyIdentity('https://api.example.com/v1/models') === 'ht
 assert(inspectEndpointSecurity('http://203.0.113.10:8080/v1').isRemotePlaintextHttp === true, 'Remote HTTP warning');
 assert(shouldStripAuthOnRedirect('https://api.example.com/v1', 'https://evil.example.net/v1') === true, 'Cross-origin redirect strip');
 assert(buildRuntimeContextSignature('openai', {openaiBaseUrl: 'https://api.example.com/v1', openaiModel: 'gpt-4o'}).includes('api.example.com'), 'Context signature');
-assert(evaluateToolPermission('Bash', {command: 'ls -la'}, {cwd: '/tmp', sessionId: 's1'}).allowSessionScope === false, 'Conservative Bash default');
+assert(
+    evaluatePermissionPolicy({
+        toolName: 'Bash',
+        input: {command: 'ls -la'},
+        cwd: '/tmp',
+        sessionId: 's1',
+    }).allowSessionRule === false,
+    'Conservative Bash default'
+);
 
 // 3. Streaming Markdown + OpenAI SSE + Context budgeting + BaseBackendAdapter
 const md = new StreamingMarkdownParser();
-md.pushDelta('# 标题\n\n```js\nconst x = 1;\n```\n');
-assert(md.finalize().blocks.length === 2, 'Streaming Markdown blocks');
+assert(md.update('# 标题\n\n```js\nconst x = 1;\n```\n', {finalize: true}).blocks.length === 2, 'Streaming Markdown blocks');
 
 const sse = new OpenAISseParser();
-const sseEvents = sse.pushChunk(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"你好"}}]}\r\n\r\ndata: [DONE]\r\n\r\n'));
-assert(sseEvents.some(e => e.type === 'text_delta' && e.delta === '你好'), 'SSE UTF-8 delta');
+const sseEvents = sse.pushBytes(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"你好"}}]}\r\n\r\ndata: [DONE]\r\n\r\n'));
+assert(sseEvents.some(e => e.type === 'delta' && e.textDelta === '你好'), 'SSE UTF-8 delta');
 assert(getBackendCapabilities('codex', 'readonly').supportsApproval === false, 'Codex capability honesty');
-assert(typeof BaseBackendAdapter === 'function' && typeof RenderScheduler === 'function', 'Adapter & scheduler classes');
-assert(buildBudgetedContextMessages([{role: 'user', text: 'hi'}], {currentPrompt: 'next'}).messages.length === 1, 'Budgeted context');
+assert(typeof BaseBackendAdapter === 'function' && typeof computeAdaptiveRenderDelayMs === 'function', 'Adapter & scheduler helpers');
+assert(buildBudgetedContextMessages([{role: 'user', content: 'hi'}], {currentPrompt: 'next'}).length === 1, 'Budgeted context');
 
 // 4. Stage F modules (`/` commands, Nautilus file URI attachments, notifications, router, diagnostics)
 const slash = matchSlashCommands('/translate Hello');
@@ -94,8 +101,8 @@ let asyncError = null;
     try {
         const store = new SessionStore('gjs_smoke_sess', {sessionsRootDir: tmpRoot});
         await store.load('openai', {openaiModel: 'gpt-4o'});
-        await store.appendMessage({id: 'u1', role: 'user', text: 'GJS 异步持久化测试'}, 'openai', {openaiModel: 'gpt-4o'});
-        await store.appendMessage({id: 'a1', role: 'assistant', text: '持久化正常', replyTo: 'u1'}, 'openai', {openaiModel: 'gpt-4o'});
+        await store.appendMessage({id: 'u1', role: 'user', content: 'GJS 异步持久化测试'}, 'openai', {openaiModel: 'gpt-4o'});
+        await store.appendMessage({id: 'a1', role: 'assistant', content: '持久化正常', replyTo: 'u1'}, 'openai', {openaiModel: 'gpt-4o'});
         await store.flush();
 
         const reloaded = new SessionStore('gjs_smoke_sess', {sessionsRootDir: tmpRoot});
