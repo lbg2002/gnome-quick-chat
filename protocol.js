@@ -7,13 +7,22 @@ export function stripAnsi(text) {
     return text.replace(ANSI_PATTERN, '');
 }
 
+const DESKTOP_ENV_HEADER_RE = /^\[Ubuntu GNOME 用户目录环境：[^\n]*\]\n/;
+
+export function stripDesktopEnvPrefix(text) {
+    if (typeof text !== 'string') return '';
+    return text.replace(DESKTOP_ENV_HEADER_RE, '');
+}
+
 export function messageText(message) {
     if (!message) return '';
-    if (typeof message.content === 'string') return message.content;
-    return (Array.isArray(message.content) ? message.content : [])
-        .filter(part => part && part.type === 'text')
-        .map(part => part.text ?? '')
-        .join('\n');
+    const raw = typeof message.content === 'string'
+        ? message.content
+        : (Array.isArray(message.content) ? message.content : [])
+            .filter(part => part && part.type === 'text')
+            .map(part => part.text ?? '')
+            .join('\n');
+    return message.role === 'user' ? stripDesktopEnvPrefix(raw) : raw;
 }
 
 export function messageThinking(message) {
@@ -356,6 +365,68 @@ export function buildBudgetedContextMessages(messages, maxMessages = 24, maxChar
     return selected;
 }
 
+const USER_DIR_MENTION_RE = /(?:桌面|下载|文档|图片|视频|音乐|主目录|家目录|\bdesktop\b|\bdownloads?\b|\bdocuments?\b|\bpictures?\b)/i;
+
+export function expandHomePath(rawPath, homeDir = '') {
+    const raw = String(rawPath ?? '').trim();
+    const home = String(homeDir ?? '').trim().replace(/\/+$/, '');
+    if (!raw) return home;
+    if (!home) return raw;
+    if (raw === '~' || raw === '$HOME' || raw === '${HOME}') {
+        return home;
+    }
+    if (raw.startsWith('~/')) {
+        return `${home}${raw.slice(1)}`;
+    }
+    if (raw.startsWith('$HOME/')) {
+        return `${home}${raw.slice('$HOME'.length)}`;
+    }
+    if (raw.startsWith('${HOME}/')) {
+        return `${home}${raw.slice('${HOME}'.length)}`;
+    }
+    // Migrate legacy v0.1.0 isolated empty workspace to user's real HOME directory
+    if (raw.endsWith('/gnome-quick-chat/workspace')) {
+        return home;
+    }
+    return raw;
+}
+
+export function augmentPromptWithDesktopContext(promptText, envDirs = null, {isFirstTurn = false, mode = 'readonly', workspace = ''} = {}) {
+    const rawPrompt = String(promptText ?? '');
+    if (!rawPrompt || !envDirs || typeof envDirs !== 'object' || mode === 'chat') {
+        return rawPrompt;
+    }
+
+    const mentionsUserDir = USER_DIR_MENTION_RE.test(rawPrompt);
+    if (!isFirstTurn && !mentionsUserDir) {
+        return rawPrompt;
+    }
+
+    const parts = [];
+    const home = String(envDirs.home || '').trim();
+    const work = String(workspace || envDirs.workspace || home).trim();
+    if (home) parts.push(`主目录(HOME)=${home}`);
+    if (work && work !== home) parts.push(`当前工作目录=${work}`);
+    if (envDirs.desktop) parts.push(`真实桌面(XDG_DESKTOP_DIR)=${envDirs.desktop}`);
+    if (envDirs.downloads) parts.push(`下载=${envDirs.downloads}`);
+    if (envDirs.documents) parts.push(`文档=${envDirs.documents}`);
+    if (envDirs.pictures) parts.push(`图片=${envDirs.pictures}`);
+
+    if (!parts.length) return rawPrompt;
+
+    let clashWarning = '';
+    if (
+        home &&
+        envDirs.desktop &&
+        envDirs.desktop !== `${home}/Desktop` &&
+        envDirs.hasLegacyEnglishDesktop
+    ) {
+        clashWarning = `；特别注意：本机真实桌面为 ${envDirs.desktop}，请勿误查残留的英文 ${home}/Desktop 目录`;
+    }
+
+    return `[Ubuntu GNOME 用户目录环境：${parts.join('，')}${clashWarning}]\n${rawPrompt}`;
+}
+
 export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromptText, maxChars = 6000) {
     const prior = buildBudgetedContextMessages(historyBeforePrompt, 8, maxChars);
     if (!prior.length) return newPromptText;
@@ -390,13 +461,15 @@ export function buildArgs(config, sessionDir, sessionId) {
     return args;
 }
 
-export function buildZCodeArgs(config, prompt, resumeSessionId = '') {
+export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace = '') {
     const mode = config?.mode;
+    const effectiveCwd = String(workspace || config?.resolvedWorkspace || '').trim();
     const prefix = Array.isArray(config?.commandPrefix) && config.commandPrefix.length
         ? [...config.commandPrefix]
         : [config?.executable || 'zcode'];
     const args = [
         ...prefix,
+        ...(effectiveCwd ? ['--cwd', effectiveCwd] : []),
         '--prompt', String(prompt ?? ''),
         '--output-format', 'stream-json',
         '--no-color',

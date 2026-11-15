@@ -17,7 +17,7 @@ import {
     messageText,
     messageThinking,
 } from './protocol.js';
-import {getDataDir, getSessionsDir} from './core/paths.js';
+import {getSessionsDir, resolveWorkspacePath} from './core/paths.js';
 import {loadOpenAIApiKey} from './core/secretStore.js';
 import {detectEffectiveBackend, loadLocalBackendCatalog} from './core/backendDetect.js';
 import {DateMenuIntegration} from './ui/dateMenuIntegration.js';
@@ -1117,10 +1117,12 @@ export default class QuickChat extends Extension {
             const config = await this._loadRuntimeConfig();
             if (!this._enabled || generation !== this._generation) return;
 
-            const root = getDataDir();
             const sessions = getSessionsDir();
-            const defaultHome = GLib.get_home_dir() || GLib.build_filenamev([root, 'workspace']);
-            const work = config.workspace || defaultHome;
+            if (config.workspace && config.workspace.endsWith('/gnome-quick-chat/workspace')) {
+                this._settings.set_string('workspace', '');
+                config.workspace = '';
+            }
+            const work = resolveWorkspacePath(config.workspace);
             if (!GLib.file_test(work, GLib.FileTest.IS_DIR)) {
                 GLib.mkdir_with_parents(work, 0o700);
             }

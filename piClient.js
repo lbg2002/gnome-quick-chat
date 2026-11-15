@@ -2,6 +2,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Soup from 'gi://Soup?version=3.0';
 import {
+    augmentPromptWithDesktopContext,
     buildArgs,
     buildBudgetedContextMessages,
     buildCodexArgs,
@@ -22,6 +23,7 @@ import {
 } from './core/backendDetect.js';
 import {
     getPrivateRuntimeDir,
+    getUserSpecialDirs,
     removeFileQuietly,
     writePrivateFileSync,
 } from './core/paths.js';
@@ -268,6 +270,8 @@ export class PiClient {
         this._workspace = workspace;
         this._sessionDir = sessionDir;
         this._sessionId = sessionId;
+        this._specialDirs = getUserSpecialDirs();
+        this._piFirstPromptSent = false;
         this._runtime = resolveBackendRuntime(config);
         this._backend = this._runtime.backend;
 
@@ -279,6 +283,19 @@ export class PiClient {
             }
             this._store = new SessionStore(sessionId);
         }
+    }
+
+    _buildXdgEnvVars() {
+        const d = this._specialDirs || {};
+        const env = {};
+        if (d.home) env.HOME = d.home;
+        if (d.desktop) env.XDG_DESKTOP_DIR = d.desktop;
+        if (d.downloads) env.XDG_DOWNLOAD_DIR = d.downloads;
+        if (d.documents) env.XDG_DOCUMENTS_DIR = d.documents;
+        if (d.pictures) env.XDG_PICTURES_DIR = d.pictures;
+        if (d.music) env.XDG_MUSIC_DIR = d.music;
+        if (d.videos) env.XDG_VIDEOS_DIR = d.videos;
+        return env;
     }
 
     updateApiKey(apiKey) {
@@ -335,7 +352,7 @@ export class PiClient {
         launcher.set_cwd(this._workspace);
         launcher.setenv('PATH', this._runtime.pathEnv, true);
         launcher.setenv('NO_COLOR', '1', true);
-        for (const [k, v] of Object.entries(this._runtime.extraEnv || {})) {
+        for (const [k, v] of Object.entries({...this._buildXdgEnvVars(), ...(this._runtime.extraEnv || {})})) {
             launcher.setenv(k, String(v), true);
         }
         this._cancel = new Gio.Cancellable();
@@ -395,6 +412,18 @@ export class PiClient {
         } catch (err) {
             return Promise.reject(err);
         }
+        let rpcFields = fields;
+        if (type === 'prompt' && typeof fields?.message === 'string') {
+            rpcFields = {
+                ...fields,
+                message: augmentPromptWithDesktopContext(fields.message, this._specialDirs, {
+                    isFirstTurn: !this._piFirstPromptSent,
+                    mode: this._config?.mode,
+                    workspace: this._workspace,
+                }),
+            };
+            this._piFirstPromptSent = true;
+        }
         const id = `qc-${++this._sequence}`;
         const timeoutSeconds = type === 'prompt' ? 60 : type === 'abort' ? 25 : 20;
         return new Promise((resolve, reject) => {
@@ -404,7 +433,7 @@ export class PiClient {
                 return GLib.SOURCE_REMOVE;
             });
             this._pending.set(id, {type, resolve, reject, timeout});
-            const bytes = Encoder.encode(JSON.stringify({id, type, ...fields}) + '\n');
+            const bytes = Encoder.encode(JSON.stringify({id, type, ...rpcFields}) + '\n');
             this._writeQueue.push(bytes);
             this._writeNext();
         });
@@ -759,9 +788,14 @@ export class PiClient {
 
         const historyBeforePrompt = this._store ? [...this._store.messages] : [];
         const remoteId = this._store?.remoteSessionId || '';
+        const promptWithDesktopEnv = augmentPromptWithDesktopContext(promptText, this._specialDirs, {
+            isFirstTurn: !remoteId,
+            mode: this._config?.mode,
+            workspace: this._workspace,
+        });
         const effectiveCliPrompt = (!remoteId && historyBeforePrompt.length > 0)
-            ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptText)
-            : promptText;
+            ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptWithDesktopEnv)
+            : promptWithDesktopEnv;
 
         this._store?.appendMessage({role: 'user', content: promptText}, this._backend, this._config);
         this._stderrLines = [];
@@ -784,6 +818,7 @@ export class PiClient {
         }
 
         const turnExtraEnv = {
+            ...this._buildXdgEnvVars(),
             ...(this._runtime.extraEnv || {}),
             ...zcodeIsolated.env,
             ...(this._approvedScopes.size > 0
@@ -800,7 +835,7 @@ export class PiClient {
             commandPrefix: this._runtime.commandPrefix,
         };
         const argv = this._backend === 'zcode'
-            ? buildZCodeArgs(spawnConfig, effectiveCliPrompt, remoteId)
+            ? buildZCodeArgs(spawnConfig, effectiveCliPrompt, remoteId, this._workspace)
             : buildCodexArgs(spawnConfig, this._workspace, effectiveCliPrompt, remoteId);
 
         try {

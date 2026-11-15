@@ -1,4 +1,5 @@
 import GLib from 'gi://GLib';
+import {expandHomePath} from '../protocol.js';
 
 export const APP_DIR_NAME = 'gnome-quick-chat';
 
@@ -16,6 +17,49 @@ export function getSessionDir(sessionId) {
 
 export function getLegacySessionFile(sessionId) {
     return GLib.build_filenamev([getSessionsDir(), `${sessionId}.qc.json`]);
+}
+
+export function resolveWorkspacePath(rawWorkspace = '') {
+    const home = GLib.get_home_dir() || '';
+    const fallback = home || GLib.build_filenamev([getDataDir(), 'workspace']);
+    const resolved = expandHomePath(rawWorkspace, home);
+    return resolved || fallback;
+}
+
+export function getUserSpecialDirs() {
+    const home = GLib.get_home_dir() || '';
+    const safeSpecial = dirEnum => {
+        try {
+            return GLib.get_user_special_dir(dirEnum) || '';
+        } catch (_) {
+            return '';
+        }
+    };
+    const desktop = safeSpecial(GLib.UserDirectory.DIRECTORY_DESKTOP);
+    const downloads = safeSpecial(GLib.UserDirectory.DIRECTORY_DOWNLOAD);
+    const documents = safeSpecial(GLib.UserDirectory.DIRECTORY_DOCUMENTS);
+    const pictures = safeSpecial(GLib.UserDirectory.DIRECTORY_PICTURES);
+    const music = safeSpecial(GLib.UserDirectory.DIRECTORY_MUSIC);
+    const videos = safeSpecial(GLib.UserDirectory.DIRECTORY_VIDEOS);
+
+    const englishDesktop = home ? GLib.build_filenamev([home, 'Desktop']) : '';
+    const hasLegacyEnglishDesktop = Boolean(
+        englishDesktop &&
+        desktop &&
+        desktop !== englishDesktop &&
+        GLib.file_test(englishDesktop, GLib.FileTest.IS_DIR)
+    );
+
+    return {
+        home,
+        desktop,
+        downloads,
+        documents,
+        pictures,
+        music,
+        videos,
+        hasLegacyEnglishDesktop,
+    };
 }
 
 /**

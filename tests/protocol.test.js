@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {
+    augmentPromptWithDesktopContext,
     buildArgs,
     buildAskUserModifiedInput,
     buildBudgetedContextMessages,
@@ -13,6 +14,7 @@ import {
     computePermissionScope,
     detailedMessages,
     escapePango,
+    expandHomePath,
     formatAskUserAnswerSummary,
     getBackendCapabilities,
     inlineMarkdownToPango,
@@ -549,4 +551,59 @@ test('ZCode AskUserQuestion interactive Q&A parses questions, blocks session aut
         toolCallId: 'call_ask_1',
         decision: 'modify',
     });
+});
+
+test('Home workspace resolution, explicit ZCode --cwd, and localized XDG desktop directory disambiguation', () => {
+    const home = '/home/lbg2002';
+    assert.equal(expandHomePath('', home), home);
+    assert.equal(expandHomePath('~', home), home);
+    assert.equal(expandHomePath('~/桌面', home), '/home/lbg2002/桌面');
+    assert.equal(expandHomePath('$HOME/pythondoc', home), '/home/lbg2002/pythondoc');
+    assert.equal(expandHomePath('/home/lbg2002/.local/share/gnome-quick-chat/workspace', home), home);
+
+    // ZCode receives explicit `--cwd /home/lbg2002` even when resuming a session
+    const zArgs = buildZCodeArgs(
+        {commandPrefix: ['node', '/opt/ZCode/resources/glm/zcode.cjs'], mode: 'readonly'},
+        '查看桌面文件',
+        'sess_abc',
+        home
+    );
+    const cwdIdx = zArgs.indexOf('--cwd');
+    assert.ok(cwdIdx >= 0);
+    assert.equal(zArgs[cwdIdx + 1], '/home/lbg2002');
+
+    // Localized Chinese Ubuntu XDG directories disambiguate `/home/lbg2002/桌面` vs `/home/lbg2002/Desktop`
+    const zhDirs = {
+        home: '/home/lbg2002',
+        desktop: '/home/lbg2002/桌面',
+        downloads: '/home/lbg2002/下载',
+        documents: '/home/lbg2002/文档',
+        pictures: '/home/lbg2002/图片',
+        hasLegacyEnglishDesktop: true,
+    };
+
+    const augmented = augmentPromptWithDesktopContext('帮我看看我的桌面有什么文件', zhDirs, {
+        isFirstTurn: false,
+        mode: 'readonly',
+        workspace: home,
+    });
+    assert.ok(augmented.includes('真实桌面(XDG_DESKTOP_DIR)=/home/lbg2002/桌面'));
+    assert.ok(augmented.includes('请勿误查残留的英文 /home/lbg2002/Desktop 目录'));
+    assert.ok(augmented.endsWith('\n帮我看看我的桌面有什么文件'));
+
+    // Pure chat mode or unrelated follow-up turns do not inject directory hints unnecessarily
+    assert.equal(
+        augmentPromptWithDesktopContext('帮我看看我的桌面', zhDirs, {isFirstTurn: true, mode: 'chat'}),
+        '帮我看看我的桌面'
+    );
+    assert.equal(
+        augmentPromptWithDesktopContext('写一个快排函数', zhDirs, {isFirstTurn: false, mode: 'readonly'}),
+        '写一个快排函数'
+    );
+
+    // UI history extraction strips the internal XDG header cleanly
+    assert.deepEqual(
+        visibleMessages([{role: 'user', content: augmented}]),
+        [{role: 'user', text: '帮我看看我的桌面有什么文件'}]
+    );
 });
