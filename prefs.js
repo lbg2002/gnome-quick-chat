@@ -9,13 +9,18 @@ import {
     normalizeOpenAIEndpoint,
 } from './protocol.js';
 import {
-    detectEffectiveBackend,
+    detectBackendSelection,
     loadLocalBackendCatalog,
+    migrateGSettingsIfNeeded,
 } from './core/backendDetect.js';
 import {
     loadOpenAIApiKey,
     storeOpenAIApiKey,
 } from './core/secretStore.js';
+import {
+    importLegacyPiSessionFileReadOnly,
+    listLegacyPiSessionFiles,
+} from './core/sessionStore.js';
 
 const Decoder = new TextDecoder('utf-8');
 
@@ -33,7 +38,16 @@ function makeResetButton(tooltip, onClick) {
 export default class QuickChatPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const s = this.getSettings();
+        migrateGSettingsIfNeeded(s);
         window.set_default_size(650, 720);
+
+        const hasKey = k => Boolean(s.settings_schema?.has_key?.(k));
+        const getStr = (k, fb = '') => (hasKey(k) ? s.get_string(k) : fb);
+        const setStr = (k, v) => {
+            if (hasKey(k) && s.get_string(k) !== v) {
+                s.set_string(k, v);
+            }
+        };
 
         // =====================================================================
         // Page 1: 模型与后端 (Models & Backends)
@@ -44,29 +58,55 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         window.add(modelPage);
 
+        // --- Optional Group 0: 旧版配置升级提示 ---
+        const noticeGroup = new Adw.PreferencesGroup({
+            title: '配置迁移提示',
+        });
+        const noticeRow = new Adw.ActionRow({
+            title: '已完成旧版配置安全迁移',
+            subtitle: getStr('migration-notice', ''),
+        });
+        const dismissNoticeBtn = new Gtk.Button({
+            label: '知道了',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        const syncNoticeBanner = () => {
+            const msg = getStr('migration-notice', '').trim();
+            noticeRow.subtitle = msg;
+            noticeGroup.visible = Boolean(msg);
+        };
+        dismissNoticeBtn.connect('clicked', () => {
+            setStr('migration-notice', '');
+            syncNoticeBanner();
+        });
+        noticeRow.add_suffix(dismissNoticeBtn);
+        noticeGroup.add(noticeRow);
+        modelPage.add(noticeGroup);
+        syncNoticeBanner();
+
         // --- Group 1: 后端引擎 ---
         const backendGroup = new Adw.PreferencesGroup({
             title: '后端引擎',
-            description: '选择对话使用的 AI 引擎，修改后在空闲时自动热更新（绝不篡改外部 CLI 全局配置文件）。',
+            description: '支持 ZCode CLI、Codex CLI 与自定义 OpenAI 兼容 API（绝不篡改外部 CLI 全局配置文件）。',
         });
         modelPage.add(backendGroup);
 
-        const backends = ['auto', 'zcode', 'codex', 'pi', 'openai'];
+        const backends = ['auto', 'zcode', 'codex', 'openai'];
         const backendNames = [
-            '自动检测',
+            '自动检测 (ZCode → Codex → OpenAI API)',
             'ZCode CLI',
             'Codex CLI',
-            'Pi CLI',
             '自定义 OpenAI API',
         ];
         const backendRow = new Adw.ComboRow({
             title: '运行模式',
             model: Gtk.StringList.new(backendNames),
         });
-        backendRow.selected = Math.max(0, backends.indexOf(s.get_string('backend')));
+        backendRow.selected = Math.max(0, backends.indexOf(getStr('backend', 'auto')));
         backendGroup.add(backendRow);
 
-        // --- Group 2: 自定义 OpenAI API 连接配置 (仅在 openai 模式下显示) ---
+        // --- Group 2: 自定义 OpenAI API 连接配置 (仅在 openai 模式或未配置引导下显示) ---
         const openaiGroup = new Adw.PreferencesGroup({
             title: '自定义 OpenAI 接口连接',
             description: '支持 OpenAI / DeepSeek / Ollama / 本地代理等标准 /v1/chat/completions 流式协议。API Key 加密保存在系统密钥环 (GNOME Keyring)。',
@@ -77,7 +117,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             title: '接口地址 (Base URL)',
         });
         s.bind('openai-base-url', baseUrlRow, 'text', Gio.SettingsBindFlags.DEFAULT);
-        baseUrlRow.add_suffix(makeResetButton('清空接口地址', () => s.set_string('openai-base-url', '')));
+        baseUrlRow.add_suffix(makeResetButton('清空接口地址', () => setStr('openai-base-url', '')));
         openaiGroup.add(baseUrlRow);
 
         const apiKeyRow = new Adw.PasswordEntryRow({
@@ -124,7 +164,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             title: '系统提示词 (System Prompt)',
         });
         s.bind('system-prompt', sysPromptRow, 'text', Gio.SettingsBindFlags.DEFAULT);
-        sysPromptRow.add_suffix(makeResetButton('恢复默认系统提示词', () => s.set_string('system-prompt', '')));
+        sysPromptRow.add_suffix(makeResetButton('恢复默认系统提示词', () => setStr('system-prompt', '')));
         openaiGroup.add(sysPromptRow);
 
         // --- Group 3: Provider、模型选择与思考强度 ---
@@ -161,27 +201,73 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         catalogGroup.add(modelComboRow);
 
+        const getSelection = () => detectBackendSelection({
+            configuredBackend: getStr('backend', 'auto'),
+            zcodePath: getStr('zcode-path', ''),
+            codexPath: getStr('codex-path', ''),
+            openaiBaseUrl: getStr('openai-base-url', ''),
+        });
+        const getEffectiveBackend = () => getSelection().effectiveBackend;
+
+        const getActiveProvider = eff => {
+            if (eff === 'zcode') return getStr('zcode-provider', '').trim() || getStr('provider', '').trim();
+            if (eff === 'codex') return getStr('codex-provider', '').trim() || getStr('provider', '').trim();
+            return getStr('provider', '').trim();
+        };
+        const setActiveProvider = (eff, val) => {
+            if (eff === 'zcode') setStr('zcode-provider', val);
+            else if (eff === 'codex') setStr('codex-provider', val);
+            setStr('provider', val);
+        };
+
+        const getActiveModel = eff => {
+            if (eff === 'openai') return getStr('openai-model', '').trim() || getStr('model', '').trim();
+            if (eff === 'zcode') return getStr('zcode-model', '').trim() || getStr('model', '').trim();
+            if (eff === 'codex') return getStr('codex-model', '').trim() || getStr('model', '').trim();
+            return getStr('model', '').trim();
+        };
+        const setActiveModel = (eff, val) => {
+            if (eff === 'openai') setStr('openai-model', val);
+            else if (eff === 'zcode') setStr('zcode-model', val);
+            else if (eff === 'codex') setStr('codex-model', val);
+            if (eff !== 'openai') setStr('model', val);
+        };
+
+        const getActiveEffort = eff => {
+            if (eff === 'zcode') {
+                const v = getStr('zcode-reasoning-effort', 'default').trim();
+                if (v && v !== 'default') return v;
+            } else if (eff === 'codex') {
+                const v = getStr('codex-reasoning-effort', 'default').trim();
+                if (v && v !== 'default') return v;
+            } else if (eff === 'openai') {
+                const v = getStr('openai-reasoning-effort', 'default').trim();
+                if (v && v !== 'default') return v;
+            }
+            return getStr('reasoning-effort', 'default').trim() || 'default';
+        };
+        const setActiveEffort = (eff, val) => {
+            if (eff === 'zcode') setStr('zcode-reasoning-effort', val);
+            else if (eff === 'codex') setStr('codex-reasoning-effort', val);
+            else if (eff === 'openai') setStr('openai-reasoning-effort', val);
+            setStr('reasoning-effort', val);
+        };
+
         const providerEntryRow = new Adw.EntryRow({
             title: 'Provider 标识 (可手动修改)',
         });
         providerEntryRow.add_suffix(makeResetButton('恢复默认 Provider', () => {
-            s.set_string('provider', '');
+            setActiveProvider(getEffectiveBackend(), '');
+            rebuildProviderAndModelUi();
         }));
         catalogGroup.add(providerEntryRow);
-
-        const getEffectiveBackend = () => detectEffectiveBackend(
-            s.get_string('backend'),
-            s.get_string('pi-path'),
-            s.get_string('openai-base-url')
-        );
-        const getActiveModelKey = () => (getEffectiveBackend() === 'openai' ? 'openai-model' : 'model');
 
         const modelEntryRow = new Adw.EntryRow({
             title: '模型 ID (可手动修改)',
         });
         modelEntryRow.add_suffix(makeResetButton('恢复默认模型', () => {
-            if (getEffectiveBackend() === 'openai') s.set_string('openai-model', '');
-            else s.set_string('model', '');
+            setActiveModel(getEffectiveBackend(), '');
+            rebuildProviderAndModelUi();
         }));
         catalogGroup.add(modelEntryRow);
 
@@ -196,9 +282,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 '深入 · 复杂多步任务 (High)',
             ]),
         });
-        effortRow.selected = Math.max(0, efforts.indexOf(s.get_string('reasoning-effort')));
+        effortRow.selected = Math.max(0, efforts.indexOf(getActiveEffort(getEffectiveBackend())));
         effortRow.connect('notify::selected', () => {
-            s.set_string('reasoning-effort', efforts[effortRow.selected] || 'default');
+            if (syncingUi) return;
+            setActiveEffort(getEffectiveBackend(), efforts[effortRow.selected] || 'default');
         });
         catalogGroup.add(effortRow);
 
@@ -264,9 +351,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             subtitle: '进入桌面时通知栏左侧默认展示的页面',
             model: Gtk.StringList.new(['✦ 随问 (AI 助手)', '通知 (系统消息)']),
         });
-        tabRow.selected = Math.max(0, tabs.indexOf(s.get_string('default-tab')));
+        tabRow.selected = Math.max(0, tabs.indexOf(getStr('default-tab', 'ai')));
         tabRow.connect('notify::selected', () => {
-            s.set_string('default-tab', tabs[tabRow.selected] || 'ai');
+            setStr('default-tab', tabs[tabRow.selected] || 'ai');
         });
         uiGroup.add(tabRow);
 
@@ -316,7 +403,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         s.bind('render-markdown', mdRow, 'active', Gio.SettingsBindFlags.DEFAULT);
         uiGroup.add(mdRow);
 
-        // --- Group 3: CLI Agent 权限、能力矩阵与资源回收 ---
+        // --- Group 3: CLI Agent 权限与路径 ---
         const agentGroup = new Adw.PreferencesGroup({
             title: 'CLI Agent 权限与环境',
             description: '根据当前所选后端动态适配工具、沙箱与交互式审批能力。',
@@ -333,42 +420,77 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             title: 'Agent 权限模式',
             model: modeComboModel,
         });
-        modeRow.selected = Math.max(0, modes.indexOf(s.get_string('agent-mode')));
+        modeRow.selected = Math.max(0, modes.indexOf(getStr('agent-mode', 'readonly')));
         modeRow.connect('notify::selected', () => {
             if (syncingModeCombo) return;
-            s.set_string('agent-mode', modes[modeRow.selected] || 'readonly');
+            setStr('agent-mode', modes[modeRow.selected] || 'readonly');
         });
         agentGroup.add(modeRow);
 
-        const piIdleRow = new Adw.SpinRow({
-            title: 'Pi 常驻进程空闲回收 (分钟)',
-            subtitle: '仅对 Pi RPC 后端生效（0 表示常驻不回收；回收后下次发消息自动拉起并恢复会话）',
-            adjustment: new Gtk.Adjustment({
-                lower: 0,
-                upper: 60,
-                step_increment: 1,
-                page_increment: 5,
-            }),
+        const zcodePathRow = new Adw.EntryRow({
+            title: 'ZCode CLI 路径 (留空自动探测)',
         });
-        piIdleRow.value = s.get_int('pi-idle-minutes');
-        piIdleRow.connect('notify::value', () => {
-            s.set_int('pi-idle-minutes', Math.round(piIdleRow.value));
-        });
-        agentGroup.add(piIdleRow);
+        if (hasKey('zcode-path')) {
+            s.bind('zcode-path', zcodePathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
+        }
+        zcodePathRow.add_suffix(makeResetButton('清空自定义 ZCode 路径', () => setStr('zcode-path', '')));
+        zcodePathRow.connect('notify::text', () => rebuildProviderAndModelUi());
+        agentGroup.add(zcodePathRow);
 
-        const piPathRow = new Adw.EntryRow({
-            title: 'CLI 可执行路径 (默认 pi)',
+        const codexPathRow = new Adw.EntryRow({
+            title: 'Codex CLI 路径 (留空自动探测)',
         });
-        s.bind('pi-path', piPathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
-        piPathRow.add_suffix(makeResetButton('恢复默认路径', () => s.set_string('pi-path', 'pi')));
-        agentGroup.add(piPathRow);
+        if (hasKey('codex-path')) {
+            s.bind('codex-path', codexPathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
+        }
+        codexPathRow.add_suffix(makeResetButton('清空自定义 Codex 路径', () => setStr('codex-path', '')));
+        codexPathRow.connect('notify::text', () => rebuildProviderAndModelUi());
+        agentGroup.add(codexPathRow);
 
         const workspaceRow = new Adw.EntryRow({
             title: 'Agent 工作目录 (留空默认使用主目录 ~)',
         });
         s.bind('workspace', workspaceRow, 'text', Gio.SettingsBindFlags.DEFAULT);
-        workspaceRow.add_suffix(makeResetButton('恢复默认主目录', () => s.set_string('workspace', '')));
+        workspaceRow.add_suffix(makeResetButton('恢复默认主目录', () => setStr('workspace', '')));
         agentGroup.add(workspaceRow);
+
+        // --- Optional Group 4: 旧版 Pi 本地历史只读导入 ---
+        const legacyPiFiles = listLegacyPiSessionFiles();
+        if (legacyPiFiles.length > 0) {
+            const legacyImportGroup = new Adw.PreferencesGroup({
+                title: '旧版会话只读导入',
+                description: '检测到本地 sessions 目录中保留的旧版独立 JSONL 会话。导入后仅作为普通历史对话浏览与续问，不会修改或删除原始文件。',
+            });
+            uiPage.add(legacyImportGroup);
+
+            for (const item of legacyPiFiles.slice(0, 8)) {
+                const row = new Adw.ActionRow({
+                    title: item.name,
+                    subtitle: item.path,
+                });
+                const importBtn = new Gtk.Button({
+                    label: '只读导入',
+                    valign: Gtk.Align.CENTER,
+                    css_classes: ['flat'],
+                });
+                importBtn.connect('clicked', async () => {
+                    importBtn.sensitive = false;
+                    importBtn.label = '导入中…';
+                    const res = await importLegacyPiSessionFileReadOnly(item.path);
+                    if (res.ok && res.sessionId) {
+                        setStr('session-id', res.sessionId);
+                        importBtn.label = `✓ 已导入 (${res.importedCount} 条)`;
+                        row.subtitle = `已作为只读历史导入至新会话（原文件保留未变）`;
+                    } else {
+                        importBtn.sensitive = true;
+                        importBtn.label = '重试导入';
+                        row.subtitle = `⚠️ ${res.error || '导入失败，已保留原始文件'}`;
+                    }
+                });
+                row.add_suffix(importBtn);
+                legacyImportGroup.add(row);
+            }
+        }
 
         // =====================================================================
         // State & Synchronization for Provider / Model / Backend Capabilities
@@ -382,25 +504,27 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const syncBackendCapabilitiesUi = eff => {
             const caps = getBackendCapabilities(eff);
-            const curModeIdx = Math.max(0, modes.indexOf(s.get_string('agent-mode')));
+            const curModeIdx = Math.max(0, modes.indexOf(getStr('agent-mode', 'readonly')));
             syncingModeCombo = true;
             modeComboModel.splice(0, modeComboModel.get_n_items(), caps.modeLabels);
             modeRow.selected = curModeIdx;
             syncingModeCombo = false;
 
             modeRow.sensitive = caps.supportsTools;
-            if (!caps.supportsTools) {
+            if (eff === 'unconfigured') {
+                modeRow.subtitle = '尚未配置可用后端；请先安装 ZCode / Codex CLI 或配置自定义 OpenAI 兼容 API';
+            } else if (!caps.supportsTools) {
                 modeRow.subtitle = '当前自定义 OpenAI API 仅使用标准 HTTP 对话流，不挂载本机工具或文件权限';
             } else if (caps.supportsApproval) {
                 modeRow.subtitle = '支持按命令/域名/文件粒度分级审批，高危破坏性命令禁止会话级一键放行';
             } else {
-                modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 使用 CLI 沙箱/白名单策略控制权限，不支持会话内交互弹窗审批`;
+                modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 使用 CLI 沙箱策略控制权限，不支持会话内交互弹窗审批`;
             }
         };
 
-        const autoRepairSwappedProviderAndModel = providers => {
-            const curProv = s.get_string('provider').trim();
-            const curMod = s.get_string('model').trim();
+        const autoRepairSwappedProviderAndModel = (eff, providers) => {
+            const curProv = getActiveProvider(eff);
+            const curMod = getActiveModel(eff);
             if (!curProv || curMod || !providers.length) return;
             const isKnownProvider = providers.some(
                 p => p.id.toLowerCase() === curProv.toLowerCase() || p.name.toLowerCase() === curProv.toLowerCase()
@@ -411,15 +535,15 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             );
             if (owner) {
                 const exactModel = owner.models.find(m => m.toLowerCase() === curProv.toLowerCase()) || curProv;
-                s.set_string('provider', owner.id);
-                s.set_string('model', exactModel);
+                setActiveProvider(eff, owner.id);
+                setActiveModel(eff, exactModel);
             }
         };
 
         const rebuildModelDropdown = () => {
             const eff = getEffectiveBackend();
-            const curProv = s.get_string('provider').trim();
-            const curMod = s.get_string(getActiveModelKey()).trim();
+            const curProv = getActiveProvider(eff);
+            const curMod = getActiveModel(eff);
 
             let availableModels = [];
             if (eff === 'openai') {
@@ -463,36 +587,44 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             if (modelEntryRow.text !== curMod) {
                 modelEntryRow.text = curMod;
             }
+            effortRow.selected = Math.max(0, efforts.indexOf(getActiveEffort(eff)));
             syncingUi = false;
         };
 
         const rebuildProviderAndModelUi = (statusNote = '') => {
-            const configured = s.get_string('backend') || 'auto';
-            const eff = getEffectiveBackend();
+            const configured = getStr('backend', 'auto') || 'auto';
+            const selection = getSelection();
+            const eff = selection.effectiveBackend;
             const isOpenAI = eff === 'openai';
+            const isUnconfigured = eff === 'unconfigured';
 
             const modeNameMap = {
                 zcode: 'ZCode CLI',
                 codex: 'Codex CLI',
-                pi: 'Pi CLI',
                 openai: '自定义 OpenAI API',
+                unconfigured: '未配置可用引擎',
             };
-            backendRow.subtitle = configured === 'auto'
-                ? `当前自动匹配：${modeNameMap[eff] || eff}`
-                : `当前固定使用：${modeNameMap[eff] || eff}`;
+            if (!selection.available) {
+                backendRow.subtitle = `⚠️ ${selection.reason}`;
+            } else {
+                backendRow.subtitle = configured === 'auto'
+                    ? `当前自动匹配：${modeNameMap[eff] || eff}`
+                    : `当前固定使用：${modeNameMap[eff] || eff}`;
+            }
 
-            openaiGroup.visible = isOpenAI;
-            providerComboRow.visible = !isOpenAI;
-            providerEntryRow.visible = !isOpenAI;
+            // Show OpenAI setup group both when openai is selected AND when unconfigured so user can easily configure an API
+            openaiGroup.visible = isOpenAI || isUnconfigured;
+            providerComboRow.visible = !isOpenAI && !isUnconfigured;
+            providerEntryRow.visible = !isOpenAI && !isUnconfigured;
 
             syncBackendCapabilitiesUi(eff);
 
             currentCatalog = loadLocalBackendCatalog(eff);
-            if (!isOpenAI) {
-                autoRepairSwappedProviderAndModel(currentCatalog.providers);
+            if (!isOpenAI && !isUnconfigured) {
+                autoRepairSwappedProviderAndModel(eff, currentCatalog.providers);
             }
 
-            const curProv = s.get_string('provider').trim();
+            const curProv = getActiveProvider(eff);
             const provLabels = ['默认 (由后端自动决定)'];
             providerValues = [''];
 
@@ -523,6 +655,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const totalModels = new Set(currentCatalog.providers.flatMap(p => p.models)).size;
             if (statusNote) {
                 catalogGroup.description = statusNote;
+            } else if (isUnconfigured) {
+                catalogGroup.description = '尚未检测到可用后端：可在上方直接填写 OpenAI 兼容接口地址，或安装 ZCode / Codex CLI。';
             } else if (isOpenAI) {
                 catalogGroup.description = onlineOpenAIModels.length
                     ? `自定义 API：已在线拉取 ${onlineOpenAIModels.length} 个可选模型。`
@@ -532,21 +666,24 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             }
         };
 
+        baseUrlRow.connect('notify::text', () => rebuildProviderAndModelUi());
+
         backendRow.connect('notify::selected', () => {
             const next = backends[backendRow.selected] || 'auto';
-            if (s.get_string('backend') !== next) {
-                s.set_string('backend', next);
+            if (getStr('backend', 'auto') !== next) {
+                setStr('backend', next);
+                setStr('migration-notice', '');
+                syncNoticeBanner();
             }
             rebuildProviderAndModelUi();
         });
 
         providerComboRow.connect('notify::selected', () => {
             if (syncingUi) return;
+            const eff = getEffectiveBackend();
             const idx = providerComboRow.selected;
             const val = idx >= 0 && idx < providerValues.length ? providerValues[idx] : '';
-            if (s.get_string('provider') !== val) {
-                s.set_string('provider', val);
-            }
+            setActiveProvider(eff, val);
             syncingUi = true;
             if (providerEntryRow.text !== val) providerEntryRow.text = val;
             syncingUi = false;
@@ -555,19 +692,17 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         modelComboRow.connect('notify::selected', () => {
             if (syncingUi) return;
+            const eff = getEffectiveBackend();
             const idx = modelComboRow.selected;
             const val = idx >= 0 && idx < modelValues.length ? modelValues[idx] : '';
-            const key = getActiveModelKey();
-            if (s.get_string(key) !== val) {
-                s.set_string(key, val);
-            }
-            if (val && getEffectiveBackend() !== 'openai') {
-                const curProv = s.get_string('provider').trim();
+            setActiveModel(eff, val);
+            if (val && eff !== 'openai' && eff !== 'unconfigured') {
+                const curProv = getActiveProvider(eff);
                 const currentProvObj = currentCatalog.providers.find(p => p.id === curProv);
                 if (!currentProvObj || !currentProvObj.models.includes(val)) {
                     const owner = currentCatalog.providers.find(p => p.models.includes(val));
-                    if (owner && s.get_string('provider') !== owner.id) {
-                        s.set_string('provider', owner.id);
+                    if (owner) {
+                        setActiveProvider(eff, owner.id);
                     }
                 }
             }
@@ -576,19 +711,20 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         providerEntryRow.connect('notify::text', () => {
             if (syncingUi) return;
+            const eff = getEffectiveBackend();
             const val = providerEntryRow.text.trim();
-            if (s.get_string('provider') !== val) {
-                s.set_string('provider', val);
+            if (getActiveProvider(eff) !== val) {
+                setActiveProvider(eff, val);
                 rebuildProviderAndModelUi();
             }
         });
 
         modelEntryRow.connect('notify::text', () => {
             if (syncingUi) return;
+            const eff = getEffectiveBackend();
             const val = modelEntryRow.text.trim();
-            const key = getActiveModelKey();
-            if (s.get_string(key) !== val) {
-                s.set_string(key, val);
+            if (getActiveModel(eff) !== val) {
+                setActiveModel(eff, val);
                 rebuildModelDropdown();
             }
         });
@@ -601,11 +737,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             let targetApiKey = '';
             let targetProviderObj = null;
 
-            if (eff === 'openai') {
-                targetBaseUrl = s.get_string('openai-base-url').trim();
+            if (eff === 'openai' || eff === 'unconfigured') {
+                targetBaseUrl = getStr('openai-base-url', '').trim();
                 targetApiKey = latestApiKeyDraft || (await loadOpenAIApiKey(s));
             } else {
-                const curProv = s.get_string('provider').trim();
+                const curProv = getActiveProvider(eff);
                 targetProviderObj = (curProv && currentCatalog.providers.find(p => p.id === curProv))
                     || currentCatalog.providers.find(p => p.baseUrl);
                 if (targetProviderObj?.baseUrl) {
@@ -616,7 +752,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
             if (!targetBaseUrl) {
                 rebuildProviderAndModelUi(
-                    eff === 'openai'
+                    eff === 'openai' || eff === 'unconfigured'
                         ? '⚠️ 请先在上方填写接口地址 (Base URL)'
                         : `✓ 已重新扫描 ${currentCatalog.backendLabel} 本地配置（共 ${currentCatalog.providers.length} 个 Provider）`
                 );
@@ -659,10 +795,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                         rebuildProviderAndModelUi('⚠️ 在线接口未返回模型列表，已使用本地配置');
                         return;
                     }
-                    if (eff === 'openai') {
+                    if (eff === 'openai' || eff === 'unconfigured') {
                         onlineOpenAIModels = ids;
-                        if (!s.get_string('openai-model').trim() && ids[0]) {
-                            s.set_string('openai-model', ids[0]);
+                        if (!getStr('openai-model', '').trim() && ids[0]) {
+                            setStr('openai-model', ids[0]);
                         }
                         rebuildProviderAndModelUi(`✓ 连接成功：从 ${modelsUrl} 拉取到 ${ids.length} 个在线模型`);
                     } else {

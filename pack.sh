@@ -19,7 +19,7 @@ glib-compile-schemas --strict schemas
 gnome-extensions pack . \
   --force \
   --out-dir="$out_dir" \
-  --extra-source=piClient.js \
+  --extra-source=backendClient.js \
   --extra-source=protocol.js \
   --extra-source=zcodeBridge.cjs \
   --extra-source=core \

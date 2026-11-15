@@ -6,8 +6,8 @@
 
 [![GNOME Shell](https://img.shields.io/badge/GNOME_Shell-50-4a86cf?logo=gnome&logoColor=white)](https://www.gnome.org/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-26.04_LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
-[![Backends](https://img.shields.io/badge/Engines-ZCode_%7C_Codex_%7C_Pi_%7C_OpenAI_API-2ec27e)](#3-四大智能后端与能力矩阵)
-[![Tests](https://img.shields.io/badge/Unit_&_State_Tests-14_Passed-success)](#8-模块化架构开发与测试)
+[![Backends](https://img.shields.io/badge/Engines-ZCode_%7C_Codex_%7C_OpenAI_API-2ec27e)](#3-三大智能后端与能力矩阵)
+[![Tests](https://img.shields.io/badge/Unit_&_State_Tests-Passed-success)](#8-模块化架构开发与测试)
 [![Interactive Demo](https://img.shields.io/badge/▶_在线交互式动画演示-1080p_60fps-f5a623)](https://lbg2002.github.io/gnome-quick-chat/)
 
 点击屏幕顶部中央的「时间 / 日期」（或按下全局快捷键 **`Super + Shift + Q`**），即可在通知栏左栏无缝切换 **「✦ 随问 | 通知」**，右侧原生日历与世界时钟保持原样。  
@@ -37,7 +37,7 @@
 
 1. [核心特性一览](#1-核心特性一览)
 2. [横向彩色小圆点轨迹与分级工具审批](#2-横向彩色小圆点轨迹与分级工具审批)
-3. [四大智能后端与能力矩阵](#3-四大智能后端与能力矩阵)
+3. [三大智能后端与能力矩阵](#3-三大智能后端与能力矩阵)
 4. [真实桌面运行实拍](#4-真实桌面运行实拍)
 5. [桌面流畅性、会话状态机与安全边界设计](#5-桌面流畅性会话状态机与安全边界设计)
 6. [快速安装、打包与配置指南](#6-快速安装打包与配置指南)
@@ -84,7 +84,7 @@
 
 ---
 
-## 3. 四大智能后端与能力矩阵
+## 3. 三大智能后端与能力矩阵
 
 在 `gnome-extensions prefs quick-chat@lbg2002.github.io` 设置面板中，根据当前生效后端自动同步真实能力说明：
 
@@ -92,7 +92,6 @@
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **ZCode CLI** (`zcode`) | ✓ | ✓ (分级范围规则) | ✓ (`--resume`) | ✓ | `zcodeBridge.cjs` 握手校验 (`protocolVersion: 1`) + `0600` 临时配置沙箱 |
 | **Codex CLI** (`codex`) | ✓ | — (CLI 沙箱策略) | ✓ (`exec resume`) | ✓ | 原生 `read-only` / `danger-full-access` 沙箱，支持并发 `item.id` 与退出码追踪 |
-| **Pi CLI** (`pi`) | ✓ | — (工具白名单) | ✓ (`--session-id`) | ✓ | 常驻 JSON-RPC 流 + 显式工具白名单 + 默认 5 分钟空闲进程自动回收 |
 | **OpenAI API** (`openai`) | — | — | ✓ (字符预算裁剪) | ✓ (`reasoning_content`) | `Soup 3.0` 原生 SSE 流（含非正常中断检测）+ GNOME Keyring 密钥存储 |
 
 > **跨后端无缝续接**：当在同一对话中途切换模型或 CLI 引擎时，`SessionStore` 会通过完整模型签名 (`backend + provider + model + baseUrl`) 自动识别变更，并在新后端首轮提问时按字符预算自动注入近期上下文摘要，避免误恢复旧引擎会话 ID。
@@ -154,7 +153,7 @@ stateDiagram-v2
 
 * **桌面环境**：Ubuntu 26.04 LTS（或搭载 **GNOME Shell 50** 的 Linux 发行版）
 * **基础依赖**：`gjs`、`glib-compile-schemas`、`gir1.2-soup-3.0`（Ubuntu 26.04 默认已预装）
-* **智能后端（四选一即可）**：`ZCode`、`Codex CLI`、`Pi CLI`，或任意 **OpenAI 兼容 API 地址**
+* **智能后端（三选一即可）**：`ZCode CLI`、`Codex CLI`，或任意 **OpenAI 兼容 API 地址**
 
 ### 原子化一键安装
 
@@ -205,12 +204,13 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 ```text
 .
 ├── extension.js               # 通知栏面板主控制器、全局快捷键、快速模型切换与脏标记调度
-├── piClient.js                # 四后端统一运行时、Soup 3.0 SSE、优雅进程回收与 0600 临时配置注入
+├── backendClient.js           # 三后端统一运行时、Soup 3.0 SSE、优雅进程回收与 0600 临时配置注入
 ├── protocol.js                # 纯函数协议归一化、能力矩阵、范围权限规则、上下文预算与 Markdown 解析
 ├── zcodeBridge.cjs            # ZCode 无头模式双向权限桥接（含版本握手与范围授权校验）
 ├── prefs.js                   # Libadwaita 双分页设置中心（只读配置扫描、Keyring 密钥存储）
 ├── core/
 │   ├── paths.js               # 统一数据目录与 $XDG_RUNTIME_DIR 0700/0600 私有临时文件管理
+│   ├── configMigration.js     # 旧版配置无损迁移、CLI 身份核验与旧版历史只读导入解析
 │   ├── secretStore.js         # GNOME Keyring (libsecret) API Key 加密读写与明文自动迁移
 │   ├── backendDetect.js       # 设置页、快捷栏与运行时共享的统一 PATH 与模型目录探测
 │   ├── turnController.js      # 纯 JS 每轮独立 TurnContext 状态机与幂等结算器

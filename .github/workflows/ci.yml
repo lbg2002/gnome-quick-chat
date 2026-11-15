@@ -26,7 +26,7 @@ jobs:
 
       - name: Check JS / CJS syntax
         run: |
-          for f in extension.js prefs.js piClient.js protocol.js zcodeBridge.cjs core/*.js ui/*.js tests/*.js; do
+          for f in extension.js prefs.js backendClient.js protocol.js zcodeBridge.cjs core/*.js ui/*.js tests/*.js; do
             node --check "$f"
           done
 

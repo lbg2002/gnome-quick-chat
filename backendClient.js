@@ -3,7 +3,6 @@ import GLib from 'gi://GLib';
 import Soup from 'gi://Soup?version=3.0';
 import {
     augmentPromptWithDesktopContext,
-    buildArgs,
     buildBudgetedContextMessages,
     buildCodexArgs,
     buildCrossBackendPromptWithContext,
@@ -17,10 +16,12 @@ import {
 } from './protocol.js';
 import {
     buildSearchPath,
-    detectEffectiveBackend,
+    createGioCliEnv,
+    detectBackendSelection,
     findExecutableInDirs,
     readJsonFileSync,
 } from './core/backendDetect.js';
+import {UNCONFIGURED_BACKEND_MESSAGE} from './core/configMigration.js';
 import {
     getPrivateRuntimeDir,
     getUserSpecialDirs,
@@ -122,50 +123,52 @@ function createIsolatedZCodeConfigOverride(config) {
     }
 }
 
-export function resolveBackendRuntime(config) {
-    const effective = detectEffectiveBackend(config.backend || 'auto', config.executable || 'pi', config.openaiBaseUrl || '');
-    const rawExec = (config.executable || '').trim();
-    const pathDirs = buildSearchPath(rawExec);
+export function resolveBackendRuntime(config = {}) {
+    const rawZCodePath = String(config.zcodePath || '').trim();
+    const rawCodexPath = String(config.codexPath || '').trim();
+    const rawBaseUrl = String(config.openaiBaseUrl || '').trim();
+
+    const selection = detectBackendSelection({
+        configuredBackend: config.backend || 'auto',
+        zcodePath: rawZCodePath,
+        codexPath: rawCodexPath,
+        openaiBaseUrl: rawBaseUrl,
+    });
+
+    const effective = selection.effectiveBackend;
+    if (effective === 'unconfigured') {
+        return {
+            backend: 'unconfigured',
+            available: false,
+            reason: selection.reason || UNCONFIGURED_BACKEND_MESSAGE,
+            label: '未配置后端',
+        };
+    }
+
+    if (!selection.available) {
+        throw new Error(selection.reason || UNCONFIGURED_BACKEND_MESSAGE);
+    }
 
     if (effective === 'openai') {
-        const baseUrl = (config.openaiBaseUrl || '').trim();
-        if (!baseUrl) {
-            throw new Error('已选择「自定义 OpenAI 兼容 API」，请先在随问设置（⚙）中填写 API 地址 (Base URL)');
-        }
-        const modelId = (config.openaiModel || config.model || '').trim();
+        const modelId = String(config.openaiModel || config.model || '').trim();
         return {
             backend: 'openai',
-            baseUrl,
-            chatUrl: normalizeOpenAIEndpoint(baseUrl, '/chat/completions'),
-            modelsUrl: normalizeOpenAIEndpoint(baseUrl, '/models'),
-            apiKey: (config.openaiApiKey || '').trim(),
+            available: true,
+            baseUrl: rawBaseUrl,
+            chatUrl: normalizeOpenAIEndpoint(rawBaseUrl, '/chat/completions'),
+            modelsUrl: normalizeOpenAIEndpoint(rawBaseUrl, '/models'),
+            apiKey: String(config.openaiApiKey || '').trim(),
             modelId,
-            systemPrompt: (config.systemPrompt || '').trim(),
+            systemPrompt: String(config.systemPrompt || '').trim(),
             reasoningEffort: mapReasoningEffort(config.reasoningEffort),
             label: modelId || 'OpenAI API',
         };
     }
 
-    if (effective === 'pi') {
-        const exe = findExecutableInDirs(rawExec || 'pi', pathDirs);
-        if (!exe) {
-            throw new Error('未检测到 Pi CLI 可执行文件，请在设置中检查路径或切换后端');
-        }
-        return {
-            backend: 'pi',
-            executable: exe,
-            pathEnv: buildSearchPath(exe).join(':'),
-            label: config.model || 'Pi',
-        };
-    }
-
     if (effective === 'zcode') {
-        const bundledCjs = rawExec && rawExec.endsWith('.cjs') && GLib.file_test(rawExec, GLib.FileTest.EXISTS)
-            ? rawExec
-            : '/opt/ZCode/resources/glm/zcode.cjs';
-        if (!GLib.file_test(bundledCjs, GLib.FileTest.EXISTS)) {
-            throw new Error('未检测到本机 ZCode CLI（/opt/ZCode/resources/glm/zcode.cjs）');
-        }
+        const cliEnv = createGioCliEnv(rawZCodePath);
+        const pathDirs = cliEnv.pathDirs;
+        const resolvedCustom = rawZCodePath ? cliEnv.resolveCandidate(rawZCodePath) : '';
 
         const builtinCfg = '/opt/ZCode/resources/config/provider/zcode-builtin.json';
         const baseEnv = GLib.file_test(builtinCfg, GLib.FileTest.EXISTS)
@@ -191,69 +194,101 @@ export function resolveBackendRuntime(config) {
             || '';
         const label = effectiveModel || 'ZCode';
 
+        let bridgePath = '';
         let bridgeArgs = [];
         try {
             const selfFile = Gio.File.new_for_uri(import.meta.url);
             const selfDir = selfFile.get_parent()?.get_path();
             if (selfDir) {
-                const bridgePath = GLib.build_filenamev([selfDir, 'zcodeBridge.cjs']);
-                if (GLib.file_test(bridgePath, GLib.FileTest.EXISTS)) {
-                    bridgeArgs = ['--require', bridgePath];
+                const candidateBridge = GLib.build_filenamev([selfDir, 'zcodeBridge.cjs']);
+                if (GLib.file_test(candidateBridge, GLib.FileTest.EXISTS)) {
+                    bridgePath = candidateBridge;
+                    bridgeArgs = ['--require', candidateBridge];
                 }
             }
         } catch (_) {}
 
+        const defaultBundledCjs = '/opt/ZCode/resources/glm/zcode.cjs';
+        const cjsTarget = resolvedCustom && resolvedCustom.endsWith('.cjs')
+            ? resolvedCustom
+            : ((!resolvedCustom || resolvedCustom === '/opt/ZCode/zcode') &&
+               GLib.file_test(defaultBundledCjs, GLib.FileTest.EXISTS)
+                ? defaultBundledCjs
+                : '');
+
         const nodeExe = findExecutableInDirs('node', pathDirs);
-        if (nodeExe) {
-            return {
-                backend: 'zcode',
-                executable: nodeExe,
-                commandPrefix: [nodeExe, ...bridgeArgs, bundledCjs],
-                extraEnv: baseEnv,
-                pathEnv: buildSearchPath(nodeExe).join(':'),
-                label,
-            };
+        if (cjsTarget) {
+            if (nodeExe) {
+                return {
+                    backend: 'zcode',
+                    available: true,
+                    executable: nodeExe,
+                    commandPrefix: [nodeExe, ...bridgeArgs, cjsTarget],
+                    extraEnv: baseEnv,
+                    pathEnv: buildSearchPath(nodeExe).join(':'),
+                    label,
+                };
+            }
+
+            const electronExe = '/opt/ZCode/zcode';
+            if (GLib.file_test(electronExe, GLib.FileTest.IS_EXECUTABLE)) {
+                return {
+                    backend: 'zcode',
+                    available: true,
+                    executable: electronExe,
+                    commandPrefix: [electronExe, ...bridgeArgs, cjsTarget],
+                    extraEnv: {...baseEnv, ELECTRON_RUN_AS_NODE: '1'},
+                    pathEnv: pathDirs.join(':'),
+                    label,
+                };
+            }
+            throw new Error('找到 ZCode 脚本但缺少 Node 或 Electron 运行时');
         }
 
-        const electronExe = '/opt/ZCode/zcode';
-        if (GLib.file_test(electronExe, GLib.FileTest.IS_EXECUTABLE)) {
-            return {
-                backend: 'zcode',
-                executable: electronExe,
-                commandPrefix: [electronExe, ...bridgeArgs, bundledCjs],
-                extraEnv: {...baseEnv, ELECTRON_RUN_AS_NODE: '1'},
-                pathEnv: pathDirs.join(':'),
-                label,
-            };
+        const zcodeExe = resolvedCustom || findExecutableInDirs('zcode', pathDirs);
+        if (!zcodeExe) {
+            throw new Error('未检测到本机 ZCode CLI，请安装 ZCode 或在设置中检查路径');
         }
-        throw new Error('找到 ZCode 脚本但缺少 Node 或 Electron 运行时');
+        const extraEnv = {...baseEnv};
+        if (bridgePath && !bridgePath.includes('"')) {
+            const existingNodeOpts = GLib.getenv('NODE_OPTIONS') || '';
+            extraEnv.NODE_OPTIONS = `${existingNodeOpts} --require "${bridgePath}"`.trim();
+        }
+        return {
+            backend: 'zcode',
+            available: true,
+            executable: zcodeExe,
+            commandPrefix: [zcodeExe],
+            extraEnv,
+            pathEnv: buildSearchPath(zcodeExe).join(':'),
+            label,
+        };
     }
 
     if (effective === 'codex') {
-        const customCodex = rawExec && rawExec !== 'pi' ? findExecutableInDirs(rawExec, pathDirs) : null;
-        const codexExe = customCodex || findExecutableInDirs('codex', pathDirs);
+        const cliEnv = createGioCliEnv(rawCodexPath);
+        const codexExe = (rawCodexPath ? cliEnv.resolveCandidate(rawCodexPath) : '')
+            || findExecutableInDirs('codex', cliEnv.pathDirs);
         if (!codexExe) {
             throw new Error('未检测到本机 Codex CLI 可执行文件');
         }
         return {
             backend: 'codex',
+            available: true,
             executable: codexExe,
             pathEnv: buildSearchPath(codexExe).join(':'),
             label: config.model || 'Codex',
         };
     }
 
-    throw new Error('未检测到可用后端：请在设置中配置自定义 OpenAI API，或安装 ZCode / Codex / Pi');
+    throw new Error(UNCONFIGURED_BACKEND_MESSAGE);
 }
 
-export class PiClient {
+export class BackendClient {
     constructor(onEvent, onExit) {
         this._event = onEvent;
         this._exit = onExit;
-        this._pending = new Map();
-        this._sequence = 0;
         this._closed = false;
-        this._writeQueue = [];
         this._stderrLines = [];
         this._httpSession = null;
         this._approvedScopes = new Set();
@@ -261,8 +296,6 @@ export class PiClient {
             if (!this._closed) this._event(evt);
         });
         this._store = null;
-        this._piIdleTimer = 0;
-        this._piReclaimedIdle = false;
     }
 
     start(config, workspace, sessionDir, sessionId) {
@@ -271,18 +304,13 @@ export class PiClient {
         this._sessionDir = sessionDir;
         this._sessionId = sessionId;
         this._specialDirs = getUserSpecialDirs();
-        this._piFirstPromptSent = false;
         this._runtime = resolveBackendRuntime(config);
         this._backend = this._runtime.backend;
 
-        if (this._backend === 'pi') {
-            this._ensurePiProcessRunning();
-        } else {
-            if (this._backend === 'openai') {
-                this._httpSession = new Soup.Session({timeout: 120});
-            }
-            this._store = new SessionStore(sessionId);
+        if (this._backend === 'openai') {
+            this._httpSession = new Soup.Session({timeout: 120});
         }
+        this._store = new SessionStore(sessionId);
     }
 
     _buildXdgEnvVars() {
@@ -305,73 +333,6 @@ export class PiClient {
         }
     }
 
-    _clearPiIdleTimer() {
-        if (this._piIdleTimer) {
-            try { GLib.source_remove(this._piIdleTimer); } catch (_) {}
-            this._piIdleTimer = 0;
-        }
-    }
-
-    _schedulePiIdleReclaim() {
-        this._clearPiIdleTimer();
-        if (this._backend !== 'pi' || this._closed) return;
-        const minutes = Number(this._config?.piIdleMinutes ?? 5);
-        if (minutes <= 0) return;
-        this._piIdleTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, minutes * 60, () => {
-            this._piIdleTimer = 0;
-            if (!this._closed && this._process && this._pending.size === 0) {
-                this._reclaimPiIdleProcess();
-            }
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    _reclaimPiIdleProcess() {
-        if (!this._process) return;
-        this._piReclaimedIdle = true;
-        this._cancel?.cancel();
-        const proc = this._process;
-        this._process = null;
-        this._input = null;
-        this._stderr = null;
-        this._output = null;
-        terminateSubprocessGracefully(proc);
-    }
-
-    _ensurePiProcessRunning() {
-        this._clearPiIdleTimer();
-        if (this._process) return;
-        this._piReclaimedIdle = false;
-
-        const launcher = new Gio.SubprocessLauncher({
-            flags:
-                Gio.SubprocessFlags.STDIN_PIPE |
-                Gio.SubprocessFlags.STDOUT_PIPE |
-                Gio.SubprocessFlags.STDERR_PIPE,
-        });
-        launcher.set_cwd(this._workspace);
-        launcher.setenv('PATH', this._runtime.pathEnv, true);
-        launcher.setenv('NO_COLOR', '1', true);
-        for (const [k, v] of Object.entries({...this._buildXdgEnvVars(), ...(this._runtime.extraEnv || {})})) {
-            launcher.setenv(k, String(v), true);
-        }
-        this._cancel = new Gio.Cancellable();
-        const rpcConfig = {...this._config, executable: this._runtime.executable};
-        this._process = launcher.spawnv(buildArgs(rpcConfig, this._sessionDir, this._sessionId));
-        this._input = new Gio.DataInputStream({base_stream: this._process.get_stdout_pipe()});
-        this._stderr = new Gio.DataInputStream({base_stream: this._process.get_stderr_pipe()});
-        this._output = this._process.get_stdin_pipe();
-        this._readStdout();
-        this._readStderr(this._stderr, this._cancel);
-        this._schedulePiIdleReclaim();
-    }
-
-    _formatStderrSuffix() {
-        if (!this._stderrLines.length) return '';
-        const last = this._stderrLines.slice(-2).join(' | ');
-        return last ? `（${last.slice(0, 140)}）` : '';
-    }
-
     _readStderr(stream, cancellable) {
         if (this._closed || !stream) return;
         stream.read_line_async(GLib.PRIORITY_DEFAULT, cancellable, (src, result) => {
@@ -389,57 +350,10 @@ export class PiClient {
         });
     }
 
-    _refreshPromptTimeouts() {
-        for (const [id, p] of this._pending.entries()) {
-            if (p.type === 'prompt') {
-                if (p.timeout) GLib.source_remove(p.timeout);
-                p.timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 90, () => {
-                    this._pending.delete(id);
-                    p.reject(new Error('Pi 响应流超时'));
-                    return GLib.SOURCE_REMOVE;
-                });
-            }
+    async request(type, fields = {}) {
+        if (this._closed) {
+            throw new Error('服务已关闭');
         }
-    }
-
-    request(type, fields = {}) {
-        if (this._closed) return Promise.reject(new Error('服务已关闭'));
-        if (this._backend !== 'pi') {
-            return this._requestTranscriptBackend(type, fields);
-        }
-        try {
-            this._ensurePiProcessRunning();
-        } catch (err) {
-            return Promise.reject(err);
-        }
-        let rpcFields = fields;
-        if (type === 'prompt' && typeof fields?.message === 'string') {
-            rpcFields = {
-                ...fields,
-                message: augmentPromptWithDesktopContext(fields.message, this._specialDirs, {
-                    isFirstTurn: !this._piFirstPromptSent,
-                    mode: this._config?.mode,
-                    workspace: this._workspace,
-                }),
-            };
-            this._piFirstPromptSent = true;
-        }
-        const id = `qc-${++this._sequence}`;
-        const timeoutSeconds = type === 'prompt' ? 60 : type === 'abort' ? 25 : 20;
-        return new Promise((resolve, reject) => {
-            const timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutSeconds, () => {
-                this._pending.delete(id);
-                reject(new Error(`Pi 请求超时：${type}${this._formatStderrSuffix()}`));
-                return GLib.SOURCE_REMOVE;
-            });
-            this._pending.set(id, {type, resolve, reject, timeout});
-            const bytes = Encoder.encode(JSON.stringify({id, type, ...rpcFields}) + '\n');
-            this._writeQueue.push(bytes);
-            this._writeNext();
-        });
-    }
-
-    async _requestTranscriptBackend(type, fields = {}) {
         if (this._store) {
             await this._store.load(this._backend, this._config);
         }
@@ -447,6 +361,8 @@ export class PiClient {
         if (type === 'get_state') {
             return {
                 backend: this._backend,
+                unconfigured: this._backend === 'unconfigured',
+                reason: this._runtime?.reason || '',
                 model: {id: this._runtime.label},
             };
         }
@@ -465,6 +381,9 @@ export class PiClient {
             return this._sendTurnPermissionResponse(fields);
         }
         if (type === 'prompt') {
+            if (this._backend === 'unconfigured') {
+                throw new Error(this._runtime?.reason || UNCONFIGURED_BACKEND_MESSAGE);
+            }
             if (this._backend === 'openai') {
                 return this._runOpenAITurn(fields.message || '');
             }
@@ -984,89 +903,14 @@ export class PiClient {
         return Promise.resolve({disposition: 'streaming'});
     }
 
-    _writeNext() {
-        if (this._closed || this._writing || !this._writeQueue.length || !this._output) return;
-        this._writing = true;
-        const bytes = this._writeQueue.shift();
-        this._output.write_all_async(bytes, GLib.PRIORITY_DEFAULT, this._cancel, (stream, result) => {
-            this._writing = false;
-            try {
-                stream.write_all_finish(result);
-            } catch (error) {
-                if (!this._closed && !this._piReclaimedIdle) this._fail(error);
-                return;
-            }
-            this._writeNext();
-        });
-    }
-
-    _readStdout() {
-        if (this._closed || !this._input) return;
-        this._input.read_line_async(GLib.PRIORITY_DEFAULT, this._cancel, (stream, result) => {
-            if (this._closed || this._piReclaimedIdle) return;
-            try {
-                const [line] = stream.read_line_finish_utf8(result);
-                if (line === null) {
-                    if (this._piReclaimedIdle) return;
-                    const detail = this._formatStderrSuffix();
-                    this._fail(new Error(`Pi 已退出${detail || '；请检查安装、模型及日志'}`));
-                    return;
-                }
-                let record;
-                try {
-                    record = JSON.parse(line);
-                } catch (_) {
-                    this._readStdout();
-                    return;
-                }
-                if (record.type === 'response' && this._pending.has(record.id)) {
-                    const p = this._pending.get(record.id);
-                    this._pending.delete(record.id);
-                    GLib.source_remove(p.timeout);
-                    if (record.success) p.resolve(record.data ?? {});
-                    else p.reject(new Error(record.error || `Pi 请求失败：${record.command}`));
-                    if (this._pending.size === 0) {
-                        this._schedulePiIdleReclaim();
-                    }
-                } else if (record.type !== 'response') {
-                    this._refreshPromptTimeouts();
-                    if (record.type === 'agent_end') {
-                        this._schedulePiIdleReclaim();
-                    }
-                    this._event(record);
-                }
-                this._readStdout();
-            } catch (error) {
-                if (!this._closed && !this._piReclaimedIdle) this._fail(error);
-            }
-        });
-    }
-
-    _fail(error) {
-        if (this._closed) return;
-        this.close();
-        this._exit(error);
-    }
-
     close() {
         if (this._closed) return;
         this._closed = true;
-        this._clearPiIdleTimer();
         this._turns.dispose(
             proc => terminateSubprocessGracefully(proc),
             files => files.forEach(removeFileQuietly)
         );
-        this._cancel?.cancel();
         try { this._httpSession?.abort(); } catch (_) {}
         this._httpSession = null;
-        for (const p of this._pending.values()) {
-            GLib.source_remove(p.timeout);
-            p.reject(new Error('服务已关闭'));
-        }
-        this._pending.clear();
-        this._writeQueue = [];
-
-        terminateSubprocessGracefully(this._process);
-        this._process = null;
     }
 }

@@ -44,50 +44,44 @@
   <text x="360" y="163" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• backendDetect 共享 PATH/模型探测</text>
 
   <rect x="346" y="190" width="214" height="90" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="360" y="211" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">piClient.js + core/paths.js</text>
+  <text x="360" y="211" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">backendClient.js + core/paths.js</text>
   <text x="360" y="230" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4">• SIGTERM → SIGKILL 优雅进程回收</text>
   <text x="360" y="247" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4">• $XDG_RUNTIME_DIR 0600 临时沙箱</text>
   <text x="360" y="264" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4">• Soup 3.0 SSE 截断检测与看门狗</text>
 
   <rect x="346" y="292" width="214" height="84" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
   <text x="360" y="313" fill="#b48ead" font-family="JetBrains Mono, monospace" font-size="11.5" font-weight="700">protocol.js</text>
-  <text x="360" y="332" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 四端流式事件归一化与范围权限规则</text>
+  <text x="360" y="332" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 三端流式事件归一化与范围权限规则</text>
   <text x="360" y="349" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• 高危破坏性命令拦截 (禁会话级放行)</text>
   <text x="360" y="366" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.6">• Markdown → 安全 Pango XML 转换</text>
 
-  <!-- Layer 3: 4 Backend Engines -->
+  <!-- Layer 3: 3 Backend Engines -->
   <rect x="630" y="28" width="304" height="364" rx="14" fill="#1f222d" stroke="#3b4254" stroke-width="1.3"/>
-  <text x="782" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">四大可插拔智能后端</text>
+  <text x="782" y="56" fill="#ffffff" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="700" text-anchor="middle">三大可插拔智能后端</text>
 
   <!-- Engine 1: ZCode + zcodeBridge.cjs -->
-  <rect x="646" y="72" width="272" height="86" rx="10" fill="#22322c" stroke="#2ec27e" stroke-width="1.2"/>
-  <text x="660" y="93" fill="#57e389" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">1. ZCode CLI + zcodeBridge.cjs</text>
-  <text x="660" y="112" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.3">• protocolVersion:1 握手 + 恢复 defineProperty</text>
-  <text x="660" y="129" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.3">• 按命令/域名/文件范围授权与送达回执确认</text>
-  <text x="660" y="146" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.3">• 只读解析 v2 配置 + --resume 多轮续接</text>
+  <rect x="646" y="76" width="272" height="94" rx="10" fill="#22322c" stroke="#2ec27e" stroke-width="1.2"/>
+  <text x="660" y="99" fill="#57e389" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">1. ZCode CLI + zcodeBridge.cjs</text>
+  <text x="660" y="120" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">• protocolVersion:1 握手 + 恢复 defineProperty</text>
+  <text x="660" y="138" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">• 按命令/域名/文件范围授权与送达回执确认</text>
+  <text x="660" y="156" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5">• 只读解析 v2 配置 + --resume 多轮续接</text>
 
   <!-- Engine 2: Codex CLI -->
-  <rect x="646" y="170" width="272" height="64" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="660" y="191" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">2. Codex CLI (codex exec --json)</text>
-  <text x="660" y="210" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 只读解析 config.toml 与 models_cache.json</text>
-  <text x="660" y="225" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 并发 item.id 追踪、退出码检测与沙箱控制</text>
+  <rect x="646" y="188" width="272" height="84" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
+  <text x="660" y="211" fill="#88c0d0" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">2. Codex CLI (codex exec --json)</text>
+  <text x="660" y="232" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 只读解析 config.toml 与 models_cache.json</text>
+  <text x="660" y="250" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 并发 item.id 追踪、退出码检测与沙箱控制</text>
 
-  <!-- Engine 3: Pi CLI -->
-  <rect x="646" y="246" width="272" height="56" rx="10" fill="#272b38" stroke="#454d63" stroke-width="1"/>
-  <text x="660" y="267" fill="#ebcb8b" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">3. Pi Agent CLI (pi --mode rpc)</text>
-  <text x="660" y="286" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 常驻 JSON-RPC + 工具白名单 + 5m 空闲回收</text>
-
-  <!-- Engine 4: Custom OpenAI API -->
-  <rect x="646" y="314" width="272" height="64" rx="10" fill="#252c3d" stroke="#3584e4" stroke-width="1.2"/>
-  <text x="660" y="335" fill="#7dcfff" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">4. 自定义 OpenAI 兼容 API</text>
-  <text x="660" y="354" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 直连 OpenAI / DeepSeek / Ollama / 本地代理</text>
-  <text x="660" y="369" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• Keyring 密钥保护，原生支持 reasoning_content</text>
+  <!-- Engine 3: Custom OpenAI API -->
+  <rect x="646" y="290" width="272" height="84" rx="10" fill="#252c3d" stroke="#3584e4" stroke-width="1.2"/>
+  <text x="660" y="313" fill="#7dcfff" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">3. 自定义 OpenAI 兼容 API</text>
+  <text x="660" y="334" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• 直连 OpenAI / DeepSeek / Ollama / 本地代理</text>
+  <text x="660" y="352" fill="#d8dee9" font-family="Noto Sans CJK SC, sans-serif" font-size="10.8">• Keyring 密钥保护，原生支持 reasoning_content</text>
 
   <!-- Connecting Arrows -->
   <line x1="276" y1="125" x2="342" y2="125" stroke="#6893d4" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
   <line x1="276" y1="238" x2="342" y2="238" stroke="#6893d4" stroke-width="2" marker-end="url(#arrow)"/>
-  <line x1="560" y1="198" x2="642" y2="115" stroke="#4ad68d" stroke-width="2" marker-end="url(#arrowGreen)" marker-start="url(#arrowGreen)"/>
-  <line x1="560" y1="220" x2="642" y2="200" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
-  <line x1="560" y1="242" x2="642" y2="274" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
-  <line x1="560" y1="264" x2="642" y2="344" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="560" y1="205" x2="642" y2="123" stroke="#4ad68d" stroke-width="2" marker-end="url(#arrowGreen)" marker-start="url(#arrowGreen)"/>
+  <line x1="560" y1="230" x2="642" y2="230" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="560" y1="255" x2="642" y2="332" stroke="#6893d4" stroke-width="1.8" marker-end="url(#arrow)"/>
 </svg>

@@ -269,7 +269,7 @@ body.render .orb{animation:none!important}
   <h2 class="a up" style="--d:.35">面向 GNOME Shell 的<em>进程级流畅</em></h2>
   <div class="abs" style="left:110px;top:326px;display:flex;gap:33px">
     <div class="stat a up" style="--d:.7"><div class="num" style="--c:var(--green)"></div><div class="lb">WebView 内存开销</div><div class="sb">纯 GJS / St / Clutter 原生控件</div></div>
-    <div class="stat a up" style="--d:1.0"><div class="num c4" style="--d:1.0"></div><div class="lb">大可插拔后端</div><div class="sb">ZCode · Codex · Pi · OpenAI</div></div>
+    <div class="stat a up" style="--d:1.0"><div class="num c3" style="--d:1.0"></div><div class="lb">大可插拔后端</div><div class="sb">ZCode · Codex · OpenAI API</div></div>
     <div class="stat a up" style="--d:1.3"><div class="num c3" style="--d:1.3;--c:var(--orange)"></div><div class="lb">档 Agent 权限</div><div class="sb">chat · readonly · full</div></div>
     <div class="stat a up" style="--d:1.6"><div class="num c14" style="--d:1.6;--c:var(--purple)"></div><div class="lb">项单元与状态机测试</div><div class="sb">npm test · GitHub Actions CI</div></div>
   </div>
@@ -308,12 +308,11 @@ body.render .orb{animation:none!important}
 <!-- ============ 5 后端 ============ -->
 <section class="slide" style="--s:29;--len:7.5">
   <div class="kicker a up" style="--d:.2"><b>04</b>后端引擎</div>
-  <h2 class="a up" style="--d:.35">四大后端，<em>只读自动发现模型</em></h2>
-  <div class="abs" style="left:110px;top:324px;display:flex;gap:33px">
-    <div class="card bk a up" style="--d:.8;--c:var(--green)"><span class="cmd">zcode</span><h4>ZCode CLI</h4><div class="lab">只读扫描</div><div class="path">~/.zcode/v2/<br>provider_config.json</div><ul><li><span class="mono">zcodeBridge.cjs</span> 版本握手与范围审批</li><li><span class="mono">0600</span> 临时配置沙箱 + <span class="mono">--resume</span></li></ul></div>
-    <div class="card bk a up" style="--d:1.3;--c:var(--orange)"><span class="cmd">codex</span><h4>Codex CLI</h4><div class="lab">只读扫描</div><div class="path">~/.codex/config.toml<br>~/.codex/models_cache.json</div><ul><li>并发 <span class="mono">item.id</span> 与退出码精准追踪</li><li><span class="mono">exec resume</span> 会话恢复与原生沙箱</li></ul></div>
-    <div class="card bk a up" style="--d:1.8;--c:var(--purple)"><span class="cmd">pi</span><h4>Pi CLI</h4><div class="lab">只读扫描</div><div class="path">~/.pi/agent/models.json<br>&amp; CLI 环境变量</div><ul><li>常驻 <span class="mono">pi --mode rpc</span> 双向 JSON-RPC</li><li>显式工具白名单 + 5 分钟空闲回收</li></ul></div>
-    <div class="card bk a up" style="--d:2.3;--c:var(--blue2)"><span class="cmd">openai</span><h4>自定义 API</h4><div class="lab">直连流式</div><div class="path">任意标准<br>/v1/chat/completions</div><ul><li>OpenAI · DeepSeek · Ollama · 本地代理</li><li>Soup 3.0 原生 SSE + Keyring 密钥加密</li></ul></div>
+  <h2 class="a up" style="--d:.35">三大后端，<em>只读自动发现模型</em></h2>
+  <div class="abs" style="left:110px;top:324px;display:grid;grid-template-columns:repeat(3,540px);gap:40px">
+    <div class="card bk a up" style="--d:.8;--c:var(--green);width:540px"><span class="cmd">zcode</span><h4>ZCode CLI</h4><div class="lab">只读扫描</div><div class="path">~/.zcode/v2/<br>provider_config.json</div><ul><li><span class="mono">zcodeBridge.cjs</span> 版本握手与范围审批</li><li><span class="mono">0600</span> 临时配置沙箱 + <span class="mono">--resume</span></li></ul></div>
+    <div class="card bk a up" style="--d:1.3;--c:var(--orange);width:540px"><span class="cmd">codex</span><h4>Codex CLI</h4><div class="lab">只读扫描</div><div class="path">~/.codex/config.toml<br>~/.codex/models_cache.json</div><ul><li>并发 <span class="mono">item.id</span> 与退出码精准追踪</li><li><span class="mono">exec resume</span> 会话恢复与原生沙箱</li></ul></div>
+    <div class="card bk a up" style="--d:1.8;--c:var(--blue2);width:540px"><span class="cmd">openai</span><h4>自定义 API</h4><div class="lab">直连流式</div><div class="path">任意标准<br>/v1/chat/completions</div><ul><li>OpenAI · DeepSeek · Ollama · 本地代理</li><li>Soup 3.0 原生 SSE + Keyring 密钥加密</li></ul></div>
   </div>
   <div class="abs a up" style="--d:3.5;left:110px;top:898px;font-size:28px;color:var(--mute)"><b style="color:var(--text)">跨后端无缝续接</b>　同一会话中途切换引擎自动按字符预算注入上下文摘要 · 设置页支持 <span class="mono" style="color:var(--blue2)">/v1/models</span> 在线测速拉取</div>
 </section>
@@ -365,7 +364,7 @@ body.render .orb{animation:none!important}
   <div class="ring" style="--d:4.4;--c:var(--green);left:1194px;top:312px;width:474px;height:568px;border-radius:22px"><span class="bd" style="--c:var(--green)">3</span></div>
   <div class="abs a up" style="--d:2.1;left:251px;top:910px;width:392px;text-align:center;font-size:29px;font-weight:700;color:var(--blue2)">UI 视图与 Keyring 层 (ui/*)</div>
   <div class="abs a up" style="--d:3.3;left:726px;top:910px;width:382px;text-align:center;font-size:29px;font-weight:700;color:var(--purple)">状态机与存储协议层 (core/*)</div>
-  <div class="abs a up" style="--d:4.5;left:1194px;top:910px;width:474px;text-align:center;font-size:29px;font-weight:700;color:var(--green)">四大可插拔智能后端</div>
+  <div class="abs a up" style="--d:4.5;left:1194px;top:910px;width:474px;text-align:center;font-size:29px;font-weight:700;color:var(--green)">三大可插拔智能后端</div>
 </section>
 
 <!-- ============ 9 审批流程 ============ -->
@@ -413,7 +412,7 @@ body.render .orb{animation:none!important}
     <div class="chk a up" style="--d:5.2"><b>✓</b>支持 <span class="mono">./pack.sh</span> 标准打包与 <span class="mono">./uninstall.sh --purge</span> 彻底清理</div>
   </div>
   <div class="abs" style="left:1130px;top:310px;width:680px">
-    <div class="card a rt" style="--d:1.0;padding:28px 34px;margin-bottom:24px"><div style="font-size:23px;color:var(--blue2);font-weight:700;letter-spacing:2px;margin-bottom:10px">环境要求</div><div style="font-size:25px;line-height:1.6;color:var(--mute)">Ubuntu 26.04 LTS / GNOME Shell 50<br>gjs · gir1.2-soup-3.0 · libsecret<br>后端四选一：ZCode / Codex / Pi / API</div></div>
+    <div class="card a rt" style="--d:1.0;padding:28px 34px;margin-bottom:24px"><div style="font-size:23px;color:var(--blue2);font-weight:700;letter-spacing:2px;margin-bottom:10px">环境要求</div><div style="font-size:25px;line-height:1.6;color:var(--mute)">Ubuntu 26.04 LTS / GNOME Shell 50<br>gjs · gir1.2-soup-3.0 · libsecret<br>后端三选一：ZCode / Codex / API</div></div>
     <div class="card a rt" style="--d:2.2;padding:28px 34px;margin-bottom:24px;border-color:var(--orange)"><div style="font-size:23px;color:var(--orange);font-weight:700;letter-spacing:2px;margin-bottom:10px">WAYLAND 提示</div><div style="font-size:25px;line-height:1.6;color:var(--mute)">首次安装或升级扩展后，注销并重新登录一次桌面即可由 GNOME Shell 加载生效。</div></div>
     <div class="card a rt" style="--d:3.4;padding:28px 34px"><div style="font-size:23px;color:var(--green);font-weight:700;letter-spacing:2px;margin-bottom:10px">开发自检与单测</div><div style="font:500 22px/1.6 var(--mono);color:var(--text)">npm test &amp;&amp; ./pack.sh<br><span style="color:var(--green)"># 14/14 unit &amp; state tests passed</span></div></div>
   </div>

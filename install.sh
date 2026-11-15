@@ -39,7 +39,7 @@ fi
 # 2. Atomic Staging Build & Schema Validation
 mkdir -p "$staging/core" "$staging/ui" "$staging/schemas"
 
-install -m 644 metadata.json extension.js piClient.js protocol.js prefs.js zcodeBridge.cjs stylesheet.css "$staging/"
+install -m 644 metadata.json extension.js backendClient.js protocol.js prefs.js zcodeBridge.cjs stylesheet.css "$staging/"
 install -m 644 core/*.js "$staging/core/"
 install -m 644 ui/*.js "$staging/ui/"
 install -m 644 schemas/*.xml "$staging/schemas/"

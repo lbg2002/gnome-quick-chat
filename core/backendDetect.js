@@ -1,5 +1,16 @@
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {parseCodexProviderCatalog, parseZCodeProviderCatalog} from '../protocol.js';
+import {
+    expandHomePath,
+    parseCodexProviderCatalog,
+    parseZCodeProviderCatalog,
+} from '../protocol.js';
+import {
+    createGSettingsStoreAdapter,
+    identifyCliCandidate,
+    migrateLegacyConfig,
+    resolveBackendSelection,
+} from './configMigration.js';
 
 const Decoder = new TextDecoder('utf-8');
 
@@ -19,6 +30,61 @@ export function readTextFileSync(path) {
     try {
         const [ok, raw] = GLib.file_get_contents(path);
         return ok && raw ? Decoder.decode(raw) : '';
+    } catch (_) {
+        return '';
+    }
+}
+
+function readFileHeadSync(path, maxBytes = 2048) {
+    if (!path || !GLib.file_test(path, GLib.FileTest.EXISTS) || GLib.file_test(path, GLib.FileTest.IS_DIR)) {
+        return '';
+    }
+    let stream = null;
+    try {
+        const file = Gio.File.new_for_path(path);
+        stream = file.read(null);
+        const bytes = stream.read_bytes(maxBytes, null);
+        const data = bytes ? bytes.get_data() : null;
+        if (!data || !data.length) return '';
+        // Skip binary ELF executables
+        if (data[0] === 0x7f && data[1] === 0x45 && data[2] === 0x4c && data[3] === 0x46) {
+            return '';
+        }
+        return Decoder.decode(data);
+    } catch (_) {
+        return '';
+    } finally {
+        try { stream?.close(null); } catch (_) {}
+    }
+}
+
+function probeCliVersionSync(executablePath) {
+    if (!executablePath || !GLib.file_test(executablePath, GLib.FileTest.IS_EXECUTABLE)) {
+        return '';
+    }
+    try {
+        const launcher = new Gio.SubprocessLauncher({
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        });
+        launcher.setenv('NO_COLOR', '1', true);
+        const proc = launcher.spawnv([executablePath, '--version']);
+        let timedOut = false;
+        const killTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
+            timedOut = true;
+            try { proc.force_exit(); } catch (_) {}
+            return GLib.SOURCE_REMOVE;
+        });
+        let stdout = '';
+        let stderr = '';
+        try {
+            const [, outStr, errStr] = proc.communicate_utf8(null, null);
+            stdout = outStr || '';
+            stderr = errStr || '';
+        } finally {
+            try { GLib.source_remove(killTimer); } catch (_) {}
+        }
+        if (timedOut) return '';
+        return `${stdout}\n${stderr}`.trim().slice(0, 400);
     } catch (_) {
         return '';
     }
@@ -53,13 +119,14 @@ export function buildSearchPath(extraExecutable = '') {
         }
     };
 
-    if (extraExecutable && extraExecutable.startsWith('/')) {
-        pushDir(GLib.path_get_dirname(extraExecutable));
+    const expandedExtra = extraExecutable ? expandHomePath(extraExecutable, home) : '';
+    if (expandedExtra && expandedExtra.startsWith('/')) {
+        pushDir(GLib.path_get_dirname(expandedExtra));
         try {
-            const linkTarget = GLib.file_read_link(extraExecutable);
+            const linkTarget = GLib.file_read_link(expandedExtra);
             const resolved = linkTarget.startsWith('/')
                 ? linkTarget
-                : GLib.build_filenamev([GLib.path_get_dirname(extraExecutable), linkTarget]);
+                : GLib.build_filenamev([GLib.path_get_dirname(expandedExtra), linkTarget]);
             pushDir(GLib.path_get_dirname(resolved));
         } catch (_) {}
     }
@@ -80,14 +147,18 @@ export function buildSearchPath(extraExecutable = '') {
 
 export function findExecutableInDirs(nameOrPath, pathDirs) {
     if (!nameOrPath) return null;
-    if (nameOrPath.includes('/')) {
-        return GLib.file_test(nameOrPath, GLib.FileTest.IS_EXECUTABLE) &&
-            !GLib.file_test(nameOrPath, GLib.FileTest.IS_DIR)
-            ? nameOrPath
+    const home = GLib.get_home_dir() || '';
+    const expanded = nameOrPath.startsWith('~') || nameOrPath.startsWith('$')
+        ? expandHomePath(nameOrPath, home)
+        : nameOrPath;
+    if (expanded.includes('/')) {
+        return GLib.file_test(expanded, GLib.FileTest.IS_EXECUTABLE) &&
+            !GLib.file_test(expanded, GLib.FileTest.IS_DIR)
+            ? expanded
             : null;
     }
     for (const dir of pathDirs) {
-        const candidate = GLib.build_filenamev([dir, nameOrPath]);
+        const candidate = GLib.build_filenamev([dir, expanded]);
         if (GLib.file_test(candidate, GLib.FileTest.IS_EXECUTABLE) &&
             !GLib.file_test(candidate, GLib.FileTest.IS_DIR)) {
             return candidate;
@@ -96,34 +167,117 @@ export function findExecutableInDirs(nameOrPath, pathDirs) {
     return null;
 }
 
+export function createGioCliEnv(extraExecutable = '') {
+    const home = GLib.get_home_dir() || '';
+    const pathDirs = buildSearchPath(extraExecutable);
+
+    const resolveCandidate = raw => {
+        const trimmed = String(raw || '').trim();
+        if (!trimmed) return '';
+        const expanded = trimmed.startsWith('~') || trimmed.startsWith('$')
+            ? expandHomePath(trimmed, home)
+            : trimmed;
+        if (expanded.includes('/')) {
+            return expanded;
+        }
+        return findExecutableInDirs(expanded, pathDirs) || '';
+    };
+
+    const readLink = p => {
+        try {
+            const target = GLib.file_read_link(p);
+            if (!target) return '';
+            return target.startsWith('/')
+                ? target
+                : GLib.build_filenamev([GLib.path_get_dirname(p), target]);
+        } catch (_) {
+            return '';
+        }
+    };
+
+    const hasZCodeNodeRuntime = () => Boolean(
+        findExecutableInDirs('node', pathDirs) ||
+        GLib.file_test('/opt/ZCode/zcode', GLib.FileTest.IS_EXECUTABLE)
+    );
+
+    const baseEnv = {
+        pathDirs,
+        resolveCandidate,
+        fileExists: p => Boolean(p && GLib.file_test(p, GLib.FileTest.EXISTS)),
+        isDir: p => Boolean(p && GLib.file_test(p, GLib.FileTest.IS_DIR)),
+        isExecutable: p => Boolean(
+            p &&
+            GLib.file_test(p, GLib.FileTest.IS_EXECUTABLE) &&
+            !GLib.file_test(p, GLib.FileTest.IS_DIR)
+        ),
+        readLink,
+        readFileHead: readFileHeadSync,
+        probeVersion: probeCliVersionSync,
+        hasZCodeNodeRuntime,
+    };
+
+    return {
+        ...baseEnv,
+        hasZCode(customZCodePath = '') {
+            const custom = String(customZCodePath || '').trim();
+            if (custom) {
+                return identifyCliCandidate(custom, baseEnv) === 'zcode';
+            }
+            const bundledZCode = '/opt/ZCode/resources/glm/zcode.cjs';
+            if (GLib.file_test(bundledZCode, GLib.FileTest.EXISTS) && hasZCodeNodeRuntime()) {
+                return true;
+            }
+            const pathZCode = findExecutableInDirs('zcode', pathDirs);
+            return Boolean(pathZCode && identifyCliCandidate(pathZCode, baseEnv) === 'zcode');
+        },
+        hasCodex(customCodexPath = '') {
+            const custom = String(customCodexPath || '').trim();
+            if (custom) {
+                return identifyCliCandidate(custom, baseEnv) === 'codex';
+            }
+            const pathCodex = findExecutableInDirs('codex', pathDirs);
+            return Boolean(pathCodex && identifyCliCandidate(pathCodex, baseEnv) === 'codex');
+        },
+    };
+}
+
+export function migrateGSettingsIfNeeded(settings) {
+    if (!settings) return {migrated: false, migratedFromPi: false, migratedCliIdentity: 'none'};
+    const store = createGSettingsStoreAdapter(settings);
+    const hasVer = store.hasKey('config-version') && store.getInt('config-version') >= 1;
+    const legacyHint = !hasVer && store.hasKey('pi-path') ? store.getString('pi-path') : '';
+    const cliEnv = createGioCliEnv(legacyHint);
+    return migrateLegacyConfig(store, cliEnv);
+}
+
+export function detectBackendSelection({
+    configuredBackend = 'auto',
+    zcodePath = '',
+    codexPath = '',
+    openaiBaseUrl = '',
+} = {}) {
+    const extra = zcodePath || codexPath || '';
+    const cliEnv = createGioCliEnv(extra);
+    return resolveBackendSelection(
+        {configuredBackend, zcodePath, codexPath, openaiBaseUrl},
+        cliEnv
+    );
+}
+
 /**
  * Shared backend detection logic used identically by Preferences UI, Quick Model Switcher, and Runtime.
+ * Returns 'zcode' | 'codex' | 'openai' | 'unconfigured'.
  */
-export function detectEffectiveBackend(configuredBackend = 'auto', executableHint = 'pi', openaiBaseUrl = '') {
-    if (configuredBackend && configuredBackend !== 'auto') {
-        return configuredBackend;
-    }
-    const rawExec = (executableHint || '').trim();
-    const pathDirs = buildSearchPath(rawExec);
-
-    if (findExecutableInDirs(rawExec || 'pi', pathDirs)) {
-        return 'pi';
-    }
-    const bundledZCode = '/opt/ZCode/resources/glm/zcode.cjs';
-    if (
-        GLib.file_test(bundledZCode, GLib.FileTest.EXISTS) &&
-        (findExecutableInDirs('node', pathDirs) || GLib.file_test('/opt/ZCode/zcode', GLib.FileTest.IS_EXECUTABLE))
-    ) {
-        return 'zcode';
-    }
-    const customCodex = rawExec && rawExec !== 'pi' ? findExecutableInDirs(rawExec, pathDirs) : null;
-    if (customCodex || findExecutableInDirs('codex', pathDirs)) {
-        return 'codex';
-    }
-    if ((openaiBaseUrl || '').trim()) {
-        return 'openai';
-    }
-    return 'zcode';
+export function detectEffectiveBackend(configuredBackend = 'auto', options = {}) {
+    const normalizedOpts = typeof options === 'object' && options !== null
+        ? options
+        : {openaiBaseUrl: ''};
+    return detectBackendSelection({
+        configuredBackend,
+        zcodePath: normalizedOpts.zcodePath || '',
+        codexPath: normalizedOpts.codexPath || '',
+        openaiBaseUrl: normalizedOpts.openaiBaseUrl || '',
+    }).effectiveBackend;
 }
 
 export function loadLocalBackendCatalog(effectiveBackend) {
@@ -154,31 +308,10 @@ export function loadLocalBackendCatalog(effectiveBackend) {
         };
     }
 
-    if (effectiveBackend === 'pi') {
-        const piModelsPath = GLib.build_filenamev([home, '.pi', 'agent', 'models.json']);
-        const piObj = readJsonFileSync(piModelsPath);
-        const providers = [];
-        if (piObj && typeof piObj === 'object') {
-            for (const [k, v] of Object.entries(piObj.providers || piObj)) {
-                if (v && typeof v === 'object') {
-                    const models = Array.isArray(v.models)
-                        ? v.models.map(m => String(m?.id || m?.name || m || '').trim()).filter(Boolean)
-                        : [];
-                    providers.push({id: k, name: k, baseUrl: v.baseUrl || '', apiKey: '', models});
-                }
-            }
-        }
-        if (!providers.length) {
-            providers.push(
-                {id: 'anthropic', name: 'Anthropic', baseUrl: '', apiKey: '', models: ['claude-sonnet-4-5', 'claude-opus-4-5']},
-                {id: 'openai', name: 'OpenAI', baseUrl: '', apiKey: '', models: ['gpt-5', 'gpt-4.1', 'o3']},
-                {id: 'google', name: 'Google Gemini', baseUrl: '', apiKey: '', models: ['gemini-2.5-pro', 'gemini-2.5-flash']},
-                {id: 'deepseek', name: 'DeepSeek', baseUrl: '', apiKey: '', models: ['deepseek-chat', 'deepseek-reasoner']},
-            );
-        }
+    if (effectiveBackend === 'unconfigured') {
         return {
-            backendLabel: 'Pi CLI',
-            providers,
+            backendLabel: '未配置后端',
+            providers: [],
             defaultProviderId: '',
             defaultModelId: '',
         };

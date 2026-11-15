@@ -7,7 +7,7 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import {PiClient} from './piClient.js';
+import {BackendClient} from './backendClient.js';
 import {
     buildAskUserModifiedInput,
     computePermissionScope,
@@ -19,7 +19,11 @@ import {
 } from './protocol.js';
 import {getSessionsDir, resolveWorkspacePath} from './core/paths.js';
 import {loadOpenAIApiKey} from './core/secretStore.js';
-import {detectEffectiveBackend, loadLocalBackendCatalog} from './core/backendDetect.js';
+import {
+    detectEffectiveBackend,
+    loadLocalBackendCatalog,
+    migrateGSettingsIfNeeded,
+} from './core/backendDetect.js';
 import {DateMenuIntegration} from './ui/dateMenuIntegration.js';
 import {renderCardBodyIncremental} from './ui/markdownRenderer.js';
 
@@ -88,6 +92,7 @@ export default class QuickChat extends Extension {
         this._modelPickerOpen = false;
 
         this._settings = this.getSettings();
+        migrateGSettingsIfNeeded(this._settings);
         this._dateIntegration = new DateMenuIntegration();
 
         this._wrapper = new St.BoxLayout({
@@ -593,16 +598,115 @@ export default class QuickChat extends Extension {
         this._dateIntegration?.nudgeLayout();
     }
 
+    _getEffectiveBackend() {
+        return detectEffectiveBackend(
+            this._getSettingString('backend', 'auto') || 'auto',
+            {
+                zcodePath: this._getSettingString('zcode-path', ''),
+                codexPath: this._getSettingString('codex-path', ''),
+                openaiBaseUrl: this._getSettingString('openai-base-url', ''),
+            }
+        );
+    }
+
+    _getBackendProvider(effectiveBackend) {
+        if (effectiveBackend === 'zcode') {
+            return this._getSettingString('zcode-provider', '').trim() ||
+                this._getSettingString('provider', '').trim();
+        }
+        if (effectiveBackend === 'codex') {
+            return this._getSettingString('codex-provider', '').trim() ||
+                this._getSettingString('provider', '').trim();
+        }
+        return this._getSettingString('provider', '').trim();
+    }
+
+    _getBackendModel(effectiveBackend) {
+        if (effectiveBackend === 'openai') {
+            return this._getSettingString('openai-model', '').trim() ||
+                this._getSettingString('model', '').trim();
+        }
+        if (effectiveBackend === 'zcode') {
+            return this._getSettingString('zcode-model', '').trim() ||
+                this._getSettingString('model', '').trim();
+        }
+        if (effectiveBackend === 'codex') {
+            return this._getSettingString('codex-model', '').trim() ||
+                this._getSettingString('model', '').trim();
+        }
+        return this._getSettingString('model', '').trim();
+    }
+
+    _getBackendEffort(effectiveBackend) {
+        if (effectiveBackend === 'zcode') {
+            const v = this._getSettingString('zcode-reasoning-effort', 'default').trim();
+            if (v && v !== 'default') return v;
+        } else if (effectiveBackend === 'codex') {
+            const v = this._getSettingString('codex-reasoning-effort', 'default').trim();
+            if (v && v !== 'default') return v;
+        } else if (effectiveBackend === 'openai') {
+            const v = this._getSettingString('openai-reasoning-effort', 'default').trim();
+            if (v && v !== 'default') return v;
+        }
+        return this._getSettingString('reasoning-effort', 'default').trim() || 'default';
+    }
+
+    _setBackendModelSelection(effectiveBackend, providerId, modelId) {
+        if (effectiveBackend === 'zcode') {
+            if (this._hasKey('zcode-provider')) this._settings.set_string('zcode-provider', providerId);
+            if (this._hasKey('zcode-model')) this._settings.set_string('zcode-model', modelId);
+        } else if (effectiveBackend === 'codex') {
+            if (this._hasKey('codex-provider')) this._settings.set_string('codex-provider', providerId);
+            if (this._hasKey('codex-model')) this._settings.set_string('codex-model', modelId);
+        } else if (effectiveBackend === 'openai') {
+            if (this._hasKey('openai-model')) this._settings.set_string('openai-model', modelId);
+        }
+        this._settings.set_string('provider', providerId);
+        this._settings.set_string('model', modelId);
+    }
+
+    _setBackendEffort(effectiveBackend, effortId) {
+        if (effectiveBackend === 'zcode' && this._hasKey('zcode-reasoning-effort')) {
+            this._settings.set_string('zcode-reasoning-effort', effortId);
+        } else if (effectiveBackend === 'codex' && this._hasKey('codex-reasoning-effort')) {
+            this._settings.set_string('codex-reasoning-effort', effortId);
+        } else if (effectiveBackend === 'openai' && this._hasKey('openai-reasoning-effort')) {
+            this._settings.set_string('openai-reasoning-effort', effortId);
+        }
+        if (this._hasKey('reasoning-effort')) {
+            this._settings.set_string('reasoning-effort', effortId);
+        }
+    }
+
+    _dismissMigrationNotice() {
+        if (this._hasKey('migration-notice') && this._getSettingString('migration-notice', '')) {
+            this._settings.set_string('migration-notice', '');
+        }
+    }
+
     _populateModelPicker() {
         if (!this._modelPickerBox) return;
         this._modelPickerBox.destroy_all_children();
 
         const configuredBackend = this._getSettingString('backend', 'auto') || 'auto';
-        const effectiveBackend = detectEffectiveBackend(
-            configuredBackend,
-            this._getSettingString('pi-path', 'pi'),
-            this._getSettingString('openai-base-url', '')
-        );
+        const effectiveBackend = this._getEffectiveBackend();
+
+        const migrationNotice = this._getSettingString('migration-notice', '').trim();
+        if (migrationNotice) {
+            const noticeRow = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-picker-row',
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: true,
+            });
+            const noticeLbl = wrapLabel(`ℹ️ ${migrationNotice}`, 'qc-picker-empty');
+            noticeRow.add_child(noticeLbl);
+            noticeRow.add_child(button('知道了', () => {
+                this._dismissMigrationNotice();
+                this._populateModelPicker();
+            }, 'qc-picker-chip', '关闭升级提示'));
+            this._modelPickerBox.add_child(noticeRow);
+        }
 
         // Row 1: Backend switcher chips
         const backendRow = new St.BoxLayout({
@@ -620,7 +724,6 @@ export default class QuickChat extends Extension {
             {id: 'auto', label: '自动'},
             {id: 'zcode', label: 'ZCode'},
             {id: 'codex', label: 'Codex'},
-            {id: 'pi', label: 'Pi'},
             {id: 'openai', label: 'OpenAI'},
         ];
         for (const item of backendChoices) {
@@ -628,6 +731,7 @@ export default class QuickChat extends Extension {
             const chip = button(
                 item.label,
                 () => {
+                    this._dismissMigrationNotice();
                     this._settings.set_string('backend', item.id);
                     this._populateModelPicker();
                 },
@@ -640,10 +744,8 @@ export default class QuickChat extends Extension {
 
         // Row 2: Discovered Models for effectiveBackend
         const catalog = loadLocalBackendCatalog(effectiveBackend);
-        const curProvider = this._getSettingString('provider', '').trim();
-        const curModel = effectiveBackend === 'openai'
-            ? this._getSettingString('openai-model', '').trim()
-            : this._getSettingString('model', '').trim();
+        const curProvider = this._getBackendProvider(effectiveBackend);
+        const curModel = this._getBackendModel(effectiveBackend);
 
         const modelEntries = [];
         const seen = new Set();
@@ -675,8 +777,7 @@ export default class QuickChat extends Extension {
                     const mBtn = button(
                         lbl,
                         () => {
-                            this._settings.set_string('provider', entry.providerId);
-                            this._settings.set_string('model', entry.modelId);
+                            this._setBackendModelSelection(effectiveBackend, entry.providerId, entry.modelId);
                             this._toggleModelPicker(false);
                         },
                         isSelected ? 'qc-picker-model-btn qc-picker-chip-active' : 'qc-picker-model-btn',
@@ -690,9 +791,11 @@ export default class QuickChat extends Extension {
             this._modelPickerBox.add_child(modelsWrap);
         } else {
             const hint = wrapLabel(
-                effectiveBackend === 'openai'
-                    ? `当前自定义模型：${curModel || '自动发现'}（可在设置中在线拉取列表）`
-                    : '未检测到预设模型列表，将使用后端默认模型。',
+                effectiveBackend === 'unconfigured'
+                    ? '未检测到可用引擎：请安装 ZCode / Codex CLI，或点击下方「更多设置…」配置 OpenAI API。'
+                    : effectiveBackend === 'openai'
+                        ? `当前自定义模型：${curModel || '自动发现'}（可在设置中在线拉取列表）`
+                        : '未检测到预设模型列表，将使用后端默认模型。',
                 'qc-picker-empty'
             );
             this._modelPickerBox.add_child(hint);
@@ -709,7 +812,7 @@ export default class QuickChat extends Extension {
             style_class: 'qc-picker-label',
             y_align: Clutter.ActorAlign.CENTER,
         }));
-        const curEffort = this._getSettingString('reasoning-effort', 'default') || 'default';
+        const curEffort = this._getBackendEffort(effectiveBackend);
         for (const ef of [
             {id: 'default', label: '默认'},
             {id: 'fast', label: '快'},
@@ -719,9 +822,7 @@ export default class QuickChat extends Extension {
             const efBtn = button(
                 ef.label,
                 () => {
-                    if (this._hasKey('reasoning-effort')) {
-                        this._settings.set_string('reasoning-effort', ef.id);
-                    }
+                    this._setBackendEffort(effectiveBackend, ef.id);
                     this._populateModelPicker();
                 },
                 curEffort === ef.id ? 'qc-picker-chip qc-picker-chip-active' : 'qc-picker-chip',
@@ -750,24 +851,37 @@ export default class QuickChat extends Extension {
         });
         const title = wrapLabel('有什么想问的？', 'qc-empty-title');
 
-        const effBackend = detectEffectiveBackend(
-            this._getSettingString('backend', 'auto'),
-            this._getSettingString('pi-path', 'pi'),
-            this._getSettingString('openai-base-url', '')
-        );
+        const effBackend = this._getEffectiveBackend();
         const caps = getBackendCapabilities(effBackend);
         const mode = this._getSettingString('agent-mode', 'readonly');
         const modeIdx = mode === 'full' ? 2 : mode === 'readonly' ? 1 : 0;
-        const modeDesc = `当前模式：${caps.modeLabels[modeIdx] || caps.modeLabels[1]}`;
+        const modeDesc = effBackend === 'unconfigured'
+            ? '未检测到可用后端：请安装 ZCode / Codex CLI，或在右上角 ⚙ 设置中配置 OpenAI 兼容 API。'
+            : `当前模式：${caps.modeLabels[modeIdx] || caps.modeLabels[1]}`;
         const subtitle = wrapLabel(modeDesc, 'qc-empty-subtitle');
         card.add_child(title);
         card.add_child(subtitle);
+
+        const migrationNotice = this._getSettingString('migration-notice', '').trim();
+        if (migrationNotice) {
+            const noticeLbl = wrapLabel(`ℹ️ ${migrationNotice}`, 'qc-empty-subtitle');
+            card.add_child(noticeLbl);
+        }
 
         const chips = new St.BoxLayout({
             orientation: V,
             style_class: 'qc-chips-box',
             x_expand: true,
         });
+        if (effBackend === 'unconfigured') {
+            const setupChip = button('⚙ 打开随问设置配置后端…', () => {
+                this._dismissMigrationNotice();
+                this._dateIntegration?.dateMenu?.menu?.close();
+                this.openPreferences();
+            }, 'qc-chip', '打开设置配置后端');
+            setupChip.x_align = Clutter.ActorAlign.START;
+            chips.add_child(setupChip);
+        }
         for (const item of QUICK_PROMPTS) {
             const chip = button(item.label, () => {
                 if (item.prompt.endsWith('\n')) {
@@ -879,6 +993,12 @@ export default class QuickChat extends Extension {
         watch('toggle-shortcut', () => this._registerGlobalKeybindings());
         watch('clipboard-shortcut', () => this._registerGlobalKeybindings());
 
+        watch('migration-notice', () => {
+            if (this._enabled && !this._cardList?.length) {
+                this._buildEmptyState();
+            }
+        });
+
         const onBackendConfigChanged = () => {
             if (!this._enabled) return;
             if (this._busy) {
@@ -889,17 +1009,25 @@ export default class QuickChat extends Extension {
         };
         for (const key of [
             'backend',
-            'pi-path',
+            'zcode-path',
+            'codex-path',
             'provider',
             'model',
+            'zcode-provider',
+            'zcode-model',
+            'zcode-reasoning-effort',
+            'codex-provider',
+            'codex-model',
+            'codex-reasoning-effort',
             'openai-base-url',
             'openai-api-key',
             'openai-model',
+            'openai-reasoning-effort',
             'system-prompt',
             'reasoning-effort',
-            'pi-idle-minutes',
             'agent-mode',
             'workspace',
+            'session-id',
         ]) {
             watch(key, onBackendConfigChanged);
         }
@@ -1082,18 +1210,21 @@ export default class QuickChat extends Extension {
     }
 
     async _loadRuntimeConfig() {
+        migrateGSettingsIfNeeded(this._settings);
         const apiKey = await loadOpenAIApiKey(this._settings);
+        const eff = this._getEffectiveBackend();
+        const activeModel = this._getBackendModel(eff);
         return {
             backend: this._getSettingString('backend', 'auto').trim() || 'auto',
-            executable: this._getSettingString('pi-path', 'pi').trim() || 'pi',
-            provider: this._getSettingString('provider', '').trim(),
-            model: this._getSettingString('model', '').trim(),
+            zcodePath: this._getSettingString('zcode-path', '').trim(),
+            codexPath: this._getSettingString('codex-path', '').trim(),
+            provider: this._getBackendProvider(eff),
+            model: activeModel,
             openaiBaseUrl: this._getSettingString('openai-base-url', '').trim(),
             openaiApiKey: apiKey,
-            openaiModel: this._getSettingString('openai-model', '').trim(),
+            openaiModel: this._getSettingString('openai-model', '').trim() || activeModel,
             systemPrompt: this._getSettingString('system-prompt', '').trim(),
-            reasoningEffort: this._getSettingString('reasoning-effort', 'default').trim() || 'default',
-            piIdleMinutes: this._getSettingInt('pi-idle-minutes', 5),
+            reasoningEffort: this._getBackendEffort(eff),
             mode: this._getSettingString('agent-mode', 'readonly').trim() || 'readonly',
             workspace: this._getSettingString('workspace', '').trim(),
         };
@@ -1134,7 +1265,7 @@ export default class QuickChat extends Extension {
                 this._settings.set_string('session-id', sessionId);
             }
 
-            const client = new PiClient(
+            const client = new BackendClient(
                 event => {
                     if (this._enabled && this._generation === generation) this._onEvent(event);
                 },
@@ -1153,16 +1284,24 @@ export default class QuickChat extends Extension {
             const data = await client.request('get_messages');
             if (!this._enabled || generation !== this._generation) return;
 
+            this._renderInitialHistory(detailedMessages(data.messages));
+
+            if (state.unconfigured || state.backend === 'unconfigured') {
+                this._modelLabel = '未配置后端';
+                this._idleStatus = '未配置后端';
+                this._ready = false;
+                this._setStatusIndicator('error', state.reason || '未检测到可用后端，请在设置（⚙）中配置');
+                this._setBusy(false);
+                this._scrollBottom(true);
+                return;
+            }
+
             const backendTag = state.backend === 'openai'
                 ? 'OpenAI API'
-                : state.backend === 'zcode'
-                    ? 'ZCode'
-                    : state.backend === 'codex'
-                        ? 'Codex'
-                        : 'Pi';
+                : state.backend === 'codex'
+                    ? 'Codex'
+                    : 'ZCode';
             this._modelLabel = state.model?.id || config.model || backendTag;
-
-            this._renderInitialHistory(detailedMessages(data.messages));
 
             this._ready = true;
             const caps = getBackendCapabilities(state.backend);

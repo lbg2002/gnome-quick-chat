@@ -1,6 +1,10 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {getLegacySessionFile, getSessionDir} from './paths.js';
+import {getLegacySessionFile, getSessionDir, getSessionsDir} from './paths.js';
+import {
+    isLegacyPiSessionMeta,
+    parseLegacyPiSessionContent,
+} from './configMigration.js';
 import {
     buildBudgetedContextMessages,
     buildCrossBackendPromptWithContext,
@@ -93,6 +97,62 @@ function appendLineAsync(filePath, lineStr) {
     });
 }
 
+export function listLegacyPiSessionFiles() {
+    const sessionsDir = getSessionsDir();
+    if (!GLib.file_test(sessionsDir, GLib.FileTest.IS_DIR)) return [];
+    const found = [];
+    try {
+        const dir = GLib.Dir.open(sessionsDir, 0);
+        let name;
+        while ((name = dir.read_name()) !== null) {
+            if (!name.endsWith('.jsonl')) continue;
+            const fullPath = GLib.build_filenamev([sessionsDir, name]);
+            if (!GLib.file_test(fullPath, GLib.FileTest.IS_DIR)) {
+                found.push({name, path: fullPath});
+            }
+        }
+        dir.close();
+    } catch (_) {}
+    found.sort((a, b) => b.name.localeCompare(a.name));
+    return found;
+}
+
+export async function importLegacyPiSessionFileReadOnly(sourceFilePath, targetSessionId = '') {
+    if (!sourceFilePath || !GLib.file_test(sourceFilePath, GLib.FileTest.EXISTS)) {
+        return {ok: false, sessionId: '', importedCount: 0, error: '指定的旧会话文件不存在'};
+    }
+    let raw = '';
+    try {
+        raw = await readFileAsync(sourceFilePath);
+    } catch (err) {
+        return {ok: false, sessionId: '', importedCount: 0, error: `读取旧会话失败：${err.message}`};
+    }
+    const parsed = parseLegacyPiSessionContent(raw);
+    if (!parsed.ok) {
+        return {ok: false, sessionId: '', importedCount: 0, error: parsed.error};
+    }
+    const newSessionId = targetSessionId || GLib.uuid_string_random();
+    const store = new SessionStore(newSessionId);
+    store.messages = parsed.messages.slice(-MAX_DISK_MESSAGES);
+    store.meta = {
+        backend: '',
+        modelSignature: '',
+        remoteSessionId: '',
+        updatedAt: Date.now(),
+        importedFromLegacyPi: true,
+    };
+    await store._enqueueWrite(async () => {
+        await store._writeMetaNow();
+        await store._rewriteAllMessagesNow();
+    });
+    return {
+        ok: true,
+        sessionId: newSessionId,
+        importedCount: store.messages.length,
+        error: '',
+    };
+}
+
 /**
  * Async JSONL + meta.json session store.
  * Layout:
@@ -120,7 +180,9 @@ export class SessionStore {
 
     async load(currentBackend, currentConfig) {
         if (this._loaded) return;
-        const currentSig = buildModelSignature(currentBackend, currentConfig);
+        const currentSig = currentBackend && currentBackend !== 'unconfigured'
+            ? buildModelSignature(currentBackend, currentConfig)
+            : '';
 
         // 1. Try modern meta.json + messages.jsonl
         if (GLib.file_test(this.metaPath, GLib.FileTest.EXISTS) || GLib.file_test(this.jsonlPath, GLib.FileTest.EXISTS)) {
@@ -154,7 +216,7 @@ export class SessionStore {
                 if (raw) {
                     const parsed = JSON.parse(raw);
                     this.meta = {
-                        backend: parsed.backend || currentBackend,
+                        backend: parsed.backend || '',
                         modelSignature: parsed.modelSignature || '',
                         remoteSessionId: parsed.remoteSessionId || '',
                         updatedAt: parsed.updatedAt || Date.now(),
@@ -173,12 +235,19 @@ export class SessionStore {
             }
         }
 
-        // Verify signature match for remoteSessionId reuse
-        if (this.meta.modelSignature && this.meta.modelSignature !== currentSig) {
+        // Never treat a legacy Pi session ID as a ZCode or Codex remote session ID
+        if (isLegacyPiSessionMeta(this.meta)) {
             this.meta.remoteSessionId = '';
         }
-        this.meta.backend = currentBackend;
-        this.meta.modelSignature = currentSig;
+
+        // Verify signature match for remoteSessionId reuse
+        if (!currentSig || (this.meta.modelSignature && this.meta.modelSignature !== currentSig)) {
+            this.meta.remoteSessionId = '';
+        }
+        if (currentBackend && currentBackend !== 'unconfigured') {
+            this.meta.backend = currentBackend;
+            this.meta.modelSignature = currentSig;
+        }
         this._loaded = true;
     }
 

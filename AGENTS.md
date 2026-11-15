@@ -15,39 +15,39 @@
 
 ## 1. 实施顺序
 
-| 阶段 | 优先级 | 范围 | 完成条件 |
-| --- | --- | --- | --- |
-| A | P0 | 移除 Pi、配置迁移、后端检测 | 三后端可用，旧安装可升级 |
-| B | P0 | 审批安全、回合状态、子进程取消 | 权限不扩大、回合隔离、失败准确 |
-| C | P0/P1 | 会话数据一致性、流协议与密钥 | 历史正确、流终止可靠、密钥不泄露 |
-| D | P1 | GNOME 主线程与长文本性能 | 有可复现性能数据及回归测试 |
-| E | P1 | 模块化、配置和 GNOME 生命周期 | 可维护、可独立测试、安装可回滚 |
-| F | P2 | 桌面上下文、快捷动作、会话恢复 | 提升日常使用效率，不增加常驻负担 |
+| 阶段 | 优先级 | 范围 | 完成条件 | 状态 |
+| --- | --- | --- | --- | --- |
+| A | P0 | 移除 Pi、配置迁移、后端检测 | 三后端可用，旧安装可升级 | ✅ 已完成 |
+| B | P0 | 审批安全、回合状态、子进程取消 | 权限不扩大、回合隔离、失败准确 | 进行中 |
+| C | P0/P1 | 会话数据一致性、流协议与密钥 | 历史正确、流终止可靠、密钥不泄露 | 待实施 |
+| D | P1 | GNOME 主线程与长文本性能 | 有可复现性能数据及回归测试 | 待实施 |
+| E | P1 | 模块化、配置和 GNOME 生命周期 | 可维护、可独立测试、安装可回滚 | 待实施 |
+| F | P2 | 桌面上下文、快捷动作、会话恢复 | 提升日常使用效率，不增加常驻负担 | 待实施 |
 
 优先完成 A–C 再做功能扩展。D、E 可按实际依赖拆分穿插实施。不得在安全和数据一致性未解决前默认启用更强权限或复杂自动化。
 
-## 2. A：移除 Pi 后端（P0，首个独立提交）
+## 2. A：移除 Pi 后端（P0，首个独立提交）— ✅ 已完成
 
-### A1. 删除运行时与依赖
+### A1. 删除运行时与依赖 — ✅ 已完成
 
 审查入口：piClient.js、core/backendDetect.js、protocol.js、extension.js、prefs.js、schemas/org.gnome.shell.extensions.quick-chat.gschema.xml、tests/protocol.test.js。
 
-- 将 piClient.js / PiClient 重命名为 backendClient.js / BackendClient（也可直接实施第 6 节适配器结构），更新所有 import、install.sh、pack.sh、CI 语法检查和测试入口。避免保留旧名称作为长期兼容层。
-- 移除 Pi 专用 buildArgs、RPC request/response 队列、读写方法、持久进程、空闲计时器、Pi first-turn 标记、Pi 模型硬编码目录、Pi 可执行文件探测和 Pi 专属测试。共享的 Gio 异步 I/O、XDG 路径获取、权限处理、TurnController 继续保留。
-- 三个后端统一使用同一套 SessionStore、TurnController、标准化事件与前端状态。ZCode/Codex 按回合启动 CLI，OpenAI 使用 Soup HTTP 流；无需新增常驻 CLI 进程。
-- 删除模型选择器、设置页、空状态、能力矩阵、metadata.json、README、docs/index.html、SVG 架构图等所有仍宣称支持 Pi 的内容。不要删除历史中用户实际写过的文本。
-- 使用 ripgrep 全仓搜索 Pi 专属符号与文案，人工区分普通英文单词及合法的迁移代码。检查安装包不会包含已移除文件。
+- [x] 将 piClient.js / PiClient 重命名为 backendClient.js / BackendClient（也可直接实施第 6 节适配器结构），更新所有 import、install.sh、pack.sh、CI 语法检查和测试入口。避免保留旧名称作为长期兼容层。
+- [x] 移除 Pi 专用 buildArgs、RPC request/response 队列、读写方法、持久进程、空闲计时器、Pi first-turn 标记、Pi 模型硬编码目录、Pi 可执行文件探测和 Pi 专属测试。共享的 Gio 异步 I/O、XDG 路径获取、权限处理、TurnController 继续保留。
+- [x] 三个后端统一使用同一套 SessionStore、TurnController、标准化事件与前端状态。ZCode/Codex 按回合启动 CLI，OpenAI 使用 Soup HTTP 流；无需新增常驻 CLI 进程。
+- [x] 删除模型选择器、设置页、空状态、能力矩阵、metadata.json、README、docs/index.html、SVG 架构图等所有仍宣称支持 Pi 的内容。不要删除历史中用户实际写过的文本。
+- [x] 使用 ripgrep 全仓搜索 Pi 专属符号与文案，人工区分普通英文单词及合法的迁移代码。检查安装包不会包含已移除文件。
 
-### A2. 向后兼容迁移
+### A2. 向后兼容迁移 — ✅ 已完成
 
 当前 schema 共享 backend、pi-path、provider、model、reasoning-effort 等字段，且 backend 允许 auto/pi/zcode/codex/openai。
 
-- 增加配置版本或迁移标记；旧 backend=pi 安全迁移为 auto 并明确告知用户重新选择后端。未配置可用引擎时进入明确的未配置状态，不能返回一个不存在的 ZCode。
-- 将旧 pi-path 迁移为独立 zcode-path 或 codex-path **仅在验证身份后**；原本的 Pi 路径不应被误当成其他 CLI。
-- 保留旧 schema 字段仅用于一次性迁移，之后停止读写并在后续版本移除；pi-idle-minutes 不再展示或影响运行。迁移幂等，可重复运行；不要清空原始共享 provider/model，先按已验证的旧 backend 迁移对应字段。
-- 默认 auto 检测顺序建议 ZCode → Codex → 已配置的 OpenAI；明确选择的后端不可悄悄切换为另一后端。检测依据实际 executable/CLI identity，而不是任意路径存在。无后端时提示配置方式。
-- 用户历史中原有 Pi 会话保持原文件不变；如果能安全解析其本地会话格式，可提供显式只读导入为普通历史，不承诺恢复 Pi 执行状态，也不要求实现 Pi RPC。不能解析时保留原始数据并给出提示。
-- 旧版本 SessionStore JSON/JSONL 会话必须可读取。不要把旧 Pi session ID 当成 ZCode 或 Codex 的远端 ID。
+- [x] 增加配置版本或迁移标记；旧 backend=pi 安全迁移为 auto 并明确告知用户重新选择后端。未配置可用引擎时进入明确的未配置状态，不能返回一个不存在的 ZCode。
+- [x] 将旧 pi-path 迁移为独立 zcode-path 或 codex-path **仅在验证身份后**；原本的 Pi 路径不应被误当成其他 CLI。
+- [x] 保留旧 schema 字段仅用于一次性迁移，之后停止读写并在后续版本移除；pi-idle-minutes 不再展示或影响运行。迁移幂等，可重复运行；不要清空原始共享 provider/model，先按已验证的旧 backend 迁移对应字段。
+- [x] 默认 auto 检测顺序建议 ZCode → Codex → 已配置的 OpenAI；明确选择的后端不可悄悄切换为另一后端。检测依据实际 executable/CLI identity，而不是任意路径存在。无后端时提示配置方式。
+- [x] 用户历史中原有 Pi 会话保持原文件不变；如果能安全解析其本地会话格式，可提供显式只读导入为普通历史，不承诺恢复 Pi 执行状态，也不要求实现 Pi RPC。不能解析时保留原始数据并给出提示。
+- [x] 旧版本 SessionStore JSON/JSONL 会话必须可读取。不要把旧 Pi session ID 当成 ZCode 或 Codex 的远端 ID。
 
 验收：旧 backend=pi/auto/zcode/codex/openai 配置分别升级；已安装三个后端、只有一个后端、无后端、无效路径均有明确结果；不存在对 Pi 的运行依赖；npm test 与严格 schema 编译通过。
 

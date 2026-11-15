@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {
     augmentPromptWithDesktopContext,
-    buildArgs,
     buildAskUserModifiedInput,
     buildBudgetedContextMessages,
     buildCodexArgs,
@@ -35,24 +34,6 @@ import {
 
 const require = createRequire(import.meta.url);
 const zcodeBridge = require('../zcodeBridge.cjs');
-
-const config = {executable: '/usr/local/bin/pi', mode: 'chat', provider: 'openai', model: 'my-model'};
-
-test('default mode disables all tools and discovered resources', () => {
-    const args = buildArgs(config, '/tmp/sessions', 'abc-123');
-    for (const flag of ['--no-tools', '--no-extensions', '--no-mcp', '--no-context-files']) {
-        assert.ok(args.includes(flag));
-    }
-    assert.equal(args[0], config.executable);
-    assert.equal(args[args.indexOf('--session-id') + 1], 'abc-123');
-    assert.equal(args[args.indexOf('--model') + 1], 'my-model');
-});
-
-test('read only and full are explicit tool allowlists', () => {
-    assert.ok(buildArgs({...config, mode: 'readonly'}, '/tmp/s', 'a').includes('read,grep,find,ls'));
-    assert.ok(buildArgs({...config, mode: 'full'}, '/tmp/s', 'b').includes('read,bash,edit,write'));
-    assert.ok(buildArgs({...config, mode: 'invalid'}, '/tmp/s', 'c').includes('--no-tools'));
-});
 
 test('messages extract text without exposing thinking or tool results', () => {
     assert.equal(messageText({content: [{type: 'thinking', thinking: 'hidden'}, {type: 'text', text: '你好'}]}), '你好');

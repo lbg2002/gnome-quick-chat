@@ -86,20 +86,20 @@ export function getBackendCapabilities(backend) {
                 ],
                 modeBadges: {chat: '纯问答', readonly: '只读沙箱', full: '全自动 Agent'},
             };
-        case 'pi':
+        case 'unconfigured':
             return {
-                supportsTools: true,
+                supportsTools: false,
                 supportsApproval: false,
-                supportsResume: true,
-                supportsThinking: true,
+                supportsResume: false,
+                supportsThinking: false,
                 supportsSkills: false,
                 supportsMcp: false,
                 modeLabels: [
-                    '纯问答 (--no-tools 完全禁用工具)',
-                    '只读白名单 Agent (仅允许 read/grep/find/ls)',
-                    '全自动 Agent (允许 read/bash/edit/write)',
+                    '未配置可用后端 (请在设置中选择或配置引擎)',
+                    '未配置可用后端 (请在设置中选择或配置引擎)',
+                    '未配置可用后端 (请在设置中选择或配置引擎)',
                 ],
-                modeBadges: {chat: '纯问答', readonly: '只读白名单', full: '全自动 Agent'},
+                modeBadges: {chat: '未配置', readonly: '未配置', full: '未配置'},
             };
         default:
             return {
@@ -438,27 +438,6 @@ export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromp
         '[最新问题]',
         newPromptText,
     ].join('\n');
-}
-
-export function buildArgs(config, sessionDir, sessionId) {
-    const mode = config?.mode;
-    const args = [
-        config?.executable || 'pi',
-        '--mode', 'rpc',
-        '--session-dir', sessionDir,
-        '--session-id', sessionId,
-        '--no-extensions',
-        '--no-skills',
-        '--no-prompt-templates',
-        '--no-context-files',
-        '--no-mcp',
-    ];
-    if (mode === 'full') args.push('--tools', 'read,bash,edit,write');
-    else if (mode === 'readonly') args.push('--tools', 'read,grep,find,ls');
-    else args.push('--no-tools');
-    if (config?.provider) args.push('--provider', config.provider);
-    if (config?.model) args.push('--model', config.model);
-    return args;
 }
 
 export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace = '') {

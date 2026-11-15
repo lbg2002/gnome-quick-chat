@@ -1,13 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
   <schema id="org.gnome.shell.extensions.quick-chat" path="/org/gnome/shell/extensions/quick-chat/">
+    <key name="config-version" type="i">
+      <default>0</default>
+      <summary>Schema migration version marker</summary>
+    </key>
+    <key name="migration-notice" type="s">
+      <default>''</default>
+      <summary>Pending one-time user notice after legacy backend migration</summary>
+    </key>
     <key name="backend" type="s">
       <default>'auto'</default>
-      <summary>Backend engine (auto, pi, zcode, codex, openai)</summary>
+      <summary>Backend engine (auto, zcode, codex, openai)</summary>
     </key>
-    <key name="pi-path" type="s">
-      <default>'pi'</default>
-      <summary>Executable name or absolute path</summary>
+    <key name="zcode-path" type="s">
+      <default>''</default>
+      <summary>Custom ZCode CLI executable or zcode.cjs bundle path</summary>
+    </key>
+    <key name="codex-path" type="s">
+      <default>''</default>
+      <summary>Custom Codex CLI executable path</summary>
     </key>
     <key name="provider" type="s">
       <default>''</default>
@@ -17,17 +29,45 @@
       <default>''</default>
       <summary>Model identifier override</summary>
     </key>
+    <key name="zcode-provider" type="s">
+      <default>''</default>
+      <summary>ZCode provider override</summary>
+    </key>
+    <key name="zcode-model" type="s">
+      <default>''</default>
+      <summary>ZCode model override</summary>
+    </key>
+    <key name="zcode-reasoning-effort" type="s">
+      <default>'default'</default>
+      <summary>ZCode reasoning effort preference</summary>
+    </key>
+    <key name="codex-provider" type="s">
+      <default>''</default>
+      <summary>Codex provider override</summary>
+    </key>
+    <key name="codex-model" type="s">
+      <default>''</default>
+      <summary>Codex model override</summary>
+    </key>
+    <key name="codex-reasoning-effort" type="s">
+      <default>'default'</default>
+      <summary>Codex reasoning effort preference</summary>
+    </key>
     <key name="openai-base-url" type="s">
       <default>''</default>
       <summary>OpenAI-compatible API Base URL</summary>
     </key>
     <key name="openai-api-key" type="s">
       <default>''</default>
-      <summary>OpenAI-compatible API Key</summary>
+      <summary>Legacy OpenAI-compatible API Key (migrated to GNOME Keyring)</summary>
     </key>
     <key name="openai-model" type="s">
       <default>''</default>
       <summary>OpenAI-compatible Model ID</summary>
+    </key>
+    <key name="openai-reasoning-effort" type="s">
+      <default>'default'</default>
+      <summary>OpenAI-compatible reasoning effort preference</summary>
     </key>
     <key name="system-prompt" type="s">
       <default>''</default>
@@ -41,10 +81,14 @@
       <default>'default'</default>
       <summary>Thinking / reasoning effort (default, fast, standard, deep)</summary>
     </key>
+    <key name="pi-path" type="s">
+      <default>''</default>
+      <summary>Deprecated legacy executable key kept strictly for one-time upgrade migration</summary>
+    </key>
     <key name="pi-idle-minutes" type="i">
       <range min="0" max="60"/>
-      <default>5</default>
-      <summary>Minutes before reclaiming idle Pi RPC process (0 = never reclaim while enabled)</summary>
+      <default>0</default>
+      <summary>Deprecated legacy key kept strictly for schema upgrade compatibility</summary>
     </key>
     <key name="toggle-shortcut" type="as">
       <default>['&lt;Super&gt;&lt;Shift&gt;q']</default>
