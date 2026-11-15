@@ -16,6 +16,8 @@
  *    from overwriting newer user input, with `flush()` for window close safety.
  */
 
+import {parseUrlPortable} from './permissionPolicy.js';
+
 const LOOPBACK_HOSTS = new Set([
     'localhost',
     '127.0.0.1',
@@ -50,7 +52,7 @@ export function normalizeEndpointKeyIdentity(rawBaseUrl = '') {
     const trimmed = String(rawBaseUrl || '').trim();
     if (!trimmed) return '';
     try {
-        const u = new URL(trimmed);
+        const u = parseUrlPortable(trimmed);
         const protocol = u.protocol.toLowerCase();
         if (protocol !== 'http:' && protocol !== 'https:') {
             return '';
@@ -95,7 +97,7 @@ export function inspectEndpointSecurity(rawBaseUrl = '') {
 
     let parsed;
     try {
-        parsed = new URL(trimmed);
+        parsed = parseUrlPortable(trimmed);
     } catch (_) {
         return {
             isValid: false,
@@ -149,8 +151,8 @@ export function inspectEndpointSecurity(rawBaseUrl = '') {
  */
 export function shouldStripAuthOnRedirect(initialUrl, redirectedUrl) {
     try {
-        const a = new URL(String(initialUrl || ''));
-        const b = new URL(String(redirectedUrl || ''));
+        const a = parseUrlPortable(String(initialUrl || ''));
+        const b = parseUrlPortable(String(redirectedUrl || ''));
         const schemeA = a.protocol.toLowerCase();
         const schemeB = b.protocol.toLowerCase();
         if (schemeA !== schemeB) return true;

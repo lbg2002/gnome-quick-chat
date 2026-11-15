@@ -461,6 +461,184 @@ function isPrivateOrLoopbackHost(hostname) {
     return false;
 }
 
+function decodeQueryComponent(str) {
+    const plusAsSpace = String(str || '').replace(/\+/g, ' ');
+    try {
+        return decodeURIComponent(plusAsSpace);
+    } catch (_) {
+        return plusAsSpace;
+    }
+}
+
+function createPortableSearchParams(rawQuery = '') {
+    const pairs = [];
+    if (rawQuery) {
+        for (const seg of String(rawQuery).split('&')) {
+            if (!seg) continue;
+            const eqIdx = seg.indexOf('=');
+            if (eqIdx >= 0) {
+                pairs.push([
+                    decodeQueryComponent(seg.slice(0, eqIdx)),
+                    decodeQueryComponent(seg.slice(eqIdx + 1)),
+                ]);
+            } else {
+                pairs.push([decodeQueryComponent(seg), '']);
+            }
+        }
+    }
+    return {
+        entries() {
+            return pairs[Symbol.iterator]();
+        },
+    };
+}
+
+/**
+ * Portable, zero-dependency RFC 3986 URL parser compatible with both GJS (where `globalThis.URL`
+ * is absent in GJS 1.80) and Node.js.
+ */
+export function parseUrlPortable(rawInput) {
+    const trimmed = String(rawInput ?? '').trim();
+    if (!trimmed || /[\x00-\x20\x7f\\]/.test(trimmed)) {
+        throw new TypeError('Invalid URL');
+    }
+
+    const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/.exec(trimmed);
+    if (!schemeMatch) {
+        throw new TypeError('Invalid URL');
+    }
+
+    const protocol = `${schemeMatch[1].toLowerCase()}:`;
+    const afterScheme = schemeMatch[2];
+    const requiresHierarchical =
+        protocol === 'http:' ||
+        protocol === 'https:' ||
+        protocol === 'ws:' ||
+        protocol === 'wss:' ||
+        protocol === 'ftp:' ||
+        protocol === 'file:';
+
+    if (!afterScheme.startsWith('//')) {
+        if (requiresHierarchical) {
+            throw new TypeError('Invalid URL');
+        }
+        return {
+            protocol,
+            username: '',
+            password: '',
+            hostname: '',
+            host: '',
+            port: '',
+            pathname: afterScheme,
+            search: '',
+            hash: '',
+            href: `${protocol}${afterScheme}`,
+            searchParams: createPortableSearchParams(''),
+        };
+    }
+
+    let rest = afterScheme.slice(2);
+    const hashIdx = rest.indexOf('#');
+    const hash = hashIdx >= 0 ? rest.slice(hashIdx) : '';
+    if (hashIdx >= 0) rest = rest.slice(0, hashIdx);
+
+    const queryIdx = rest.indexOf('?');
+    const rawQuery = queryIdx >= 0 ? rest.slice(queryIdx + 1) : '';
+    const search = queryIdx >= 0 && rawQuery.length > 0 ? `?${rawQuery}` : '';
+    if (queryIdx >= 0) rest = rest.slice(0, queryIdx);
+
+    const slashIdx = rest.indexOf('/');
+    const authority = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+    const pathname = slashIdx >= 0 ? rest.slice(slashIdx) : '/';
+
+    if (protocol === 'file:') {
+        if (authority && authority.toLowerCase() !== 'localhost') {
+            throw new TypeError('Unsupported non-local file URL authority');
+        }
+        return {
+            protocol: 'file:',
+            username: '',
+            password: '',
+            hostname: '',
+            host: '',
+            port: '',
+            pathname,
+            search,
+            hash,
+            href: `file://${pathname}${search}${hash}`,
+            searchParams: createPortableSearchParams(rawQuery),
+        };
+    }
+
+    let username = '';
+    let password = '';
+    let hostPort = authority;
+    const atIdx = authority.lastIndexOf('@');
+    if (atIdx >= 0) {
+        const userinfo = authority.slice(0, atIdx);
+        hostPort = authority.slice(atIdx + 1);
+        const colonIdx = userinfo.indexOf(':');
+        if (colonIdx >= 0) {
+            username = userinfo.slice(0, colonIdx);
+            password = userinfo.slice(colonIdx + 1);
+        } else {
+            username = userinfo;
+        }
+    }
+
+    let hostname = '';
+    let rawPort = '';
+    if (hostPort.startsWith('[')) {
+        const m6 = /^(\[[0-9a-fA-F:.]+\])(?::(\d*))?$/.exec(hostPort);
+        if (!m6) throw new TypeError('Invalid IPv6 host in URL');
+        hostname = m6[1].toLowerCase();
+        rawPort = m6[2] || '';
+    } else {
+        if (hostPort.includes('[') || hostPort.includes(']')) {
+            throw new TypeError('Invalid host in URL');
+        }
+        const mHost = /^([^:]+)(?::(\d*))?$/.exec(hostPort);
+        if (!mHost) throw new TypeError('Invalid host in URL');
+        hostname = mHost[1].toLowerCase();
+        rawPort = mHost[2] || '';
+    }
+
+    if (!hostname) {
+        throw new TypeError('Empty hostname in URL');
+    }
+
+    let port = '';
+    if (rawPort !== '') {
+        const portNum = Number(rawPort);
+        if (!Number.isInteger(portNum) || portNum < 0 || portNum > 65535) {
+            throw new TypeError('Invalid port in URL');
+        }
+        const isDefault =
+            (protocol === 'https:' && portNum === 443) ||
+            (protocol === 'http:' && portNum === 80);
+        port = isDefault ? '' : String(portNum);
+    }
+
+    const host = port ? `${hostname}:${port}` : hostname;
+    const authPart = username || password
+        ? `${username}${password ? `:${password}` : ''}@`
+        : '';
+
+    return {
+        protocol,
+        username,
+        password,
+        hostname,
+        host,
+        port,
+        pathname,
+        search,
+        hash,
+        href: `${protocol}//${authPart}${host}${pathname}${search}${hash}`,
+        searchParams: createPortableSearchParams(rawQuery),
+    };
+}
+
 export function parseNetworkTarget(rawUrl, extraInput = null) {
     const text = String(rawUrl ?? '').trim();
     if (!text) {
@@ -468,7 +646,7 @@ export function parseNetworkTarget(rawUrl, extraInput = null) {
     }
     let parsed;
     try {
-        parsed = new URL(text);
+        parsed = parseUrlPortable(text);
     } catch (_) {
         return {valid: false, reason: 'URL 无法解析'};
     }

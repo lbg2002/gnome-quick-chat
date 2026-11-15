@@ -10,6 +10,8 @@
  * 4. Explicitly detect oversized current prompts (`preparePromptWithinBudget`) instead of silently dropping text.
  */
 
+import {parseUrlPortable} from './permissionPolicy.js';
+
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = 32000;
 export const DEFAULT_RESERVE_OUTPUT_TOKENS = 4096;
 export const DEFAULT_MAX_HISTORY_MESSAGES = 24;
@@ -84,7 +86,7 @@ function normalizeEndpointForSignature(rawBaseUrl = '') {
     const trimmed = String(rawBaseUrl || '').trim().replace(/\/+$/, '');
     if (!trimmed) return '';
     try {
-        const u = new URL(trimmed);
+        const u = parseUrlPortable(trimmed);
         const portPart = u.port ? `:${u.port}` : '';
         const cleanPath = u.pathname.replace(/\/chat\/completions$/i, '').replace(/\/models$/i, '').replace(/\/+$/, '');
         return `${u.protocol.toLowerCase()}//${u.hostname.toLowerCase()}${portPart}${cleanPath}`;

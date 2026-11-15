@@ -4,6 +4,8 @@
 // Enforces strict file size limits, binary content detection, Wayland explicit-user-selection boundaries,
 // and outbound cloud scope disclosure.
 
+import {parseUrlPortable} from './permissionPolicy.js';
+
 export const MAX_ATTACHMENTS_COUNT = 8;
 export const MAX_ATTACHMENT_FILE_BYTES = 128 * 1024; // 128 KiB per file content
 export const MAX_CLIPBOARD_TEXT_BYTES = 192 * 1024; // 192 KiB per clipboard/log snippet
@@ -97,7 +99,7 @@ export function extractCopiedFilePaths(rawClipboardText) {
         if (line.startsWith('#')) continue;
         if (line.startsWith('file://')) {
             try {
-                const url = new URL(line);
+                const url = parseUrlPortable(line);
                 if (url.protocol !== 'file:') return [];
                 const decoded = decodeURIComponent(url.pathname || '');
                 if (!decoded.startsWith('/')) return [];
@@ -455,7 +457,7 @@ export class AttachmentManager {
             let hostLabel = '远程 API 接口';
             try {
                 if (endpointUrl) {
-                    const u = new URL(endpointUrl);
+                    const u = parseUrlPortable(endpointUrl);
                     hostLabel = u.host || hostLabel;
                 }
             } catch (_) {}
