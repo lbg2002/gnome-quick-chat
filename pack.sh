@@ -22,6 +22,7 @@ gnome-extensions pack . \
   --extra-source=backendClient.js \
   --extra-source=protocol.js \
   --extra-source=zcodeBridge.cjs \
+  --extra-source=backends \
   --extra-source=core \
   --extra-source=runtime \
   --extra-source=ui

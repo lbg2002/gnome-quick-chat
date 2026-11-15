@@ -16,6 +16,7 @@ import {
     migrateGSettingsIfNeeded,
     peekCachedBackendCatalog,
 } from './core/backendDetect.js';
+import {BackendRegistry} from './core/backendRegistry.js';
 import {attachCrossOriginRedirectGuard} from './backendClient.js';
 import {
     SecretWriteQueue,
@@ -50,6 +51,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const s = this.getSettings();
         migrateGSettingsIfNeeded(s);
+        const registry = new BackendRegistry(s);
         window.set_default_size(650, 720);
 
         const hasKey = k => Boolean(s.settings_schema?.has_key?.(k));
@@ -376,48 +378,27 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         const getEffectiveBackend = () => getSelection().effectiveBackend;
 
-        const getActiveProvider = eff => {
-            if (eff === 'zcode') return getStr('zcode-provider', '').trim() || getStr('provider', '').trim();
-            if (eff === 'codex') return getStr('codex-provider', '').trim() || getStr('provider', '').trim();
-            return getStr('provider', '').trim();
-        };
+        const getActiveProvider = eff => registry.getBackendProfile(eff).provider || '';
         const setActiveProvider = (eff, val) => {
-            if (eff === 'zcode') setStr('zcode-provider', val);
-            else if (eff === 'codex') setStr('codex-provider', val);
-            setStr('provider', val);
-        };
-
-        const getActiveModel = eff => {
-            if (eff === 'openai') return getStr('openai-model', '').trim() || getStr('model', '').trim();
-            if (eff === 'zcode') return getStr('zcode-model', '').trim() || getStr('model', '').trim();
-            if (eff === 'codex') return getStr('codex-model', '').trim() || getStr('model', '').trim();
-            return getStr('model', '').trim();
-        };
-        const setActiveModel = (eff, val) => {
-            if (eff === 'openai') setStr('openai-model', val);
-            else if (eff === 'zcode') setStr('zcode-model', val);
-            else if (eff === 'codex') setStr('codex-model', val);
-            if (eff !== 'openai') setStr('model', val);
-        };
-
-        const getActiveEffort = eff => {
-            if (eff === 'zcode') {
-                const v = getStr('zcode-reasoning-effort', 'default').trim();
-                if (v && v !== 'default') return v;
-            } else if (eff === 'codex') {
-                const v = getStr('codex-reasoning-effort', 'default').trim();
-                if (v && v !== 'default') return v;
-            } else if (eff === 'openai') {
-                const v = getStr('openai-reasoning-effort', 'default').trim();
-                if (v && v !== 'default') return v;
+            if (eff === 'zcode' || eff === 'codex') {
+                registry.updateBackendProfile(eff, {provider: val});
             }
-            return getStr('reasoning-effort', 'default').trim() || 'default';
         };
+
+        const getActiveModel = eff => registry.getBackendProfile(eff).model || '';
+        const setActiveModel = (eff, val, {recordRecent = false} = {}) => {
+            if (eff === 'zcode' || eff === 'codex' || eff === 'openai') {
+                registry.updateBackendProfile(eff, {model: val}, {recordRecent});
+            }
+        };
+
+        const getActiveEffort = eff => registry.getBackendProfile(eff).reasoningEffort || 'default';
         const setActiveEffort = (eff, val) => {
-            if (eff === 'zcode') setStr('zcode-reasoning-effort', val);
-            else if (eff === 'codex') setStr('codex-reasoning-effort', val);
-            else if (eff === 'openai') setStr('openai-reasoning-effort', val);
-            setStr('reasoning-effort', val);
+            if (eff === 'zcode' || eff === 'codex' || eff === 'openai') {
+                registry.updateBackendProfile(eff, {reasoningEffort: val});
+            } else {
+                setStr('reasoning-effort', val);
+            }
         };
 
         const providerEntryRow = new Adw.EntryRow({
@@ -524,6 +505,24 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         uiGroup.add(tabRow);
 
+        const fallbackModes = ['auto', 'datemenu', 'panel-button'];
+        const fallbackRow = new Adw.ComboRow({
+            title: '面板挂载方式与兼容回退',
+            subtitle: '默认优先嵌入原生日期菜单；若未来桌面环境定制导致嵌入失败可自动回退为顶栏独立按钮',
+            model: Gtk.StringList.new([
+                '自动嵌入日期菜单（失败时回退独立顶栏按钮）',
+                '仅嵌入原生日期菜单（不显示独立按钮）',
+                '独立顶栏按钮模式 (PanelMenu.Button)',
+            ]),
+        });
+        if (hasKey('panel-fallback-mode')) {
+            fallbackRow.selected = Math.max(0, fallbackModes.indexOf(getStr('panel-fallback-mode', 'auto')));
+            fallbackRow.connect('notify::selected', () => {
+                setStr('panel-fallback-mode', fallbackModes[fallbackRow.selected] || 'auto');
+            });
+            uiGroup.add(fallbackRow);
+        }
+
         const widthRow = new Adw.SpinRow({
             title: '面板宽度 (px)',
             subtitle: '同时固定随问与通知栏宽度，防止切换标签时日历抖动',
@@ -573,7 +572,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // --- Group 3: CLI Agent 权限与路径 ---
         const agentGroup = new Adw.PreferencesGroup({
             title: 'CLI Agent 权限与环境',
-            description: '根据当前所选后端动态适配工具、沙箱与交互式审批能力。',
+            description: '根据当前所选后端独立保存工具模式与工作目录偏好，切换引擎时自动恢复。',
         });
         uiPage.add(agentGroup);
 
@@ -587,7 +586,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             title: 'Agent 权限模式',
             model: modeComboModel,
         });
-        modeRow.selected = Math.max(0, modes.indexOf(getStr('agent-mode', 'readonly')));
+        modeRow.selected = Math.max(
+            0,
+            modes.indexOf(registry.getBackendProfile(getEffectiveBackend()).mode || 'readonly')
+        );
 
         const confirmEnableFullMode = onResult => {
             const heading = '确认开启高权限「全自动 Agent」模式？';
@@ -623,13 +625,22 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             dlg.present();
         };
 
+        const applyBackendMode = (eff, chosenMode) => {
+            if (eff === 'zcode' || eff === 'codex') {
+                registry.updateBackendProfile(eff, {mode: chosenMode});
+            } else {
+                setStr('agent-mode', chosenMode);
+            }
+        };
+
         modeRow.connect('notify::selected', () => {
             if (syncingModeCombo) return;
-            const prevMode = getStr('agent-mode', 'readonly') || 'readonly';
+            const eff = getEffectiveBackend();
+            const prevMode = registry.getBackendProfile(eff).mode || 'readonly';
             let chosenMode = modes[modeRow.selected] || 'readonly';
 
             // Codex CLI has no true tool-disabling flag; never pretend prompt text is a sandbox!
-            if (chosenMode === 'chat' && getEffectiveBackend() === 'codex') {
+            if (chosenMode === 'chat' && eff === 'codex') {
                 chosenMode = 'readonly';
                 syncingModeCombo = true;
                 modeRow.selected = modes.indexOf('readonly');
@@ -640,7 +651,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 const revertIdx = Math.max(0, modes.indexOf(prevMode));
                 confirmEnableFullMode(confirmed => {
                     if (confirmed) {
-                        setStr('agent-mode', 'full');
+                        applyBackendMode(getEffectiveBackend(), 'full');
                         syncBackendCapabilitiesUi(getEffectiveBackend());
                     } else {
                         syncingModeCombo = true;
@@ -651,8 +662,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 return;
             }
 
-            setStr('agent-mode', chosenMode);
-            syncBackendCapabilitiesUi(getEffectiveBackend());
+            applyBackendMode(eff, chosenMode);
+            syncBackendCapabilitiesUi(eff);
         });
         agentGroup.add(modeRow);
 
@@ -663,7 +674,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             s.bind('zcode-path', zcodePathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
         }
         zcodePathRow.add_suffix(makeResetButton('清空自定义 ZCode 路径', () => setStr('zcode-path', '')));
-        zcodePathRow.connect('notify::text', () => rebuildProviderAndModelUi());
+        zcodePathRow.connect('notify::text', () => {
+            invalidateBackendDetectionCaches();
+            registry.bumpGeneration();
+            rebuildProviderAndModelUi();
+        });
         agentGroup.add(zcodePathRow);
 
         const codexPathRow = new Adw.EntryRow({
@@ -673,14 +688,31 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             s.bind('codex-path', codexPathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
         }
         codexPathRow.add_suffix(makeResetButton('清空自定义 Codex 路径', () => setStr('codex-path', '')));
-        codexPathRow.connect('notify::text', () => rebuildProviderAndModelUi());
+        codexPathRow.connect('notify::text', () => {
+            invalidateBackendDetectionCaches();
+            registry.bumpGeneration();
+            rebuildProviderAndModelUi();
+        });
         agentGroup.add(codexPathRow);
 
+        let syncingWorkspace = false;
         const workspaceRow = new Adw.EntryRow({
-            title: 'Agent 工作目录 (留空默认使用主目录 ~)',
+            title: '当前后端工作目录 (留空默认使用主目录 ~)',
         });
-        s.bind('workspace', workspaceRow, 'text', Gio.SettingsBindFlags.DEFAULT);
-        workspaceRow.add_suffix(makeResetButton('恢复默认主目录', () => setStr('workspace', '')));
+        workspaceRow.text = registry.getBackendProfile(getEffectiveBackend()).workspace || '';
+        workspaceRow.connect('notify::text', () => {
+            if (syncingWorkspace) return;
+            const eff = getEffectiveBackend();
+            const val = workspaceRow.text.trim();
+            if (eff === 'zcode' || eff === 'codex') {
+                registry.updateBackendProfile(eff, {workspace: val});
+            } else {
+                setStr('workspace', val);
+            }
+        });
+        workspaceRow.add_suffix(makeResetButton('恢复默认主目录', () => {
+            workspaceRow.text = '';
+        }));
         agentGroup.add(workspaceRow);
 
         // --- Group 4: 隐私与本地历史管理 ---
@@ -758,7 +790,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         let catalogBgGen = 0;
 
         const syncBackendCapabilitiesUi = eff => {
-            const rawMode = getStr('agent-mode', 'readonly') || 'readonly';
+            const profile = registry.getBackendProfile(eff);
+            const rawMode = profile.mode || 'readonly';
             const modeInfo = normalizeEffectiveAgentMode(eff, rawMode);
             const caps = getBackendCapabilities(eff, modeInfo.effectiveMode);
             const displayMode = eff === 'codex' && rawMode === 'chat' ? 'readonly' : rawMode;
@@ -767,6 +800,14 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             modeComboModel.splice(0, modeComboModel.get_n_items(), caps.modeLabels);
             modeRow.selected = curModeIdx;
             syncingModeCombo = false;
+
+            const desiredWorkspace = profile.workspace || '';
+            if (workspaceRow.text !== desiredWorkspace) {
+                syncingWorkspace = true;
+                workspaceRow.text = desiredWorkspace;
+                syncingWorkspace = false;
+            }
+            workspaceRow.sensitive = eff === 'zcode' || eff === 'codex';
 
             modeRow.sensitive = caps.supportsTools;
             if (eff === 'unconfigured') {
@@ -795,8 +836,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             );
             if (owner) {
                 const exactModel = owner.models.find(m => m.toLowerCase() === curProv.toLowerCase()) || curProv;
-                setActiveProvider(eff, owner.id);
-                setActiveModel(eff, exactModel);
+                registry.updateBackendProfile(eff, {provider: owner.id, model: exactModel});
             }
         };
 
@@ -946,12 +986,16 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             if (nextSlot !== activeSecretEndpointSlot) {
                 // Flush any pending key edit to its original endpoint BEFORE switching to the new endpoint!
                 flushPendingDebouncedSave();
+                ++modelsRefreshGeneration;
+                registry.bumpGeneration();
                 onlineOpenAIModels = [];
                 if (hasKey('openai-cached-models')) {
                     s.set_strv('openai-cached-models', []);
                 }
                 invalidateBackendDetectionCaches();
                 try { activeModelsCancellable?.cancel?.(); } catch (_) {}
+                refreshBtn.sensitive = true;
+                refreshBtnContent.label = '查询 / 刷新模型';
                 loadSecretForCurrentEndpoint();
             }
             rebuildProviderAndModelUi();
@@ -960,8 +1004,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         backendRow.connect('notify::selected', () => {
             const next = backends[backendRow.selected] || 'auto';
             if (getStr('backend', 'auto') !== next) {
-                setStr('backend', next);
-                setStr('migration-notice', '');
+                ++modelsRefreshGeneration;
+                try { activeModelsCancellable?.cancel?.(); } catch (_) {}
+                refreshBtn.sensitive = true;
+                refreshBtnContent.label = '查询 / 刷新模型';
+                registry.selectBackend(next, {clearMigrationNotice: true});
                 syncNoticeBanner();
             }
             rebuildProviderAndModelUi();
@@ -984,16 +1031,20 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const eff = getEffectiveBackend();
             const idx = modelComboRow.selected;
             const val = idx >= 0 && idx < modelValues.length ? modelValues[idx] : '';
-            setActiveModel(eff, val);
+            let nextProv = getActiveProvider(eff);
             if (val && eff !== 'openai' && eff !== 'unconfigured') {
-                const curProv = getActiveProvider(eff);
-                const currentProvObj = currentCatalog.providers.find(p => p.id === curProv);
+                const currentProvObj = currentCatalog.providers.find(p => p.id === nextProv);
                 if (!currentProvObj || !currentProvObj.models.includes(val)) {
                     const owner = currentCatalog.providers.find(p => p.models.includes(val));
                     if (owner) {
-                        setActiveProvider(eff, owner.id);
+                        nextProv = owner.id;
                     }
                 }
+            }
+            if (eff === 'zcode' || eff === 'codex') {
+                registry.updateBackendProfile(eff, {provider: nextProv, model: val}, {recordRecent: Boolean(val)});
+            } else {
+                setActiveModel(eff, val, {recordRecent: Boolean(val)});
             }
             rebuildProviderAndModelUi();
         });
@@ -1013,13 +1064,14 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const eff = getEffectiveBackend();
             const val = modelEntryRow.text.trim();
             if (getActiveModel(eff) !== val) {
-                setActiveModel(eff, val);
+                setActiveModel(eff, val, {recordRecent: Boolean(val)});
                 rebuildModelDropdown();
             }
         });
 
         refreshBtn.connect('clicked', async () => {
             const reqGen = ++modelsRefreshGeneration;
+            const configGenSnapshot = registry.generation;
             try { activeModelsCancellable?.cancel?.(); } catch (_) {}
             const reqCancellable = new Gio.Cancellable();
             activeModelsCancellable = reqCancellable;
@@ -1039,14 +1091,17 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 const curProv = getActiveProvider(eff);
                 targetProviderObj = (curProv && currentCatalog.providers.find(p => p.id === curProv))
                     || currentCatalog.providers.find(p => p.baseUrl);
-                // Only query local CLI provider endpoints that do not require persisted plaintext keys
                 if (targetProviderObj?.baseUrl && targetProviderObj.apiKey) {
                     targetBaseUrl = targetProviderObj.baseUrl;
                     targetApiKey = targetProviderObj.apiKey;
                 }
             }
 
-            if (reqGen !== modelsRefreshGeneration || reqCancellable.is_cancelled()) {
+            if (
+                reqGen !== modelsRefreshGeneration ||
+                configGenSnapshot !== registry.generation ||
+                reqCancellable.is_cancelled()
+            ) {
                 return;
             }
 
@@ -1060,6 +1115,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 return;
             }
 
+            const targetEndpointSlot = normalizeEndpointKeyIdentity(targetBaseUrl);
             const modelsUrl = normalizeOpenAIEndpoint(targetBaseUrl, '/models');
             refreshBtn.sensitive = false;
             refreshBtnContent.label = '查询中…';
@@ -1080,7 +1136,12 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             }
 
             session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, reqCancellable, (sess, res) => {
-                if (reqGen !== modelsRefreshGeneration) {
+                if (
+                    reqGen !== modelsRefreshGeneration ||
+                    configGenSnapshot !== registry.generation ||
+                    ((eff === 'openai' || eff === 'unconfigured') &&
+                        normalizeEndpointKeyIdentity(getStr('openai-base-url', '').trim()) !== targetEndpointSlot)
+                ) {
                     return;
                 }
                 refreshBtn.sensitive = true;
@@ -1107,9 +1168,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                         if (hasKey('openai-cached-models')) {
                             s.set_strv('openai-cached-models', ids.slice(0, 120));
                         }
-                        // User-selected model ALWAYS takes precedence over models[0]!
                         if (!preferred && parsed.selectedModel) {
-                            setStr('openai-model', parsed.selectedModel);
+                            registry.updateBackendProfile('openai', {model: parsed.selectedModel});
                         }
                         rebuildProviderAndModelUi(`✓ 连接成功：从 ${modelsUrl} 拉取到 ${ids.length} 个在线模型`, true);
                     } else {

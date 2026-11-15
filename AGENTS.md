@@ -21,8 +21,8 @@
 | B | P0 | 审批安全、回合状态、子进程取消 | 权限不扩大、回合隔离、失败准确 | ✅ 已完成 |
 | C | P0/P1 | 会话数据一致性、流协议与密钥 | 历史正确、流终止可靠、密钥不泄露 | ✅ 已完成 |
 | D | P1 | GNOME 主线程与长文本性能 | 有可复现性能数据及回归测试 | ✅ 已完成（纯 JS 流式解析/调度基准已通过，GNOME 50 桌面实测见第 8 节人工验收） |
-| E | P1 | 模块化、配置和 GNOME 生命周期 | 可维护、可独立测试、安装可回滚 | 进行中 |
-| F | P2 | 桌面上下文、快捷动作、会话恢复 | 提升日常使用效率，不增加常驻负担 | 待实施 |
+| E | P1 | 模块化、配置和 GNOME 生命周期 | 可维护、可独立测试、安装可回滚 | ✅ 已完成 |
+| F | P2 | 桌面上下文、快捷动作、会话恢复 | 提升日常使用效率，不增加常驻负担 | 进行中 |
 
 优先完成 A–C 再做功能扩展。D、E 可按实际依赖拆分穿插实施。不得在安全和数据一致性未解决前默认启用更强权限或复杂自动化。
 
@@ -190,7 +190,7 @@
 - [x] ZCode 配置覆盖异步读取、生成、安全写入，缓存不含需要持久化的明文 Key；设置变更时失效。控制配置文件体积及 JSON 解析开销。
 - [x] 若 GJS 主线程仍出现明显抖动，再考虑独立进程处理高开销任务；当前阶段不新增后台守护进程。
 
-## 6. E：模块化、设置和 GNOME 集成（P1）
+## 6. E：模块化、设置和 GNOME 集成（P1）— ✅ 已完成
 
 建议逐步从约 2900 行 extension.js、1070 行 piClient.js、1100 行 protocol.js 拆分，避免一次性大重写：
 
@@ -218,15 +218,15 @@
       tracePanel.js
       markdownRenderer.js
 
-- 接口统一：initialize/configure、getCapabilities、getModels、restoreSession、sendMessage(turn)、cancel(turnId)、respondPermission(request)、dispose。仅支持相应能力的适配器实现审批；事件规范与会话逻辑共享。
-- BackendRegistry 独立管理三后端配置：executable、provider、model、reasoning effort、workspace/模式偏好；OpenAI 增加 base URL 和独立密钥。切换恢复上次所选配置，避免原模型污染另一后端。
-- GSettings 变更批量提交、单次重连；设置拉取模型请求具有取消器及配置 generation，避免旧端点响应覆盖新端点。显示实际连接状态/模型，而不是猜测。
-- dateMenuIntegration.js mount/unmount（18–69、98–132）：采用事务式挂载与完整回滚，原生 messageList 被移除但 wrapper 尚未挂载也必须恢复。记录原 parent、index、visible、opacity、translation、样式等；不盲目强制原生可见性。兼容 GNOME 锁屏及原生通知状态变化。
-- 尽量避免操作私有 layout_manager._frozen；必须使用时记录/恢复且验证不会破坏 GNOME 自身分配。无法嵌入时可选独立 PanelMenu.Button 回退；失败时保留原生日期菜单并提供诊断，不导致整个 Shell 异常。
-- extension.js disable：移除所有 signal、timeout、idle、动画、快捷键，清理 actor 引用；enable 失败也完整回滚。Clipboard 回调、异步 keyring、历史分页滚动回调需 generation 与锁屏检查；不得在卸载后或新生命周期操作旧 Actor。
-- install.sh 当前 rm -rf dest 再 mv staging 并非原子替换：增加锁、同文件系统暂存、旧版本备份、失败回滚、实际启用结果提示。避免修改用户其他扩展状态。
-- uninstall.sh --purge 清理本扩展 GSettings（在 schema 可用时）、数据目录、XDG_RUNTIME_DIR 与 XDG_CACHE_HOME 回退目录及本扩展专属 Keyring 项；删除失败报告失败。普通卸载保留历史；不删除外部 CLI 数据。不要用过宽属性清除其他应用凭据。
-- 保持 metadata、README、docs、package.json 版本和打包内容一致；CI 验证标准包文件清单与 schema。需要 GNOME 50 实际支持证据，不盲目添加其他 Shell 版本。
+- [x] 接口统一：initialize/configure、getCapabilities、getModels、restoreSession、sendMessage(turn)、cancel(turnId)、respondPermission(request)、dispose。仅支持相应能力的适配器实现审批；事件规范与会话逻辑共享。
+- [x] BackendRegistry 独立管理三后端配置：executable、provider、model、reasoning effort、workspace/模式偏好；OpenAI 增加 base URL 和独立密钥。切换恢复上次所选配置，避免原模型污染另一后端。
+- [x] GSettings 变更批量提交、单次重连；设置拉取模型请求具有取消器及配置 generation，避免旧端点响应覆盖新端点。显示实际连接状态/模型，而不是猜测。
+- [x] dateMenuIntegration.js mount/unmount（18–69、98–132）：采用事务式挂载与完整回滚，原生 messageList 被移除但 wrapper 尚未挂载也必须恢复。记录原 parent、index、visible、opacity、translation、样式等；不盲目强制原生可见性。兼容 GNOME 锁屏及原生通知状态变化。
+- [x] 尽量避免操作私有 layout_manager._frozen；必须使用时记录/恢复且验证不会破坏 GNOME 自身分配。无法嵌入时可选独立 PanelMenu.Button 回退；失败时保留原生日期菜单并提供诊断，不导致整个 Shell 异常。
+- [x] extension.js disable：移除所有 signal、timeout、idle、动画、快捷键，清理 actor 引用；enable 失败也完整回滚。Clipboard 回调、异步 keyring、历史分页滚动回调需 generation 与锁屏检查；不得在卸载后或新生命周期操作旧 Actor。
+- [x] install.sh 当前 rm -rf dest 再 mv staging 并非原子替换：增加锁、同文件系统暂存、旧版本备份、失败回滚、实际启用结果提示。避免修改用户其他扩展状态。
+- [x] uninstall.sh --purge 清理本扩展 GSettings（在 schema 可用时）、数据目录、XDG_RUNTIME_DIR 与 XDG_CACHE_HOME 回退目录及本扩展专属 Keyring 项；删除失败报告失败。普通卸载保留历史；不删除外部 CLI 数据。不要用过宽属性清除其他应用凭据。
+- [x] 保持 metadata、README、docs、package.json 版本和打包内容一致；CI 验证标准包文件清单与 schema。需要 GNOME 50 实际支持证据，不盲目添加其他 Shell 版本。
 
 ## 7. F：功能增强（P2，稳定后执行）
 

@@ -8,7 +8,7 @@ on:
 
 jobs:
   verify:
-    name: Syntax, Schema & Unit Tests
+    name: Syntax, Schema, Manifest & Unit Tests
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -19,19 +19,48 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install GLib schema compiler
+      - name: Install GLib schema compiler & GJS runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libglib2.0-bin
+          sudo apt-get install -y --no-install-recommends libglib2.0-bin gjs
 
       - name: Check JS / CJS syntax
         run: |
-          for f in extension.js prefs.js backendClient.js protocol.js zcodeBridge.cjs core/*.js runtime/*.js ui/*.js tests/*.js; do
+          for f in extension.js prefs.js backendClient.js protocol.js zcodeBridge.cjs backends/*.js core/*.js runtime/*.js ui/*.js tests/*.js; do
             node --check "$f"
           done
+
+      - name: Check shell script syntax
+        run: bash -n install.sh uninstall.sh pack.sh
 
       - name: Validate GSettings XML schema strictly
         run: glib-compile-schemas --strict --dry-run schemas
 
-      - name: Run automated unit & state-machine tests
+      - name: Verify package manifest & forbidden legacy artifacts
+        run: |
+          test ! -e piClient.js
+          grep -Fq -- '--extra-source=backends' pack.sh
+          grep -Fq -- '--extra-source=core' pack.sh
+          grep -Fq -- '--extra-source=runtime' pack.sh
+          grep -Fq -- '--extra-source=ui' pack.sh
+          python3 - << 'PY'
+          import json
+          meta = json.load(open('metadata.json', encoding='utf-8'))
+          assert meta['uuid'] == 'quick-chat@lbg2002.github.io'
+          assert meta['settings-schema'] == 'org.gnome.shell.extensions.quick-chat'
+          assert meta['shell-version'] == ['50'], f"Expected GNOME 50 only, got {meta['shell-version']}"
+          PY
+
+      - name: Run headless GJS pure-module smoke check
+        run: |
+          gjs -m -c "
+            import {BackendRegistry, MemorySettingsStore} from './core/backendRegistry.js';
+            import {detectBackendSelection} from './core/backendDetect.js';
+            const s = new MemorySettingsStore({backend: 'openai', 'openai-base-url': 'https://api.example.com/v1'});
+            const reg = new BackendRegistry(s);
+            const sel = detectBackendSelection({configuredBackend: reg.getConfiguredBackend(), openaiBaseUrl: 'https://api.example.com/v1'});
+            if (sel.effectiveBackend !== 'openai') throw new Error('Unexpected backend in GJS smoke check');
+          "
+
+      - name: Run automated unit, security, streaming & lifecycle tests
         run: npm test

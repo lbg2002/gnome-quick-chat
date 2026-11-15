@@ -1,8 +1,22 @@
+import Clutter from 'gi://Clutter';
+import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import {
+    executeDateMenuMountTransaction,
+    nudgeContainerLayoutSafely,
+    restoreNativeActorFromSnapshot,
+} from '../core/dateMenuTransaction.js';
 
 /**
- * Isolates all GNOME Shell 50 DateMenu private field interactions in one guarded adapter.
- * Performs strict existence checks before mounting and cleanly restores native state on unmount.
+ * GNOME Shell 50 DateMenu Integration & Fallback PanelMenu Adapter (Stage E).
+ * - Uses an all-or-nothing transaction (`executeDateMenuMountTransaction`) recording full native
+ *   `parent`, `index`, `visible`, `opacity`, `translation_x`, `translation_y`, `scale`, and style
+ *   classes BEFORE mutating DateMenu, rolling back completely on any partial failure.
+ * - Never mutates private `layout_manager._frozen` by default.
+ * - Provides an optional standalone `PanelMenu.Button` fallback (`panel-fallback-mode` =
+ *   `auto` | `datemenu` | `panel-button`) so Quick Chat still works cleanly without crashing
+ *   GNOME Shell even if DateMenu internals change in future desktop customizations.
  */
 export class DateMenuIntegration {
     constructor() {
@@ -10,61 +24,95 @@ export class DateMenuIntegration {
         this.nativeMessageList = null;
         this.parentBox = null;
         this.insertIndex = -1;
-        this.originalVisible = true;
+        this._snapshot = null;
         this._nativeVisibleGuard = 0;
+        this._fallbackButton = null;
         this.mounted = false;
+        this.mountMode = 'unmounted'; // 'datemenu' | 'panel-button' | 'unmounted'
+        this.lastMountError = '';
     }
 
-    mount(wrapperActor, shouldForceHideNativeFn) {
+    get menu() {
+        if (this.mountMode === 'panel-button') {
+            return this._fallbackButton?.menu || null;
+        }
+        return this.dateMenu?.menu || null;
+    }
+
+    _currentSessionState() {
+        return {
+            hasNotifications: Boolean(Main.sessionMode?.hasNotifications ?? true),
+            isLocked: Boolean(Main.sessionMode?.isLocked),
+            isGreeter: Boolean(Main.sessionMode?.isGreeter),
+        };
+    }
+
+    mount(wrapperActor, shouldForceHideNativeFn, {fallbackMode = 'auto'} = {}) {
+        this.lastMountError = '';
+
+        if (fallbackMode === 'panel-button') {
+            return this._mountFallbackPanelButton(wrapperActor);
+        }
+
         const dateMenu = Main.panel?.statusArea?.dateMenu;
-        if (!dateMenu || !dateMenu.menu) {
-            console.warn('[Quick Chat] DateMenu unavailable on Main.panel.statusArea; skipping UI mount.');
-            return false;
-        }
+        const tx = executeDateMenuMountTransaction({
+            dateMenu,
+            wrapperActor,
+            shouldForceHideNativeFn: () => Boolean(this.mounted && shouldForceHideNativeFn?.()),
+            sessionState: this._currentSessionState(),
+        });
 
-        const nativeList = dateMenu._messageList;
-        if (!nativeList || typeof nativeList.get_parent !== 'function') {
-            console.warn('[Quick Chat] DateMenu._messageList structure changed; skipping UI mount safely.');
-            return false;
-        }
-
-        const parent = nativeList.get_parent();
-        if (!parent || typeof parent.get_children !== 'function' || typeof parent.insert_child_at_index !== 'function') {
-            console.warn('[Quick Chat] DateMenu parent container incompatible; skipping UI mount safely.');
-            return false;
-        }
-
-        const children = parent.get_children();
-        const index = children.indexOf(nativeList);
-        if (index < 0) {
-            console.warn('[Quick Chat] Could not locate _messageList index in DateMenu container.');
-            return false;
-        }
-
-        this.dateMenu = dateMenu;
-        this.nativeMessageList = nativeList;
-        this.parentBox = parent;
-        this.insertIndex = index;
-        this.originalVisible = Boolean(nativeList.visible);
-
-        try {
-            parent.remove_child(nativeList);
-            nativeList.add_style_class_name('qc-native-clean');
-            wrapperActor.add_child(nativeList);
-            parent.insert_child_at_index(wrapperActor, index);
-
-            this._nativeVisibleGuard = nativeList.connect('notify::visible', () => {
-                if (this.mounted && shouldForceHideNativeFn?.() && nativeList.visible) {
-                    nativeList.visible = false;
-                }
-            });
-
+        if (tx.ok) {
+            this.dateMenu = dateMenu;
+            this.nativeMessageList = tx.nativeList;
+            this.parentBox = tx.parentBox;
+            this.insertIndex = tx.insertIndex;
+            this._snapshot = tx.snapshot;
+            this._nativeVisibleGuard = tx.guardSignalId;
             this.mounted = true;
-            this.nudgeLayout();
+            this.mountMode = 'datemenu';
+            return true;
+        }
+
+        this.lastMountError = tx.error || tx.reason || 'DateMenu mount failed';
+        console.warn(`[Quick Chat] DateMenu mount skipped (${tx.reason}): ${this.lastMountError}`);
+
+        if (fallbackMode === 'auto') {
+            return this._mountFallbackPanelButton(wrapperActor);
+        }
+        return false;
+    }
+
+    _mountFallbackPanelButton(wrapperActor) {
+        try {
+            if (!Main.panel || typeof Main.panel.addToStatusArea !== 'function') {
+                this.lastMountError = this.lastMountError || 'Main.panel.addToStatusArea unavailable';
+                return false;
+            }
+            const btn = new PanelMenu.Button(0.5, 'Quick Chat · 随问', false);
+            const label = new St.Label({
+                text: '✦ 随问',
+                y_align: Clutter.ActorAlign.CENTER,
+                style_class: 'qc-panel-fallback-label',
+            });
+            btn.add_child(label);
+            btn.menu.box.add_child(wrapperActor);
+            Main.panel.addToStatusArea('quick-chat', btn);
+
+            this._fallbackButton = btn;
+            this.dateMenu = btn; // exposes `.menu` uniformly
+            this.nativeMessageList = null;
+            this.parentBox = btn.menu.box;
+            this.mounted = true;
+            this.mountMode = 'panel-button';
             return true;
         } catch (err) {
-            console.error(`[Quick Chat] Failed to mount into DateMenu safely: ${err.message}`);
-            this.unmount(wrapperActor);
+            this.lastMountError = err?.message || String(err);
+            console.error(`[Quick Chat] Fallback PanelMenu.Button mount failed: ${this.lastMountError}`);
+            try { this._fallbackButton?.destroy?.(); } catch (_) {}
+            this._fallbackButton = null;
+            this.mounted = false;
+            this.mountMode = 'unmounted';
             return false;
         }
     }
@@ -75,24 +123,9 @@ export class DateMenuIntegration {
         } catch (_) {}
     }
 
-    /**
-     * Safely nudges DateMenu layout allocation when switching tabs or resizing,
-     * guarding internal `_frozen` access behind defensive checks.
-     */
     nudgeLayout() {
         if (!this.mounted || !this.parentBox) return;
-        try {
-            const bin = this.parentBox.get_parent?.();
-            const lm = bin?.layout_manager;
-            if (lm) {
-                if ('_frozen' in lm && lm._frozen) {
-                    lm._frozen = false;
-                }
-                lm.layout_changed?.();
-            }
-            bin?.queue_relayout?.();
-            this.parentBox.queue_relayout?.();
-        } catch (_) {}
+        nudgeContainerLayoutSafely(this.parentBox, {allowTemporaryUnfreeze: false});
     }
 
     unmount(wrapperActor) {
@@ -101,33 +134,41 @@ export class DateMenuIntegration {
             this._nativeVisibleGuard = 0;
         }
 
-        if (wrapperActor && this.parentBox) {
+        if (this.mountMode === 'panel-button' && this._fallbackButton) {
             try {
-                if (this.nativeMessageList && this.nativeMessageList.get_parent() === wrapperActor) {
-                    wrapperActor.remove_child(this.nativeMessageList);
-                    this.nativeMessageList.remove_style_class_name('qc-native-clean');
-                    const maxIdx = this.parentBox.get_n_children?.() ?? 0;
-                    const restoreIdx = Math.min(Math.max(0, this.insertIndex), maxIdx);
-                    this.parentBox.insert_child_at_index(this.nativeMessageList, restoreIdx);
-                    this.nativeMessageList.opacity = 255;
-                    this.nativeMessageList.translation_y = 0;
-                    this.nativeMessageList.visible =
-                        Main.sessionMode.hasNotifications && !Main.sessionMode.isGreeter
-                            ? true
-                            : this.originalVisible;
+                if (wrapperActor && wrapperActor.get_parent?.() === this._fallbackButton.menu?.box) {
+                    this._fallbackButton.menu.box.remove_child(wrapperActor);
                 }
-            } catch (err) {
-                console.warn(`[Quick Chat] Error restoring native DateMenu list: ${err.message}`);
+            } catch (_) {}
+            try { this._fallbackButton.destroy(); } catch (_) {}
+            this._fallbackButton = null;
+        } else if (this.nativeMessageList && this._snapshot) {
+            try {
+                this.nativeMessageList.remove_all_transitions?.();
+            } catch (_) {}
+            const res = restoreNativeActorFromSnapshot(
+                this.nativeMessageList,
+                wrapperActor,
+                this._snapshot,
+                this._currentSessionState()
+            );
+            if (!res.restored && res.error) {
+                console.warn(`[Quick Chat] Error restoring native DateMenu list: ${res.error}`);
             }
+            nudgeContainerLayoutSafely(this.parentBox, {allowTemporaryUnfreeze: false});
         }
 
         this.mounted = false;
-        this.nudgeLayout();
-        try { wrapperActor?.destroy?.(); } catch (_) {}
+        this.mountMode = 'unmounted';
+        try {
+            wrapperActor?.remove_all_transitions?.();
+            wrapperActor?.destroy?.();
+        } catch (_) {}
 
         this.dateMenu = null;
         this.nativeMessageList = null;
         this.parentBox = null;
         this.insertIndex = -1;
+        this._snapshot = null;
     }
 }
