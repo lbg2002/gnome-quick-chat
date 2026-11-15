@@ -12,7 +12,7 @@ import {
     mapReasoningEffort,
     normalizeEffectiveAgentMode,
     normalizeOpenAIEndpoint,
-    parseOpenAISSELine,
+    preparePromptWithinBudget,
 } from './protocol.js';
 import {
     buildSearchPath,
@@ -30,6 +30,10 @@ import {
     removeFileQuietly,
     writePrivateFileSync,
 } from './core/paths.js';
+import {
+    inspectEndpointSecurity,
+    shouldStripAuthOnRedirect,
+} from './core/secretPolicy.js';
 import {SessionStore} from './core/sessionStore.js';
 import {TurnController} from './core/turnController.js';
 import {
@@ -44,12 +48,38 @@ import {
     validateCliPromptLength,
     wrapArgvWithSetsid,
 } from './runtime/cliProcessRunner.js';
+import {
+    DEFAULT_SSE_LIMITS,
+    OpenAISseParser,
+    formatSanitizedHttpError,
+    parseModelsResponse,
+    redactSensitiveText,
+    resolveSplitTimeouts,
+    supportsOpenAIReasoningEffort,
+} from './runtime/sseParser.js';
 
 export {buildSearchPath, findExecutableInDirs};
 
 const Encoder = new TextEncoder();
 const Decoder = new TextDecoder('utf-8');
-const DEFAULT_APPROVAL_TIMEOUT_SEC = 300;
+
+/**
+ * Strips the `Authorization` header automatically if an HTTP 30x redirect crosses origins
+ * or downgrades `https://` -> `http://` (Stage C4).
+ */
+export function attachCrossOriginRedirectGuard(msg, initialUrl) {
+    if (!msg || typeof msg.connect !== 'function') return 0;
+    return msg.connect('restarted', m => {
+        try {
+            const nextUri = m.get_uri?.()?.to_string?.() || '';
+            if (shouldStripAuthOnRedirect(initialUrl, nextUri)) {
+                m.get_request_headers?.()?.remove?.('Authorization');
+            }
+        } catch (_) {
+            try { m.get_request_headers?.()?.remove?.('Authorization'); } catch (__) {}
+        }
+    });
+}
 
 function resolveKillExecutable() {
     if (GLib.file_test('/bin/kill', GLib.FileTest.IS_EXECUTABLE)) return '/bin/kill';
@@ -364,14 +394,40 @@ export class BackendClient {
         this._sessionId = sessionId;
         this._clientGeneration = Number(options.clientGeneration || 0);
         this._specialDirs = getUserSpecialDirs();
+        this._timeouts = resolveSplitTimeouts(config);
         cleanupStaleRuntimeFiles();
         this._runtime = resolveBackendRuntime(config);
         this._backend = this._runtime.backend;
 
         if (this._backend === 'openai') {
-            this._httpSession = new Soup.Session({timeout: 120});
+            // Keep default strict TLS verification enabled; socket idle bounded by streamIdleTimeoutSec
+            this._httpSession = new Soup.Session({
+                timeout: this._timeouts.streamIdleTimeoutSec,
+            });
+            this._runtime.modelMetadata = {};
         }
-        this._store = new SessionStore(sessionId);
+        this._store = new SessionStore(sessionId, {
+            onSaveError: errInfo => {
+                if (!this._closed) {
+                    this._event({
+                        type: 'session_save_error',
+                        sessionId: errInfo.sessionId,
+                        message: errInfo.message || '历史未保存',
+                        clientGeneration: this._clientGeneration,
+                    });
+                }
+            },
+        });
+    }
+
+    _getSessionContextConfig() {
+        return {
+            ...(this._config || {}),
+            resolvedProvider: this._runtime?.resolvedProvider || '',
+            resolvedModel: this._runtime?.resolvedModel || '',
+            resolvedWorkspace: this._workspace || '',
+            effectiveMode: this._runtime?.effectiveModeInfo?.effectiveMode || (this._config?.mode || 'readonly'),
+        };
     }
 
     revokeApprovedScopes() {
@@ -410,10 +466,13 @@ export class BackendClient {
             throw new Error('服务已关闭');
         }
         if (this._store) {
-            await this._store.load(this._backend, this._config);
+            await this._store.load(this._backend, this._getSessionContextConfig());
         }
 
         if (type === 'get_state') {
+            const endpointSec = this._backend === 'openai'
+                ? inspectEndpointSecurity(this._runtime?.baseUrl || '')
+                : null;
             return {
                 backend: this._backend,
                 unconfigured: this._backend === 'unconfigured',
@@ -427,10 +486,21 @@ export class BackendClient {
                 effectiveMode: this._runtime.effectiveModeInfo?.effectiveMode || (this._config?.mode || 'readonly'),
                 modeNotice: this._runtime.effectiveModeInfo?.notice || '',
                 cliVersion: this._runtime.cliCapabilities?.version || '',
+                endpointSecurity: endpointSec,
+                sessionUnsavedWarning: this._store?.lastWriteError
+                    ? `历史未保存：${this._store.lastWriteError.message}`
+                    : '',
             };
         }
         if (type === 'get_messages') {
             return {messages: this._store ? [...this._store.messages] : []};
+        }
+        if (type === 'flush_session') {
+            await this._store?.flush();
+            return {
+                flushed: true,
+                hasUnsavedChanges: Boolean(this._store?.hasUnsavedChanges),
+            };
         }
         if (type === 'revoke_scopes') {
             this.revokeApprovedScopes();
@@ -444,8 +514,9 @@ export class BackendClient {
             if (fields.turnId && active.id !== String(fields.turnId)) {
                 return {aborted: false, stale: true};
             }
+            const ctxCfg = this._getSessionContextConfig();
             this._turns.cancelActiveTurn({
-                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, ctxCfg),
                 onTerminateProcess: proc => this._terminateTurnProcess(active, proc),
                 onCleanupTempFiles: files => files.forEach(removeFileQuietly),
             });
@@ -461,6 +532,7 @@ export class BackendClient {
             const turnMeta = {
                 turnId: fields.turnId || '',
                 messageId: fields.messageId || '',
+                userMessageId: fields.userMessageId || `user_${GLib.uuid_string_random()}`,
                 clientGeneration: fields.clientGeneration ?? this._clientGeneration,
                 lifecycleGeneration: fields.lifecycleGeneration ?? 0,
             };
@@ -534,42 +606,82 @@ export class BackendClient {
         });
     }
 
-    _attachTurnWatchdog(turn, timeoutSec, onTimeoutMessage) {
-        let timerId = 0;
-        const pause = () => {
-            if (timerId) {
-                try { GLib.source_remove(timerId); } catch (_) {}
-                timerId = 0;
+    /**
+     * Phase-aware watchdog supporting separated connect / first-byte / stream-idle / tool-execution
+     * timeouts plus an independent total turn ceiling (Stage C3).
+     */
+    _attachTurnWatchdog(turn, initialTimeoutSec, initialMessage, totalTurnTimeoutSec = 0) {
+        let phaseTimerId = 0;
+        let totalTimerId = 0;
+        let currentTimeoutSec = Math.max(5, Number(initialTimeoutSec) || 60);
+        let currentMessage = String(initialMessage || '请求响应超时');
+
+        const clearPhase = () => {
+            if (phaseTimerId) {
+                try { GLib.source_remove(phaseTimerId); } catch (_) {}
+                phaseTimerId = 0;
             }
         };
+        const clearAll = () => {
+            clearPhase();
+            if (totalTimerId) {
+                try { GLib.source_remove(totalTimerId); } catch (_) {}
+                totalTimerId = 0;
+            }
+        };
+
+        const fireTimeout = msgText => {
+            clearAll();
+            if (this._turns.isCurrent(turn)) {
+                turn.timedOut = true;
+                try { turn.cancellable?.cancel?.(); } catch (_) {}
+                const ctxCfg = this._getSessionContextConfig();
+                this._turns.finalizeTurn(turn, {
+                    status: 'timed_out',
+                    timedOut: true,
+                    aborted: false,
+                    errorText: msgText,
+                    onPersistAssistant: msg => this._store?.appendMessage(msg, this._backend, ctxCfg),
+                    onTerminateProcess: proc => this._terminateTurnProcess(turn, proc),
+                    onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+                });
+            }
+        };
+
         const reset = () => {
-            pause();
+            clearPhase();
             if (!this._turns.isCurrent(turn)) return;
-            timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutSec, () => {
-                timerId = 0;
-                if (this._turns.isCurrent(turn)) {
-                    turn.timedOut = true;
-                    try { turn.cancellable?.cancel?.(); } catch (_) {}
-                    this._turns.finalizeTurn(turn, {
-                        status: 'timed_out',
-                        timedOut: true,
-                        aborted: false,
-                        errorText: onTimeoutMessage,
-                        onPersistAssistant: msg => this._store?.appendMessage(msg, this._backend, this._config),
-                        onTerminateProcess: proc => this._terminateTurnProcess(turn, proc),
-                        onCleanupTempFiles: files => files.forEach(removeFileQuietly),
-                    });
-                }
+            phaseTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, currentTimeoutSec, () => {
+                phaseTimerId = 0;
+                fireTimeout(currentMessage);
                 return GLib.SOURCE_REMOVE;
             });
         };
-        turn.pauseWatchdog = pause;
+
+        const setWatchdogPhase = (nextTimeoutSec, nextMessage) => {
+            currentTimeoutSec = Math.max(5, Number(nextTimeoutSec) || currentTimeoutSec);
+            if (nextMessage) currentMessage = String(nextMessage);
+            if (turn.state !== 'awaiting_approval') {
+                reset();
+            }
+        };
+
+        if (totalTurnTimeoutSec > 0) {
+            totalTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, totalTurnTimeoutSec, () => {
+                totalTimerId = 0;
+                fireTimeout(`单轮任务总时长超出安全上限（${totalTurnTimeoutSec}s）`);
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+
+        turn.pauseWatchdog = clearPhase;
         turn.resetWatchdog = reset;
-        turn.cleanupWatchdog = pause;
+        turn.setWatchdogPhase = setWatchdogPhase;
+        turn.cleanupWatchdog = clearAll;
         reset();
     }
 
-    _attachApprovalWatchdog(turn, timeoutSec = DEFAULT_APPROVAL_TIMEOUT_SEC) {
+    _attachApprovalWatchdog(turn, timeoutSec = this._timeouts?.approvalTimeoutSec || 300) {
         let approvalTimerId = 0;
         const clearApproval = () => {
             if (approvalTimerId) {
@@ -585,12 +697,13 @@ export class BackendClient {
                 if (this._turns.isCurrent(turn)) {
                     turn.timedOut = true;
                     try { turn.cancellable?.cancel?.(); } catch (_) {}
+                    const ctxCfg = this._getSessionContextConfig();
                     this._turns.finalizeTurn(turn, {
                         status: 'timed_out',
                         timedOut: true,
                         aborted: false,
                         errorText: `等待工具审批超时（${timeoutSec}s），已安全拒绝并终止本轮任务`,
-                        onPersistAssistant: msg => this._store?.appendMessage(msg, this._backend, this._config),
+                        onPersistAssistant: msg => this._store?.appendMessage(msg, this._backend, ctxCfg),
                         onTerminateProcess: proc => this._terminateTurnProcess(turn, proc),
                         onCleanupTempFiles: files => files.forEach(removeFileQuietly),
                     });
@@ -603,88 +716,136 @@ export class BackendClient {
     }
 
     _discoverOpenAIModelAsync(cancellable) {
-        if (this._runtime.modelId) return Promise.resolve(this._runtime.modelId);
+        const userPreferredModel = String(this._runtime.modelId || '').trim();
+        if (userPreferredModel) {
+            return Promise.resolve(userPreferredModel);
+        }
+        const modelsUrl = this._runtime.modelsUrl;
+        const apiKey = this._runtime.apiKey || '';
         return new Promise((resolve, reject) => {
-            const msg = Soup.Message.new('GET', this._runtime.modelsUrl);
+            const msg = Soup.Message.new('GET', modelsUrl);
             if (!msg) {
-                reject(new Error(`无效的接口地址：${this._runtime.modelsUrl}`));
+                reject(new Error(`无效的接口地址：${modelsUrl}`));
                 return;
             }
+            attachCrossOriginRedirectGuard(msg, modelsUrl);
             const headers = msg.get_request_headers();
             headers.append('Accept', 'application/json');
-            if (this._runtime.apiKey) {
-                headers.append('Authorization', `Bearer ${this._runtime.apiKey}`);
+            if (apiKey) {
+                headers.append('Authorization', `Bearer ${apiKey}`);
             }
             this._httpSession.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, cancellable, (sess, res) => {
                 try {
                     const bytes = sess.send_and_read_finish(res);
+                    const rawData = bytes?.get_data?.() || new Uint8Array(0);
                     const status = msg.get_status();
-                    if (status < 200 || status >= 300) {
-                        reject(new Error(`拉取 /models 失败（HTTP ${status}），请在设置中手动填写模型 ID`));
-                        return;
-                    }
-                    const text = Decoder.decode(bytes.get_data() || new Uint8Array());
-                    const parsed = JSON.parse(text);
-                    const list = Array.isArray(parsed.data) ? parsed.data : [];
-                    const firstId = list[0]?.id || '';
-                    if (!firstId) {
+                    const parsed = parseModelsResponse(status, rawData, {
+                        preferredModel: userPreferredModel,
+                        apiKey,
+                    });
+                    if (!parsed.selectedModel) {
                         reject(new Error('未指定模型 ID，且 /models 未返回可用模型；请在设置中填写模型 ID'));
                         return;
                     }
-                    this._runtime.modelId = firstId;
-                    this._runtime.resolvedModel = firstId;
-                    this._runtime.label = firstId;
-                    resolve(firstId);
+                    this._runtime.modelId = parsed.selectedModel;
+                    this._runtime.resolvedModel = parsed.selectedModel;
+                    this._runtime.label = parsed.selectedModel;
+                    this._runtime.modelMetadata = parsed.metadataById || {};
+                    resolve(parsed.selectedModel);
                 } catch (e) {
-                    reject(new Error(`请在设置中填写模型 ID（自动拉取失败：${e.message}）`));
+                    const cleanMsg = redactSensitiveText(e?.message || String(e), {apiKey, maxChars: 240});
+                    reject(new Error(`请在设置中填写模型 ID（${cleanMsg}）`));
                 }
             });
         });
     }
 
     async _runOpenAITurn(promptText, turnMeta = {}) {
+        const systemPrompt = this._runtime.systemPrompt ||
+            '你是 Ubuntu 26 / GNOME 50 桌面顶栏中的「随问」AI 助手。请用清晰、简明、准确的中文回答问题。';
+        const knownCtxWindow = Number(
+            this._runtime?.modelMetadata?.[this._runtime.modelId]?.contextWindowTokens || 0
+        ) || undefined;
+
+        const budgetCheck = preparePromptWithinBudget(promptText, {
+            systemPrompt,
+            ...(knownCtxWindow ? {contextWindowTokens: knownCtxWindow} : {}),
+            allowTruncate: false,
+        });
+        if (!budgetCheck.ok) {
+            throw new Error(budgetCheck.warning || '当前提问内容超出上下文预算');
+        }
+
         const cancellable = new Gio.Cancellable();
         const turn = this._turns.beginTurn({
             turnId: turnMeta.turnId,
             messageId: turnMeta.messageId,
+            replyTo: turnMeta.userMessageId || '',
+            modelId: this._runtime.modelId || '',
             sessionId: this._sessionId,
             clientGeneration: turnMeta.clientGeneration ?? this._clientGeneration,
             lifecycleGeneration: turnMeta.lifecycleGeneration ?? 0,
             backend: 'openai',
-            promptText,
+            promptText: budgetCheck.promptText,
             cancellable,
         });
 
-        this._store?.appendMessage({role: 'user', content: promptText}, this._backend, this._config);
+        const ctxCfg = this._getSessionContextConfig();
+        this._store?.appendMessage(
+            {
+                id: turnMeta.userMessageId,
+                turnId: turn.id,
+                role: 'user',
+                content: budgetCheck.promptText,
+            },
+            this._backend,
+            ctxCfg
+        );
+
+        const timeouts = this._timeouts || resolveSplitTimeouts();
+        this._attachTurnWatchdog(
+            turn,
+            timeouts.connectTimeoutSec,
+            `连接 OpenAI 接口超时（${timeouts.connectTimeoutSec}s）`,
+            timeouts.totalTurnTimeoutSec
+        );
 
         let modelId;
         try {
             modelId = await this._discoverOpenAIModelAsync(turn.cancellable);
+            turn.modelId = modelId;
         } catch (err) {
-            this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
-            throw err;
+            const cleanErr = redactSensitiveText(err?.message || String(err), {apiKey: this._runtime.apiKey});
+            this._turns.finalizeTurn(turn, {status: 'failed', errorText: cleanErr});
+            throw new Error(cleanErr);
         }
 
         if (!this._turns.isCurrent(turn)) {
             return {disposition: 'handled'};
         }
 
-        const apiMessages = [];
-        apiMessages.push({
-            role: 'system',
-            content: this._runtime.systemPrompt ||
-                '你是 Ubuntu 26 / GNOME 50 桌面顶栏中的「随问」AI 助手。请用清晰、简明、准确的中文回答问题。',
-        });
+        const effectiveCtxWindow = Number(
+            this._runtime?.modelMetadata?.[modelId]?.contextWindowTokens || knownCtxWindow || 0
+        ) || undefined;
 
-        const budgeted = buildBudgetedContextMessages(this._store?.messages || [], 24, 28000);
-        apiMessages.push(...budgeted);
+        const apiMessages = [
+            {role: 'system', content: systemPrompt},
+            ...buildBudgetedContextMessages(this._store?.messages || [], {
+                maxMessages: 24,
+                maxChars: 28000,
+                systemPrompt,
+                ...(effectiveCtxWindow ? {contextWindowTokens: effectiveCtxWindow} : {}),
+            }),
+        ];
 
-        const msg = Soup.Message.new('POST', this._runtime.chatUrl);
+        const chatUrl = this._runtime.chatUrl;
+        const msg = Soup.Message.new('POST', chatUrl);
         if (!msg) {
-            const err = new Error(`无效的 OpenAI 接口地址：${this._runtime.chatUrl}`);
+            const err = new Error(`无效的 OpenAI 接口地址：${chatUrl}`);
             this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
             throw err;
         }
+        attachCrossOriginRedirectGuard(msg, chatUrl);
 
         const reqHeaders = msg.get_request_headers();
         reqHeaders.append('Content-Type', 'application/json');
@@ -698,183 +859,282 @@ export class BackendClient {
             stream: true,
             messages: apiMessages,
         };
-        if (this._runtime.reasoningEffort) {
+        if (
+            this._runtime.reasoningEffort &&
+            supportsOpenAIReasoningEffort(modelId, this._config?.supportsReasoningEffort)
+        ) {
             reqBody.reasoning_effort = this._runtime.reasoningEffort;
         }
         msg.set_request_body_from_bytes('application/json', new GLib.Bytes(Encoder.encode(JSON.stringify(reqBody))));
 
+        const endpointSecurity = inspectEndpointSecurity(this._runtime.baseUrl || '');
+        if (endpointSecurity.isRemotePlaintextHttp && endpointSecurity.warning) {
+            this._turns.emitForTurn(turn, {
+                type: 'mode_notice',
+                message: endpointSecurity.warning,
+            });
+        }
+
         this._turns.markStreaming(turn);
         this._turns.emitForTurn(turn, {type: 'message_start', modelId, message: {role: 'assistant'}});
-        this._attachTurnWatchdog(turn, 120, 'OpenAI 接口响应超时（120s）');
+        turn.setWatchdogPhase?.(
+            timeouts.connectTimeoutSec,
+            `连接 OpenAI 接口超时（${timeouts.connectTimeoutSec}s）`
+        );
 
-        let dataStream = null;
+        let activeBaseStream = null;
         const closeOpenAIStream = () => {
-            if (!dataStream) return;
-            const s = dataStream;
-            dataStream = null;
-            try { s.close_async(GLib.PRIORITY_DEFAULT, null, (st, r) => { try { st.close_finish(r); } catch (_) {} }); } catch (_) {}
+            if (!activeBaseStream) return;
+            const s = activeBaseStream;
+            activeBaseStream = null;
+            try {
+                s.close_async(GLib.PRIORITY_DEFAULT, null, (st, r) => {
+                    try { st.close_finish(r); } catch (_) {}
+                });
+            } catch (_) {}
         };
 
-        const nonSseLines = [];
-        const settleOpenAI = (errorText = '') => {
+        const sseParser = new OpenAISseParser({
+            apiKey: this._runtime.apiKey,
+        });
+
+        const applyParsedSseEvents = events => {
+            for (const evt of events) {
+                if (!this._turns.isCurrent(turn)) return false;
+                if (evt.type === 'error') {
+                    settleOpenAI({status: 'failed', errorText: evt.error});
+                    return false;
+                }
+                if (evt.type === 'done') {
+                    turn.sawDoneMarker = true;
+                    settleOpenAI({status: 'completed'});
+                    return false;
+                }
+                if (evt.type === 'delta') {
+                    if (evt.model && !turn.modelId) {
+                        turn.modelId = evt.model;
+                    }
+                    if (evt.thinkingDelta) {
+                        this._turns.appendThinking(turn, evt.thinkingDelta);
+                    }
+                    if (evt.textDelta) {
+                        this._turns.appendText(turn, evt.textDelta);
+                    }
+                }
+            }
+            return true;
+        };
+
+        const settleOpenAI = ({status = '', interrupted = false, errorText = ''} = {}) => {
             closeOpenAIStream();
             if (!this._turns.isCurrent(turn)) return;
 
-            if (!turn.text && nonSseLines.length > 0 && !errorText) {
-                const joined = nonSseLines.join('\n').trim();
-                if (joined.startsWith('{')) {
-                    try {
-                        const obj = JSON.parse(joined);
-                        if (obj.error) {
-                            errorText = obj.error.message || JSON.stringify(obj.error);
-                        } else {
-                            const content = obj.choices?.[0]?.message?.content;
-                            if (typeof content === 'string' && content) {
-                                turn.text = content;
-                                turn.sawDoneMarker = true;
-                            }
-                        }
-                    } catch (_) {}
+            const cleanError = errorText
+                ? redactSensitiveText(errorText, {apiKey: this._runtime.apiKey, maxChars: 280})
+                : '';
+
+            let finalStatus = status;
+            let finalInterrupted = Boolean(interrupted);
+            if (turn.timedOut) {
+                finalStatus = 'timed_out';
+            } else if (turn.aborted) {
+                finalStatus = 'cancelled';
+            } else if (!finalStatus) {
+                if (cleanError) {
+                    finalStatus = 'failed';
+                } else if (!turn.sawDoneMarker) {
+                    finalStatus = 'interrupted';
+                    finalInterrupted = true;
+                } else {
+                    finalStatus = 'completed';
                 }
             }
 
-            let status = '';
-            let interrupted = false;
-            if (turn.timedOut) {
-                status = 'timed_out';
-            } else if (turn.aborted) {
-                status = 'cancelled';
-            } else if (errorText) {
-                status = 'failed';
-            } else if (!turn.sawDoneMarker) {
-                status = 'interrupted';
-                interrupted = true;
-                errorText = '响应连接意外中断（未收到完整流结束标记）';
-            } else {
-                status = 'completed';
-            }
-
+            const persistCfg = this._getSessionContextConfig();
             this._turns.finalizeTurn(turn, {
-                status,
-                interrupted,
-                errorText,
-                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                status: finalStatus,
+                interrupted: finalInterrupted,
+                errorText: cleanError,
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, persistCfg),
             });
         };
 
         this._httpSession.send_async(msg, GLib.PRIORITY_DEFAULT, turn.cancellable, (sess, res) => {
-            if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
-                try {
-                    const staleStream = sess.send_finish(res);
-                    staleStream?.close_async(GLib.PRIORITY_DEFAULT, null, (st, r) => { try { st.close_finish(r); } catch (_) {} });
-                } catch (_) {}
-                return;
-            }
-            let baseStream;
+            let baseStream = null;
             try {
                 baseStream = sess.send_finish(res);
             } catch (err) {
-                settleOpenAI(turn.aborted ? '' : `请求失败：${err.message}`);
+                if (this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                    settleOpenAI({
+                        status: turn.aborted ? 'cancelled' : 'failed',
+                        errorText: turn.aborted ? '' : `请求失败：${err.message}`,
+                    });
+                }
                 return;
             }
 
+            if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                try {
+                    baseStream?.close_async(GLib.PRIORITY_DEFAULT, null, (st, r) => {
+                        try { st.close_finish(r); } catch (_) {}
+                    });
+                } catch (_) {}
+                return;
+            }
+
+            activeBaseStream = baseStream;
             const status = msg.get_status();
-            dataStream = new Gio.DataInputStream({base_stream: baseStream});
 
             if (status < 200 || status >= 300) {
-                const errLines = [];
-                const readErr = () => {
-                    if (!this._turns.isCurrent(turn) || !dataStream) return;
-                    dataStream.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
+                const errorChunks = [];
+                let errorBytes = 0;
+                const readErrorChunks = () => {
+                    if (!this._turns.isCurrent(turn) || !activeBaseStream) {
+                        closeOpenAIStream();
+                        return;
+                    }
+                    activeBaseStream.read_bytes_async(8192, GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
+                        let gbytes = null;
+                        try {
+                            gbytes = s.read_bytes_finish(r);
+                        } catch (_) {}
+
                         if (!this._turns.isCurrent(turn)) {
                             closeOpenAIStream();
                             return;
                         }
-                        try {
-                            const [line] = s.read_line_finish_utf8(r);
-                            if (line !== null) {
-                                errLines.push(line);
-                                if (errLines.length < 25) {
-                                    readErr();
-                                    return;
-                                }
+                        const chunk = gbytes ? gbytes.get_data() : null;
+                        if (chunk && chunk.byteLength > 0 && errorBytes < DEFAULT_SSE_LIMITS.maxErrorBodyBytes) {
+                            const allowed = chunk.subarray(0, DEFAULT_SSE_LIMITS.maxErrorBodyBytes - errorBytes);
+                            errorChunks.push(Decoder.decode(allowed, {stream: true}));
+                            errorBytes += allowed.byteLength;
+                            if (errorBytes < DEFAULT_SSE_LIMITS.maxErrorBodyBytes) {
+                                readErrorChunks();
+                                return;
                             }
-                        } catch (_) {}
-                        const rawBody = errLines.join('\n').trim();
-                        let detail = `HTTP ${status} (${msg.get_reason_phrase() || 'Error'})`;
-                        if (rawBody.startsWith('{')) {
-                            try {
-                                const parsed = JSON.parse(rawBody);
-                                if (parsed.error?.message) detail = `${detail}: ${parsed.error.message}`;
-                            } catch (_) {
-                                detail = `${detail}: ${rawBody.slice(0, 160)}`;
-                            }
-                        } else if (rawBody) {
-                            detail = `${detail}: ${rawBody.slice(0, 160)}`;
                         }
-                        settleOpenAI(detail);
+                        errorChunks.push(Decoder.decode(new Uint8Array(0), {stream: false}));
+                        const detail = formatSanitizedHttpError(
+                            status,
+                            msg.get_reason_phrase() || '',
+                            errorChunks.join(''),
+                            {apiKey: this._runtime.apiKey}
+                        );
+                        settleOpenAI({status: 'failed', errorText: detail});
                     });
                 };
-                readErr();
+                readErrorChunks();
                 return;
             }
 
-            const readSseLine = () => {
-                if (!this._turns.isCurrent(turn) || !dataStream) return;
-                dataStream.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
+            // Connected and HTTP 2xx headers received: switch to first-byte timeout until first chunk arrives
+            let sawFirstPayloadChunk = false;
+            turn.setWatchdogPhase?.(
+                timeouts.firstByteTimeoutSec,
+                `等待模型首字响应超时（${timeouts.firstByteTimeoutSec}s）`
+            );
+
+            const readSseChunks = () => {
+                if (!this._turns.isCurrent(turn) || !activeBaseStream) {
+                    closeOpenAIStream();
+                    return;
+                }
+                activeBaseStream.read_bytes_async(16384, GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
+                    let gbytes = null;
+                    try {
+                        gbytes = s.read_bytes_finish(r);
+                    } catch (err) {
+                        if (!this._turns.isCurrent(turn)) {
+                            closeOpenAIStream();
+                            return;
+                        }
+                        settleOpenAI({
+                            status: turn.aborted ? 'cancelled' : 'failed',
+                            errorText: turn.aborted ? '' : err.message,
+                        });
+                        return;
+                    }
+
                     if (!this._turns.isCurrent(turn)) {
                         closeOpenAIStream();
                         return;
                     }
-                    try {
-                        const [line] = s.read_line_finish_utf8(r);
-                        if (line === null) {
-                            settleOpenAI('');
+
+                    const rawChunk = gbytes ? gbytes.get_data() : null;
+                    if (!rawChunk || rawChunk.byteLength === 0) {
+                        // Socket EOF: flush UTF-8 decoder & validate clean SSE completion or non-SSE JSON fallback
+                        const fin = sseParser.finish();
+                        if (!applyParsedSseEvents(fin.events)) {
                             return;
                         }
-                        turn.resetWatchdog?.();
-                        const sse = parseOpenAISSELine(line);
-                        if (sse) {
-                            if (sse.error) {
-                                settleOpenAI(sse.error);
-                                return;
-                            }
-                            if (sse.done) {
-                                turn.sawDoneMarker = true;
-                                settleOpenAI('');
-                                return;
-                            }
-                            if (sse.thinkingDelta) {
-                                this._turns.appendThinking(turn, sse.thinkingDelta);
-                            }
-                            if (sse.textDelta) {
-                                this._turns.appendText(turn, sse.textDelta);
-                            }
-                        } else if (line.trim()) {
-                            nonSseLines.push(line);
+                        if (fin.isNonSseJson) {
+                            if (fin.model && !turn.modelId) turn.modelId = fin.model;
+                            if (fin.nonSseThinking) this._turns.replaceThinking(turn, fin.nonSseThinking);
+                            if (fin.nonSseText) this._turns.replaceText(turn, fin.nonSseText);
+                            turn.sawDoneMarker = true;
+                            settleOpenAI({status: 'completed'});
+                            return;
                         }
-                        readSseLine();
-                    } catch (err) {
-                        settleOpenAI(turn.aborted ? '' : err.message);
+                        if (fin.completedCleanly) {
+                            turn.sawDoneMarker = true;
+                            settleOpenAI({status: 'completed'});
+                            return;
+                        }
+                        if (fin.interrupted) {
+                            settleOpenAI({
+                                status: 'interrupted',
+                                interrupted: true,
+                                errorText: fin.error,
+                            });
+                            return;
+                        }
+                        settleOpenAI({
+                            status: 'failed',
+                            errorText: fin.error || '响应解析失败',
+                        });
+                        return;
                     }
+
+                    if (!sawFirstPayloadChunk) {
+                        sawFirstPayloadChunk = true;
+                        turn.setWatchdogPhase?.(
+                            timeouts.streamIdleTimeoutSec,
+                            `流式响应空闲超时（${timeouts.streamIdleTimeoutSec}s）`
+                        );
+                    } else {
+                        turn.resetWatchdog?.();
+                    }
+
+                    const parsedEvents = sseParser.pushBytes(rawChunk);
+                    if (!applyParsedSseEvents(parsedEvents)) {
+                        return;
+                    }
+                    readSseChunks();
                 });
             };
-            readSseLine();
+            readSseChunks();
         });
 
         return {disposition: 'streaming', turnId: turn.id};
     }
 
     _runSingleTurnSubprocess(promptText, turnMeta = {}) {
+        const budgetCheck = preparePromptWithinBudget(promptText, {allowTruncate: false});
+        if (!budgetCheck.ok) {
+            return Promise.reject(new Error(budgetCheck.warning || '当前提问超出单次输入上限'));
+        }
+
         const cancellable = new Gio.Cancellable();
         const turn = this._turns.beginTurn({
             turnId: turnMeta.turnId,
             messageId: turnMeta.messageId,
+            replyTo: turnMeta.userMessageId || '',
+            modelId: this._runtime?.resolvedModel || '',
             sessionId: this._sessionId,
             clientGeneration: turnMeta.clientGeneration ?? this._clientGeneration,
             lifecycleGeneration: turnMeta.lifecycleGeneration ?? 0,
             backend: this._backend,
-            promptText,
+            promptText: budgetCheck.promptText,
             cancellable,
             deferTempCleanupUntilProcessExit: true,
         });
@@ -885,7 +1145,7 @@ export class BackendClient {
 
         const historyBeforePrompt = this._store ? [...this._store.messages] : [];
         const remoteId = this._store?.remoteSessionId || '';
-        const promptWithDesktopEnv = augmentPromptWithDesktopContext(promptText, this._specialDirs, {
+        const promptWithDesktopEnv = augmentPromptWithDesktopContext(budgetCheck.promptText, this._specialDirs, {
             isFirstTurn: !remoteId,
             mode: effectiveMode,
             workspace: this._workspace,
@@ -921,6 +1181,7 @@ export class BackendClient {
                     this._runtime.resolvedProvider = zcodeIsolated.resolvedProvider || this._runtime.resolvedProvider;
                     this._runtime.resolvedModel = zcodeIsolated.resolvedModel;
                     this._runtime.label = zcodeIsolated.resolvedModel;
+                    turn.modelId = zcodeIsolated.resolvedModel;
                 }
                 if (useZCodePromptFile) {
                     const runtimeDir = getPrivateRuntimeDir();
@@ -958,7 +1219,17 @@ export class BackendClient {
             return Promise.reject(prepErr);
         }
 
-        this._store?.appendMessage({role: 'user', content: promptText}, this._backend, this._config);
+        const ctxCfg = this._getSessionContextConfig();
+        this._store?.appendMessage(
+            {
+                id: turnMeta.userMessageId,
+                turnId: turn.id,
+                role: 'user',
+                content: budgetCheck.promptText,
+            },
+            this._backend,
+            ctxCfg
+        );
 
         const launcher = new Gio.SubprocessLauncher({
             flags:
@@ -1053,6 +1324,7 @@ export class BackendClient {
         let exitCode = null;
         let termSignal = null;
         let streamsClosed = false;
+        let activeRunningTools = 0;
 
         const closeIoPipes = () => {
             if (streamsClosed) return;
@@ -1072,10 +1344,11 @@ export class BackendClient {
                 return;
             }
             closeIoPipes();
+            const persistCfg = this._getSessionContextConfig();
             this._turns.finalizeTurn(turn, {
                 status: 'failed',
-                errorText: monitor.fatalError || 'CLI 安全校验未通过',
-                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                errorText: redactSensitiveText(monitor.fatalError || 'CLI 安全校验未通过'),
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, persistCfg),
                 onTerminateProcess: p => this._terminateTurnProcess(turn, p),
                 onCleanupTempFiles: files => files.forEach(removeFileQuietly),
             });
@@ -1105,13 +1378,25 @@ export class BackendClient {
                 stderrSummary: monitor.getStderrSummary(),
             });
 
+            // Never auto-retry side-effecting Agent turns (Stage C3)!
+            // If a remote session resume failed before producing output, invalidate the stale remoteSessionId
+            // so the user's next turn cleanly rebuilds from budgeted local SessionStore history (Stage C2).
+            let finalErrorMessage = redactSensitiveText(outcome.errorMessage || '', {maxChars: 280});
+            if (remoteId && outcome.status !== 'completed' && !turn.aborted && !turn.timedOut && !turn.text) {
+                this._store?.clearRemoteSessionId('remote_resume_failed');
+                finalErrorMessage = finalErrorMessage
+                    ? `远端会话恢复失败（已重置为本地上下文，请重试）：${finalErrorMessage}`
+                    : '远端会话恢复失败，已自动切换为本地历史上下文，请重新发送当前问题';
+            }
+
+            const persistCfg = this._getSessionContextConfig();
             this._turns.finalizeTurn(turn, {
                 status: outcome.status,
                 aborted: outcome.aborted,
                 timedOut: outcome.timedOut,
                 interrupted: outcome.interrupted,
-                errorText: outcome.errorMessage,
-                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                errorText: finalErrorMessage,
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, persistCfg),
                 onTerminateProcess: p => this._terminateTurnProcess(turn, p),
                 onCleanupTempFiles: files => files.forEach(removeFileQuietly),
             });
@@ -1181,13 +1466,19 @@ export class BackendClient {
             });
         };
 
+        const timeouts = this._timeouts || resolveSplitTimeouts();
         this._turns.markStreaming(turn);
-        this._attachTurnWatchdog(turn, 120, '响应超时（120s 无输出）');
+        this._attachTurnWatchdog(
+            turn,
+            timeouts.streamIdleTimeoutSec,
+            `CLI 响应空闲超时（${timeouts.streamIdleTimeoutSec}s 无输出）`,
+            timeouts.totalTurnTimeoutSec
+        );
         this._attachApprovalWatchdog(
             turn,
             Number(this._config?.approvalTimeoutSec) > 0
                 ? Number(this._config.approvalTimeoutSec)
-                : DEFAULT_APPROVAL_TIMEOUT_SEC
+                : timeouts.approvalTimeoutSec
         );
 
         if (modeInfo.notice) {
@@ -1199,6 +1490,19 @@ export class BackendClient {
         }
 
         const seenPermissionIds = new Set();
+        const syncCliToolTimeoutPhase = () => {
+            if (activeRunningTools > 0) {
+                turn.setWatchdogPhase?.(
+                    timeouts.toolExecutionTimeoutSec,
+                    `工具执行超时（${timeouts.toolExecutionTimeoutSec}s 无状态更新）`
+                );
+            } else {
+                turn.setWatchdogPhase?.(
+                    timeouts.streamIdleTimeoutSec,
+                    `CLI 响应空闲超时（${timeouts.streamIdleTimeoutSec}s 无输出）`
+                );
+            }
+        };
 
         const readStdoutLoop = () => {
             if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
@@ -1234,6 +1538,7 @@ export class BackendClient {
 
                     const norm = checked.normalized;
                     if (norm) {
+                        const segCfg = this._getSessionContextConfig();
                         if (norm.type === 'bridge_ready') {
                             this._turns.emitForTurn(turn, norm);
                         } else if (norm.type === 'permission_request') {
@@ -1247,44 +1552,56 @@ export class BackendClient {
                                 this._turns.leaveApproval(turn, norm.requestId);
                             }
                             this._turns.emitForTurn(turn, norm);
+                        } else if (norm.type === 'tool_execution_start') {
+                            activeRunningTools++;
+                            syncCliToolTimeoutPhase();
+                            this._turns.emitForTurn(turn, norm);
+                        } else if (norm.type === 'tool_execution_end') {
+                            activeRunningTools = Math.max(0, activeRunningTools - 1);
+                            syncCliToolTimeoutPhase();
+                            this._turns.emitForTurn(turn, norm);
+                        } else if (norm.type === 'tool_batch_end') {
+                            activeRunningTools = 0;
+                            syncCliToolTimeoutPhase();
+                            this._turns.emitForTurn(turn, norm);
                         } else if (norm.type === 'session_bound' && norm.sessionId) {
-                            this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                            this._store?.setRemoteSessionId(norm.sessionId, this._backend, segCfg);
                         } else if (norm.type === 'turn_completed') {
                             turn.sawDoneMarker = true;
                         } else if (norm.type === 'turn_result') {
                             if (norm.sessionId) {
-                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, segCfg);
                             }
                             if (norm.isError) {
                                 turn.error = norm.errorMessage || 'ZCode 执行返回错误';
                             } else {
                                 turn.sawDoneMarker = true;
                                 if (norm.text && !turn.text) {
-                                    this._turns.replaceText(turn, norm.text);
+                                    this._turns.replaceText(turn, norm.text, norm.segmentId || '');
                                 }
                             }
                         } else if (norm.type === 'text_snapshot') {
-                            this._turns.replaceText(turn, norm.text);
+                            this._turns.replaceText(turn, norm.text, norm.segmentId || '');
                         } else if (norm.type === 'thinking_snapshot') {
-                            this._turns.replaceThinking(turn, norm.text);
+                            this._turns.replaceThinking(turn, norm.text, norm.segmentId || '');
                         } else if (norm.type === 'message_update') {
                             if (norm.sessionId) {
-                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, segCfg);
                             }
                             const ev = norm.assistantMessageEvent;
                             if (ev?.type === 'text_delta') {
-                                this._turns.appendText(turn, ev.delta || '');
+                                this._turns.appendText(turn, ev.delta || '', norm.segmentId || '');
                             } else if (ev?.type === 'thinking_delta') {
-                                this._turns.appendThinking(turn, ev.delta || '');
+                                this._turns.appendThinking(turn, ev.delta || '', norm.segmentId || '');
                             } else {
                                 this._turns.emitForTurn(turn, norm);
                             }
                         } else if (norm.type === 'message_end' && norm.message) {
                             if (norm.sessionId) {
-                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, segCfg);
                             }
                             if (typeof norm.message.content === 'string' && norm.message.content) {
-                                this._turns.replaceText(turn, norm.message.content);
+                                this._turns.replaceText(turn, norm.message.content, norm.segmentId || norm.message.id || '');
                             }
                             if (norm.message.errorMessage) {
                                 turn.error = norm.message.errorMessage;
@@ -1292,7 +1609,10 @@ export class BackendClient {
                             // Defer final `message_end` emission to `finalizeTurn` after exit status verification.
                         } else {
                             if (norm.sessionId) {
-                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, segCfg);
+                            }
+                            if (norm.type === 'message_start' && norm.modelId) {
+                                turn.modelId = norm.modelId;
                             }
                             this._turns.emitForTurn(turn, norm);
                         }

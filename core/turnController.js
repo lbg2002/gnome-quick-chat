@@ -28,6 +28,20 @@ export const TERMINAL_TURN_STATES = new Set([
     'timed_out',
 ]);
 
+export const STREAM_EVENT_TYPES = Object.freeze({
+    TEXT_DELTA: 'text_delta',
+    TEXT_REPLACE: 'text_replace',
+    THINKING_DELTA: 'thinking_delta',
+    THINKING_REPLACE: 'thinking_replace',
+    MESSAGE_FINAL: 'message_end',
+    TOOL_START: 'tool_execution_start',
+    TOOL_UPDATE: 'tool_execution_update',
+    TOOL_END: 'tool_execution_end',
+    PERMISSION_REQUEST: 'permission_request',
+    PERMISSION_RESOLVED: 'permission_resolved',
+    TURN_SETTLED: 'agent_settled',
+});
+
 export class TurnController {
     constructor(onEvent) {
         this._onEvent = onEvent;
@@ -66,6 +80,8 @@ export class TurnController {
             lifecycleGeneration: Number(meta.lifecycleGeneration || 0),
             state: 'starting',
             backend: meta.backend || '',
+            modelId: String(meta.modelId || ''),
+            replyTo: String(meta.replyTo || ''),
             promptText: meta.promptText || '',
             cancellable: meta.cancellable || null,
             process: null,
@@ -75,6 +91,8 @@ export class TurnController {
             deferTempCleanupUntilProcessExit: Boolean(meta.deferTempCleanupUntilProcessExit),
             text: '',
             thinking: '',
+            textSegments: new Map(),
+            thinkingSegments: new Map(),
             error: '',
             aborted: false,
             timedOut: false,
@@ -144,32 +162,11 @@ export class TurnController {
         return true;
     }
 
-    appendText(turn, delta) {
-        if (!this.isCurrent(turn) || !delta) return false;
-        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
-            turn.state = 'streaming';
-        }
-        turn.text += delta;
-        this._onEvent?.({
-            turnId: turn.id,
-            messageId: turn.messageId,
-            sessionId: turn.sessionId,
-            clientGeneration: turn.clientGeneration,
-            type: 'message_update',
-            assistantMessageEvent: {type: 'text_delta', delta},
-        });
-        return true;
-    }
-
-    replaceText(turn, nextText) {
-        if (!this.isCurrent(turn) || typeof nextText !== 'string') return false;
-        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
-            turn.state = 'streaming';
-        }
-        if (nextText === turn.text) return true;
-        if (nextText.startsWith(turn.text)) {
-            const delta = nextText.slice(turn.text.length);
-            turn.text = nextText;
+    _applyAggregatedText(turn, nextAggregated) {
+        if (nextAggregated === turn.text) return true;
+        if (nextAggregated.startsWith(turn.text)) {
+            const delta = nextAggregated.slice(turn.text.length);
+            turn.text = nextAggregated;
             if (delta) {
                 this._onEvent?.({
                     turnId: turn.id,
@@ -182,44 +179,23 @@ export class TurnController {
             }
             return true;
         }
-        turn.text = nextText;
+        turn.text = nextAggregated;
         this._onEvent?.({
             turnId: turn.id,
             messageId: turn.messageId,
             sessionId: turn.sessionId,
             clientGeneration: turn.clientGeneration,
             type: 'message_update',
-            assistantMessageEvent: {type: 'text_replace', text: nextText},
+            assistantMessageEvent: {type: 'text_replace', text: nextAggregated},
         });
         return true;
     }
 
-    appendThinking(turn, delta) {
-        if (!this.isCurrent(turn) || !delta) return false;
-        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
-            turn.state = 'streaming';
-        }
-        turn.thinking += delta;
-        this._onEvent?.({
-            turnId: turn.id,
-            messageId: turn.messageId,
-            sessionId: turn.sessionId,
-            clientGeneration: turn.clientGeneration,
-            type: 'message_update',
-            assistantMessageEvent: {type: 'thinking_delta', delta},
-        });
-        return true;
-    }
-
-    replaceThinking(turn, nextThinking) {
-        if (!this.isCurrent(turn) || typeof nextThinking !== 'string') return false;
-        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
-            turn.state = 'streaming';
-        }
-        if (nextThinking === turn.thinking) return true;
-        if (nextThinking.startsWith(turn.thinking)) {
-            const delta = nextThinking.slice(turn.thinking.length);
-            turn.thinking = nextThinking;
+    _applyAggregatedThinking(turn, nextAggregated) {
+        if (nextAggregated === turn.thinking) return true;
+        if (nextAggregated.startsWith(turn.thinking)) {
+            const delta = nextAggregated.slice(turn.thinking.length);
+            turn.thinking = nextAggregated;
             if (delta) {
                 this._onEvent?.({
                     turnId: turn.id,
@@ -232,16 +208,68 @@ export class TurnController {
             }
             return true;
         }
-        turn.thinking = nextThinking;
+        turn.thinking = nextAggregated;
         this._onEvent?.({
             turnId: turn.id,
             messageId: turn.messageId,
             sessionId: turn.sessionId,
             clientGeneration: turn.clientGeneration,
             type: 'message_update',
-            assistantMessageEvent: {type: 'thinking_replace', thinking: nextThinking},
+            assistantMessageEvent: {type: 'thinking_replace', thinking: nextAggregated},
         });
         return true;
+    }
+
+    appendText(turn, delta, segmentId = '') {
+        if (!this.isCurrent(turn) || !delta) return false;
+        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
+            turn.state = 'streaming';
+        }
+        const segKey = String(segmentId || '__primary__');
+        turn.textSegments.set(segKey, (turn.textSegments.get(segKey) || '') + delta);
+        const aggregated = turn.textSegments.size <= 1
+            ? (turn.textSegments.get(segKey) || '')
+            : Array.from(turn.textSegments.values()).filter(Boolean).join('\n\n');
+        return this._applyAggregatedText(turn, aggregated);
+    }
+
+    replaceText(turn, nextText, segmentId = '') {
+        if (!this.isCurrent(turn) || typeof nextText !== 'string') return false;
+        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
+            turn.state = 'streaming';
+        }
+        const segKey = String(segmentId || '__primary__');
+        turn.textSegments.set(segKey, nextText);
+        const aggregated = turn.textSegments.size <= 1
+            ? nextText
+            : Array.from(turn.textSegments.values()).filter(Boolean).join('\n\n');
+        return this._applyAggregatedText(turn, aggregated);
+    }
+
+    appendThinking(turn, delta, segmentId = '') {
+        if (!this.isCurrent(turn) || !delta) return false;
+        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
+            turn.state = 'streaming';
+        }
+        const segKey = String(segmentId || '__primary__');
+        turn.thinkingSegments.set(segKey, (turn.thinkingSegments.get(segKey) || '') + delta);
+        const aggregated = turn.thinkingSegments.size <= 1
+            ? (turn.thinkingSegments.get(segKey) || '')
+            : Array.from(turn.thinkingSegments.values()).filter(Boolean).join('\n\n');
+        return this._applyAggregatedThinking(turn, aggregated);
+    }
+
+    replaceThinking(turn, nextThinking, segmentId = '') {
+        if (!this.isCurrent(turn) || typeof nextThinking !== 'string') return false;
+        if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
+            turn.state = 'streaming';
+        }
+        const segKey = String(segmentId || '__primary__');
+        turn.thinkingSegments.set(segKey, nextThinking);
+        const aggregated = turn.thinkingSegments.size <= 1
+            ? nextThinking
+            : Array.from(turn.thinkingSegments.values()).filter(Boolean).join('\n\n');
+        return this._applyAggregatedThinking(turn, aggregated);
     }
 
     emitForTurn(turn, event) {
@@ -362,6 +390,8 @@ export class TurnController {
             const persistedMsg = {
                 id: turn.messageId,
                 turnId: turn.id,
+                ...(turn.replyTo ? {replyTo: turn.replyTo} : {}),
+                ...(turn.modelId ? {modelId: turn.modelId} : {}),
                 role: 'assistant',
                 content: contentParts,
                 status: turn.state,

@@ -1,5 +1,18 @@
-import Gio from 'gi://Gio';
-import GLib from 'gi://GLib';
+import {
+    SecretKeyManager,
+    SecretWriteQueue,
+    inspectEndpointSecurity,
+    normalizeEndpointKeyIdentity,
+    shouldStripAuthOnRedirect,
+} from './secretPolicy.js';
+
+export {
+    SecretKeyManager,
+    SecretWriteQueue,
+    inspectEndpointSecurity,
+    normalizeEndpointKeyIdentity,
+    shouldStripAuthOnRedirect,
+};
 
 let Secret = null;
 try {
@@ -8,7 +21,8 @@ try {
     Secret = null;
 }
 
-const SECRET_SCHEMA = Secret
+// Legacy v1 schema (single global account attribute) kept strictly for one-time migration/clear
+const SECRET_SCHEMA_V1 = Secret
     ? new Secret.Schema(
         'org.gnome.shell.extensions.quick-chat.apikey',
         Secret.SchemaFlags.NONE,
@@ -16,90 +30,246 @@ const SECRET_SCHEMA = Secret
     )
     : null;
 
-const SECRET_ATTRS = {account: 'openai-compatible-api-key'};
-const SECRET_LABEL = 'Quick Chat · 随问 OpenAI API Key';
+// Per-endpoint v2 schema isolating credentials by normalized endpoint URL
+const SECRET_SCHEMA_V2 = Secret
+    ? new Secret.Schema(
+        'org.gnome.shell.extensions.quick-chat.endpoint-apikey',
+        Secret.SchemaFlags.NONE,
+        {
+            account: Secret.SchemaAttributeType.STRING,
+            endpoint: Secret.SchemaAttributeType.STRING,
+        }
+    )
+    : null;
 
-export async function loadOpenAIApiKey(settings) {
-    const legacyPlaintext = settings?.get_string?.('openai-api-key')?.trim?.() || '';
+const LEGACY_ATTRS = Object.freeze({account: 'openai-compatible-api-key'});
+const ENDPOINT_ACCOUNT = 'openai-endpoint-api-key';
 
-    if (Secret && SECRET_SCHEMA) {
-        try {
-            const stored = await new Promise((resolve, reject) => {
+function makeEndpointAttrs(endpointSlot) {
+    return {
+        account: ENDPOINT_ACCOUNT,
+        endpoint: String(endpointSlot || ''),
+    };
+}
+
+function createLibsecretAdapter() {
+    if (!Secret || !SECRET_SCHEMA_V2) {
+        return {available: false};
+    }
+
+    return {
+        available: true,
+
+        lookupEndpoint(endpointSlot) {
+            return new Promise((resolve, reject) => {
                 Secret.password_lookup(
-                    SECRET_SCHEMA,
-                    SECRET_ATTRS,
+                    SECRET_SCHEMA_V2,
+                    makeEndpointAttrs(endpointSlot),
                     null,
                     (_, res) => {
                         try {
-                            resolve(Secret.password_lookup_finish(res) || '');
+                            const val = Secret.password_lookup_finish(res);
+                            resolve(typeof val === 'string' ? val : '');
                         } catch (err) {
                             reject(err);
                         }
                     }
                 );
             });
-            if (stored) {
-                // Migrate/clear leftover plaintext GSettings key if keyring already holds a value
-                if (legacyPlaintext) {
-                    try { settings.set_string('openai-api-key', ''); } catch (_) {}
-                }
-                return stored;
-            }
-            if (legacyPlaintext) {
-                const migrated = await storeOpenAIApiKey(settings, legacyPlaintext);
-                if (migrated) return legacyPlaintext;
-            }
-        } catch (err) {
-            console.warn(`[Quick Chat] Keyring lookup unavailable, falling back: ${err.message}`);
-        }
-    }
+        },
 
-    return legacyPlaintext;
+        storeEndpoint(endpointSlot, secretValue) {
+            const label = `Quick Chat · 随问 API Key (${endpointSlot})`;
+            return new Promise((resolve, reject) => {
+                Secret.password_store(
+                    SECRET_SCHEMA_V2,
+                    makeEndpointAttrs(endpointSlot),
+                    Secret.COLLECTION_DEFAULT,
+                    label,
+                    secretValue,
+                    null,
+                    (_, res) => {
+                        try {
+                            const ok = Secret.password_store_finish(res);
+                            resolve(Boolean(ok));
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }
+                );
+            });
+        },
+
+        clearEndpoint(endpointSlot) {
+            return new Promise((resolve, reject) => {
+                Secret.password_clear(
+                    SECRET_SCHEMA_V2,
+                    makeEndpointAttrs(endpointSlot),
+                    null,
+                    (_, res) => {
+                        try {
+                            // Note: libsecret returns `true` if >=1 item was deleted, `false` if none matched,
+                            // and throws GLib.Error if D-Bus / unlocked-keyring deletion failed!
+                            const removed = Secret.password_clear_finish(res);
+                            resolve(Boolean(removed));
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }
+                );
+            });
+        },
+
+        lookupLegacyGlobal() {
+            if (!SECRET_SCHEMA_V1) return Promise.resolve('');
+            return new Promise((resolve, reject) => {
+                Secret.password_lookup(
+                    SECRET_SCHEMA_V1,
+                    LEGACY_ATTRS,
+                    null,
+                    (_, res) => {
+                        try {
+                            const val = Secret.password_lookup_finish(res);
+                            resolve(typeof val === 'string' ? val : '');
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }
+                );
+            });
+        },
+
+        clearLegacyGlobal() {
+            if (!SECRET_SCHEMA_V1) return Promise.resolve(false);
+            return new Promise((resolve, reject) => {
+                Secret.password_clear(
+                    SECRET_SCHEMA_V1,
+                    LEGACY_ATTRS,
+                    null,
+                    (_, res) => {
+                        try {
+                            const removed = Secret.password_clear_finish(res);
+                            resolve(Boolean(removed));
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }
+                );
+            });
+        },
+    };
 }
 
-export async function storeOpenAIApiKey(settings, apiKey) {
-    const trimmed = String(apiKey || '').trim();
-    if (Secret && SECRET_SCHEMA) {
-        try {
-            if (!trimmed) {
-                await new Promise(resolve => {
-                    Secret.password_clear(SECRET_SCHEMA, SECRET_ATTRS, null, (_, res) => {
-                        try { Secret.password_clear_finish(res); } catch (_) {}
-                        resolve();
-                    });
-                });
-            } else {
-                await new Promise((resolve, reject) => {
-                    Secret.password_store(
-                        SECRET_SCHEMA,
-                        SECRET_ATTRS,
-                        Secret.COLLECTION_DEFAULT,
-                        SECRET_LABEL,
-                        trimmed,
-                        null,
-                        (_, res) => {
-                            try {
-                                Secret.password_store_finish(res);
-                                resolve();
-                            } catch (err) {
-                                reject(err);
-                            }
-                        }
-                    );
-                });
+function wrapSettingsAdapter(settings) {
+    const hasKey = key => Boolean(settings?.settings_schema?.has_key?.(key));
+    return {
+        getBaseUrl() {
+            try {
+                return hasKey('openai-base-url') ? (settings.get_string('openai-base-url') || '').trim() : '';
+            } catch (_) {
+                return '';
             }
-            // Clear plaintext GSettings once stored safely in GNOME Keyring
-            if (settings && settings.get_string('openai-api-key') !== '') {
-                settings.set_string('openai-api-key', '');
+        },
+        getLegacyPlaintext() {
+            try {
+                return hasKey('openai-api-key') ? (settings.get_string('openai-api-key') || '').trim() : '';
+            } catch (_) {
+                return '';
             }
-            return true;
-        } catch (err) {
-            console.warn(`[Quick Chat] Keyring store failed, keeping fallback setting: ${err.message}`);
-        }
-    }
+        },
+        setLegacyPlaintext(nextVal) {
+            if (!hasKey('openai-api-key')) return;
+            const clean = String(nextVal ?? '');
+            if (settings.get_string('openai-api-key') !== clean) {
+                settings.set_string('openai-api-key', clean);
+            }
+        },
+        getAllowPlaintextFallback() {
+            try {
+                return hasKey('allow-plaintext-key-fallback')
+                    ? Boolean(settings.get_boolean('allow-plaintext-key-fallback'))
+                    : false;
+            } catch (_) {
+                return false;
+            }
+        },
+    };
+}
 
-    if (settings && settings.get_string('openai-api-key') !== trimmed) {
-        settings.set_string('openai-api-key', trimmed);
+const sharedRuntimeMemorySecrets = new Map();
+const defaultSecretManager = new SecretKeyManager({
+    keyring: createLibsecretAdapter(),
+    memoryStore: sharedRuntimeMemorySecrets,
+});
+
+export async function loadOpenAIApiKeyDetailed(settings, baseUrl = '') {
+    return defaultSecretManager.loadKey(wrapSettingsAdapter(settings), baseUrl);
+}
+
+export async function loadOpenAIApiKey(settings, baseUrl = '') {
+    const res = await loadOpenAIApiKeyDetailed(settings, baseUrl);
+    return res.apiKey || '';
+}
+
+export async function storeOpenAIApiKey(settings, apiKey, baseUrl = '') {
+    return defaultSecretManager.storeKey(wrapSettingsAdapter(settings), baseUrl, apiKey);
+}
+
+export async function clearOpenAIApiKey(settings, baseUrl = '') {
+    return defaultSecretManager.clearKey(wrapSettingsAdapter(settings), baseUrl);
+}
+
+/**
+ * Purges strictly extension-owned secrets (`account=openai-endpoint-api-key` and legacy `account=openai-compatible-api-key`).
+ * Never uses broad attribute queries that could touch other applications' credentials.
+ */
+export async function clearAllExtensionSecrets(settings = null) {
+    sharedRuntimeMemorySecrets.clear();
+    if (settings) {
+        try {
+            wrapSettingsAdapter(settings).setLegacyPlaintext('');
+        } catch (_) {}
     }
-    return false;
+    if (!Secret) {
+        return {ok: true, error: ''};
+    }
+    try {
+        if (SECRET_SCHEMA_V2) {
+            await new Promise((resolve, reject) => {
+                Secret.password_clear(
+                    SECRET_SCHEMA_V2,
+                    {account: ENDPOINT_ACCOUNT},
+                    null,
+                    (_, res) => {
+                        try {
+                            Secret.password_clear_finish(res);
+                            resolve();
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }
+                );
+            });
+        }
+        if (SECRET_SCHEMA_V1) {
+            await new Promise((resolve, reject) => {
+                Secret.password_clear(
+                    SECRET_SCHEMA_V1,
+                    LEGACY_ATTRS,
+                    null,
+                    (_, res) => {
+                        try {
+                            Secret.password_clear_finish(res);
+                            resolve();
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }
+                );
+            });
+        }
+        return {ok: true, error: ''};
+    } catch (err) {
+        return {ok: false, error: err?.message || String(err)};
+    }
 }

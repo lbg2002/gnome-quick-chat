@@ -14,16 +14,24 @@ import {
     loadLocalBackendCatalog,
     migrateGSettingsIfNeeded,
 } from './core/backendDetect.js';
+import {attachCrossOriginRedirectGuard} from './backendClient.js';
 import {
+    SecretWriteQueue,
+    clearOpenAIApiKey,
+    inspectEndpointSecurity,
     loadOpenAIApiKey,
+    loadOpenAIApiKeyDetailed,
+    normalizeEndpointKeyIdentity,
     storeOpenAIApiKey,
 } from './core/secretStore.js';
 import {
     importLegacyPiSessionFileReadOnly,
     listLegacyPiSessionFiles,
 } from './core/sessionStore.js';
-
-const Decoder = new TextDecoder('utf-8');
+import {
+    parseModelsResponse,
+    redactSensitiveText,
+} from './runtime/sseParser.js';
 
 function makeResetButton(tooltip, onClick) {
     const btn = new Gtk.Button({
@@ -110,7 +118,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // --- Group 2: 自定义 OpenAI API 连接配置 (仅在 openai 模式或未配置引导下显示) ---
         const openaiGroup = new Adw.PreferencesGroup({
             title: '自定义 OpenAI 接口连接',
-            description: '支持 OpenAI / DeepSeek / Ollama / 本地代理等标准 /v1/chat/completions 流式协议。API Key 加密保存在系统密钥环 (GNOME Keyring)。',
+            description: '支持 OpenAI / DeepSeek / Ollama / 本地代理等标准 /v1/chat/completions 流式协议。API Key 按接口地址独立加密保存在系统密钥环 (GNOME Keyring)，切换地址绝不串发旧密钥。',
         });
         modelPage.add(openaiGroup);
 
@@ -121,42 +129,198 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         baseUrlRow.add_suffix(makeResetButton('清空接口地址', () => setStr('openai-base-url', '')));
         openaiGroup.add(baseUrlRow);
 
-        const apiKeyRow = new Adw.PasswordEntryRow({
-            title: '接口密钥 (API Key · 密钥环加密存储)',
+        const endpointSecurityRow = new Adw.ActionRow({
+            title: '远程明文 HTTP 安全提醒',
+            subtitle: '',
+            visible: false,
         });
+        openaiGroup.add(endpointSecurityRow);
+
+        const apiKeyRow = new Adw.PasswordEntryRow({
+            title: '当前接口密钥 (API Key · 按端点独立隔离)',
+        });
+        const clearKeyBtn = makeResetButton('从系统密钥环彻底清除当前接口密钥', () => {
+            triggerClearCurrentEndpointKey();
+        });
+        apiKeyRow.add_suffix(clearKeyBtn);
         openaiGroup.add(apiKeyRow);
 
+        const secretStatusRow = new Adw.ActionRow({
+            title: '密钥存储状态',
+            subtitle: '正在读取当前端点的系统密钥环状态…',
+        });
+        openaiGroup.add(secretStatusRow);
+
+        const allowPlaintextRow = new Adw.SwitchRow({
+            title: '密钥环不可用时允许本地兼容存储',
+            subtitle: '默认关闭（拒绝静默回退明文；未开启时若系统密钥环不可用，密钥仅保留在本次运行内存中）',
+        });
+        if (hasKey('allow-plaintext-key-fallback')) {
+            s.bind('allow-plaintext-key-fallback', allowPlaintextRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+        }
+        openaiGroup.add(allowPlaintextRow);
+
+        const secretQueue = new SecretWriteQueue();
         let syncingSecret = true;
         let secretSaveTimer = 0;
+        let pendingSaveEndpointUrl = '';
+        let pendingSaveKeyDraft = '';
         let latestApiKeyDraft = '';
+        let activeSecretEndpointSlot = normalizeEndpointKeyIdentity(getStr('openai-base-url', ''));
+        let closingAfterFlush = false;
+        let activeModelsCancellable = null;
 
-        loadOpenAIApiKey(s).then(loadedKey => {
-            latestApiKeyDraft = loadedKey || '';
+        const syncEndpointSecurityBanner = () => {
+            const rawUrl = getStr('openai-base-url', '').trim();
+            const sec = inspectEndpointSecurity(rawUrl);
+            if (sec.warning) {
+                endpointSecurityRow.visible = true;
+                endpointSecurityRow.title = sec.isRemotePlaintextHttp
+                    ? '⚠️ 远程明文 HTTP 风险提示'
+                    : '⚠️ 接口地址格式提示';
+                endpointSecurityRow.subtitle = sec.warning;
+            } else {
+                endpointSecurityRow.visible = false;
+                endpointSecurityRow.subtitle = '';
+            }
+        };
+
+        const flushPendingDebouncedSave = () => {
+            if (!secretSaveTimer) return null;
+            try { GLib.source_remove(secretSaveTimer); } catch (_) {}
+            secretSaveTimer = 0;
+            const targetUrl = pendingSaveEndpointUrl;
+            const targetDraft = pendingSaveKeyDraft;
+            return secretQueue.enqueue(async () => {
+                const res = await storeOpenAIApiKey(s, targetDraft, targetUrl);
+                if (normalizeEndpointKeyIdentity(getStr('openai-base-url', '')) === normalizeEndpointKeyIdentity(targetUrl)) {
+                    if (!res.ok) {
+                        secretStatusRow.subtitle = `❌ ${res.error || '密钥操作失败'}`;
+                    } else if (res.warning) {
+                        secretStatusRow.subtitle = `⚠️ ${res.warning}`;
+                    } else if (res.storage === 'keyring') {
+                        secretStatusRow.subtitle = '✓ 已加密保存在 GNOME Keyring（仅绑定当前接口地址）';
+                    } else if (!targetDraft) {
+                        secretStatusRow.subtitle = '当前接口未保存密钥';
+                    }
+                }
+                return res;
+            });
+        };
+
+        const loadSecretForCurrentEndpoint = () => {
+            const curUrl = getStr('openai-base-url', '').trim();
+            activeSecretEndpointSlot = normalizeEndpointKeyIdentity(curUrl);
+            const loadToken = secretQueue.beginLoad(curUrl);
+
+            // Immediately clear UI draft before async lookup so switching Base URL NEVER retains or leaks old host's key!
             syncingSecret = true;
-            apiKeyRow.text = latestApiKeyDraft;
+            latestApiKeyDraft = '';
+            apiKeyRow.text = '';
             syncingSecret = false;
-        }).catch(() => {
-            syncingSecret = false;
-        });
+
+            loadOpenAIApiKeyDetailed(s, curUrl).then(info => {
+                if (!secretQueue.shouldApplyLoad(loadToken, getStr('openai-base-url', '').trim())) {
+                    return;
+                }
+                latestApiKeyDraft = info.apiKey || '';
+                syncingSecret = true;
+                apiKeyRow.text = latestApiKeyDraft;
+                syncingSecret = false;
+
+                if (info.warning) {
+                    secretStatusRow.subtitle = `⚠️ ${info.warning}`;
+                } else if (info.apiKey && info.storage === 'keyring') {
+                    secretStatusRow.subtitle = info.migrated
+                        ? '✓ 已将旧版密钥安全迁移至系统密钥环并清除明文残留'
+                        : '✓ 已从系统密钥环加载当前端点的专属密钥';
+                } else if (info.apiKey && info.storage === 'memory') {
+                    secretStatusRow.subtitle = '⚠️ 当前密钥仅保存在本次运行内存中';
+                } else {
+                    secretStatusRow.subtitle = '当前接口尚未配置密钥（本地免鉴权服务可留空）';
+                }
+            }).catch(err => {
+                syncingSecret = false;
+                secretStatusRow.subtitle = `⚠️ 读取密钥环状态异常：${redactSensitiveText(err?.message || String(err))}`;
+            });
+        };
+
+        const triggerClearCurrentEndpointKey = () => {
+            if (secretSaveTimer) {
+                try { GLib.source_remove(secretSaveTimer); } catch (_) {}
+                secretSaveTimer = 0;
+            }
+            const curUrl = getStr('openai-base-url', '').trim();
+            secretStatusRow.subtitle = '正在清除当前接口密钥…';
+            secretQueue.enqueue(async () => {
+                const res = await clearOpenAIApiKey(s, curUrl);
+                if (!res.ok) {
+                    // Never pretend deletion succeeded when Keyring rejected clear!
+                    secretStatusRow.subtitle = `❌ ${res.error || '系统密钥环删除失败，请检查密钥环锁定状态'}`;
+                    return res;
+                }
+                if (normalizeEndpointKeyIdentity(getStr('openai-base-url', '').trim()) === normalizeEndpointKeyIdentity(curUrl)) {
+                    latestApiKeyDraft = '';
+                    syncingSecret = true;
+                    apiKeyRow.text = '';
+                    syncingSecret = false;
+                    secretStatusRow.subtitle = res.removedFromKeyring
+                        ? '✓ 已从系统密钥环彻底删除当前接口密钥'
+                        : '✓ 当前接口已无保存的密钥';
+                }
+                return res;
+            });
+        };
+
+        syncEndpointSecurityBanner();
+        loadSecretForCurrentEndpoint();
 
         apiKeyRow.connect('notify::text', () => {
             if (syncingSecret) return;
             latestApiKeyDraft = apiKeyRow.text.trim();
+            pendingSaveEndpointUrl = getStr('openai-base-url', '').trim();
+            pendingSaveKeyDraft = latestApiKeyDraft;
+            // Bump edit version immediately so any in-flight initial load cannot clobber user's typing!
+            secretQueue.bumpEditVersion();
             if (secretSaveTimer) {
                 try { GLib.source_remove(secretSaveTimer); } catch (_) {}
             }
-            secretSaveTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
+            secretSaveTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 320, () => {
                 secretSaveTimer = 0;
-                storeOpenAIApiKey(s, latestApiKeyDraft).catch(() => {});
+                const targetUrl = pendingSaveEndpointUrl;
+                const targetDraft = pendingSaveKeyDraft;
+                secretQueue.enqueue(async () => {
+                    const res = await storeOpenAIApiKey(s, targetDraft, targetUrl);
+                    if (normalizeEndpointKeyIdentity(getStr('openai-base-url', '')) === normalizeEndpointKeyIdentity(targetUrl)) {
+                        if (!res.ok) {
+                            secretStatusRow.subtitle = `❌ ${res.error || '密钥保存失败'}`;
+                        } else if (res.warning) {
+                            secretStatusRow.subtitle = `⚠️ ${res.warning}`;
+                        } else if (res.storage === 'keyring') {
+                            secretStatusRow.subtitle = '✓ 已加密保存在 GNOME Keyring（仅绑定当前接口地址）';
+                        } else if (!targetDraft) {
+                            secretStatusRow.subtitle = '✓ 当前接口密钥已清空';
+                        }
+                    }
+                    return res;
+                });
                 return GLib.SOURCE_REMOVE;
             });
         });
 
         window.connect('close-request', () => {
-            if (secretSaveTimer) {
-                try { GLib.source_remove(secretSaveTimer); } catch (_) {}
-                secretSaveTimer = 0;
-                storeOpenAIApiKey(s, latestApiKeyDraft).catch(() => {});
+            try { activeModelsCancellable?.cancel?.(); } catch (_) {}
+            if (closingAfterFlush) {
+                return false;
+            }
+            flushPendingDebouncedSave();
+            if (secretQueue.hasPendingWrites) {
+                secretStatusRow.subtitle = '正在完成密钥安全保存…';
+                secretQueue.flush().finally(() => {
+                    closingAfterFlush = true;
+                    try { window.close(); } catch (_) {}
+                });
+                return true;
             }
             return false;
         });
@@ -517,6 +681,29 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         workspaceRow.add_suffix(makeResetButton('恢复默认主目录', () => setStr('workspace', '')));
         agentGroup.add(workspaceRow);
 
+        // --- Group 4: 隐私与本地历史管理 ---
+        const privacyGroup = new Adw.PreferencesGroup({
+            title: '隐私与本地会话存储',
+            description: '本地对话保存在 ~/.local/share/gnome-quick-chat/sessions/（私有 0700/0600 权限，包含消息正文、模型标识与时间戳）。随问默认绝不自动发送剪贴板、窗口标题或文件正文，后台通知默认不暴露回答正文。',
+        });
+        uiPage.add(privacyGroup);
+
+        const resetSessionRow = new Adw.ActionRow({
+            title: '新建空白当前会话',
+            subtitle: '立即切换至全新会话并撤销当前会话内的已授权工具范围（已有历史文件保留在磁盘中）',
+        });
+        const resetSessionBtn = new Gtk.Button({
+            label: '新建会话',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        resetSessionBtn.connect('clicked', () => {
+            setStr('session-id', GLib.uuid_string_random());
+            resetSessionRow.subtitle = '✓ 已切换至全新空白会话';
+        });
+        resetSessionRow.add_suffix(resetSessionBtn);
+        privacyGroup.add(resetSessionRow);
+
         // --- Optional Group 4: 旧版 Pi 本地历史只读导入 ---
         const legacyPiFiles = listLegacyPiSessionFiles();
         if (legacyPiFiles.length > 0) {
@@ -734,7 +921,21 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             }
         };
 
-        baseUrlRow.connect('notify::text', () => rebuildProviderAndModelUi());
+        let modelsRefreshGeneration = 0;
+
+        baseUrlRow.connect('notify::text', () => {
+            syncEndpointSecurityBanner();
+            const nextUrl = getStr('openai-base-url', '').trim();
+            const nextSlot = normalizeEndpointKeyIdentity(nextUrl);
+            if (nextSlot !== activeSecretEndpointSlot) {
+                // Flush any pending key edit to its original endpoint BEFORE switching to the new endpoint!
+                flushPendingDebouncedSave();
+                onlineOpenAIModels = [];
+                try { activeModelsCancellable?.cancel?.(); } catch (_) {}
+                loadSecretForCurrentEndpoint();
+            }
+            rebuildProviderAndModelUi();
+        });
 
         backendRow.connect('notify::selected', () => {
             const next = backends[backendRow.selected] || 'auto';
@@ -798,6 +999,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
 
         refreshBtn.connect('clicked', async () => {
+            const reqGen = ++modelsRefreshGeneration;
+            try { activeModelsCancellable?.cancel?.(); } catch (_) {}
+            const reqCancellable = new Gio.Cancellable();
+            activeModelsCancellable = reqCancellable;
+
             const eff = getEffectiveBackend();
             currentCatalog = loadLocalBackendCatalog(eff);
 
@@ -807,7 +1013,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
             if (eff === 'openai' || eff === 'unconfigured') {
                 targetBaseUrl = getStr('openai-base-url', '').trim();
-                targetApiKey = latestApiKeyDraft || (await loadOpenAIApiKey(s));
+                targetApiKey = latestApiKeyDraft || (await loadOpenAIApiKey(s, targetBaseUrl));
             } else {
                 const curProv = getActiveProvider(eff);
                 targetProviderObj = (curProv && currentCatalog.providers.find(p => p.id === curProv))
@@ -816,6 +1022,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     targetBaseUrl = targetProviderObj.baseUrl;
                     targetApiKey = targetProviderObj.apiKey || '';
                 }
+            }
+
+            if (reqGen !== modelsRefreshGeneration || reqCancellable.is_cancelled()) {
+                return;
             }
 
             if (!targetBaseUrl) {
@@ -840,33 +1050,40 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 rebuildProviderAndModelUi(`❌ 无效的接口地址：${modelsUrl}`);
                 return;
             }
+            attachCrossOriginRedirectGuard(msg, modelsUrl);
             msg.get_request_headers().append('Accept', 'application/json');
             if (targetApiKey) {
                 msg.get_request_headers().append('Authorization', `Bearer ${targetApiKey}`);
             }
 
-            session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (sess, res) => {
+            session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, reqCancellable, (sess, res) => {
+                if (reqGen !== modelsRefreshGeneration) {
+                    return;
+                }
                 refreshBtn.sensitive = true;
                 refreshBtnContent.label = '查询 / 刷新模型';
                 try {
                     const bytes = sess.send_and_read_finish(res);
+                    const rawData = bytes?.get_data?.() || new Uint8Array(0);
                     const status = msg.get_status();
-                    const bodyText = Decoder.decode(bytes.get_data() || new Uint8Array());
-                    if (status < 200 || status >= 300) {
-                        rebuildProviderAndModelUi(`⚠️ 在线查询返回 HTTP ${status}，已使用本地配置列表`);
-                        return;
-                    }
-                    const parsed = JSON.parse(bodyText);
-                    const items = Array.isArray(parsed.data) ? parsed.data : [];
-                    const ids = items.map(it => String(it?.id || '').trim()).filter(Boolean);
+                    const preferred = eff === 'openai' || eff === 'unconfigured'
+                        ? getStr('openai-model', '').trim()
+                        : getActiveModel(eff);
+
+                    const parsed = parseModelsResponse(status, rawData, {
+                        preferredModel: preferred,
+                        apiKey: targetApiKey,
+                    });
+                    const ids = parsed.models;
                     if (!ids.length) {
                         rebuildProviderAndModelUi('⚠️ 在线接口未返回模型列表，已使用本地配置');
                         return;
                     }
                     if (eff === 'openai' || eff === 'unconfigured') {
                         onlineOpenAIModels = ids;
-                        if (!getStr('openai-model', '').trim() && ids[0]) {
-                            setStr('openai-model', ids[0]);
+                        // User-selected model ALWAYS takes precedence over models[0]!
+                        if (!preferred && parsed.selectedModel) {
+                            setStr('openai-model', parsed.selectedModel);
                         }
                         rebuildProviderAndModelUi(`✓ 连接成功：从 ${modelsUrl} 拉取到 ${ids.length} 个在线模型`);
                     } else {
@@ -877,7 +1094,12 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                         catalogGroup.description = `✓ 已合并本地配置与 ${targetProviderObj?.name || ''} 在线查询结果（共 ${ids.length} 个在线模型）`;
                     }
                 } catch (err) {
-                    rebuildProviderAndModelUi(`⚠️ 在线接口暂不可达（${err.message}），已加载本地配置列表`);
+                    if (reqCancellable.is_cancelled()) return;
+                    const cleanErr = redactSensitiveText(err?.message || String(err), {
+                        apiKey: targetApiKey,
+                        maxChars: 200,
+                    });
+                    rebuildProviderAndModelUi(`⚠️ 在线查询未成功（${cleanErr}），已保留现有配置`);
                 }
             });
         });

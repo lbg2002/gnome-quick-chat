@@ -59,7 +59,11 @@
     </key>
     <key name="openai-api-key" type="s">
       <default>''</default>
-      <summary>Legacy OpenAI-compatible API Key (migrated to GNOME Keyring)</summary>
+      <summary>Legacy or user-authorized fallback OpenAI-compatible API Key</summary>
+    </key>
+    <key name="allow-plaintext-key-fallback" type="b">
+      <default>false</default>
+      <summary>Allow storing API keys in local GSettings only when GNOME Keyring is unavailable and explicitly approved by user</summary>
     </key>
     <key name="openai-model" type="s">
       <default>''</default>

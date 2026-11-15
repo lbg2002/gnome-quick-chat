@@ -408,16 +408,20 @@ test('Model signature, budgeted context slicing, cross-backend handoff, and capa
     assert.notEqual(sigOpenAI1, sigOpenAI2);
     assert.equal(buildModelSignature('zcode', {provider: 'openai', model: 'gpt-6-luna'}), 'zcode:openai:gpt-6-luna');
 
-    // Budgeted context respects character ceiling while always keeping at least the latest turn
+    // Budgeted context selects strictly by COMPLETE turns (never leaving an orphan assistant reply)
     const history = [
         {role: 'user', content: 'A'.repeat(500)},
         {role: 'assistant', content: 'B'.repeat(500)},
+        {role: 'user', content: '上一轮短问题'},
+        {role: 'assistant', content: '上一轮短回答'},
         {role: 'user', content: '最近的问题'},
     ];
     const budgeted = buildBudgetedContextMessages(history, 10, 600);
-    assert.equal(budgeted.length, 2);
-    assert.equal(budgeted[0].content, 'B'.repeat(500));
-    assert.equal(budgeted[1].content, '最近的问题');
+    assert.equal(budgeted.length, 3);
+    assert.equal(budgeted[0].role, 'user');
+    assert.equal(budgeted[0].content, '上一轮短问题');
+    assert.equal(budgeted[1].content, '上一轮短回答');
+    assert.equal(budgeted[2].content, '最近的问题');
 
     // Cross-backend prompt carries concise prior context when switching backends mid-session
     const handoffPrompt = buildCrossBackendPromptWithContext(

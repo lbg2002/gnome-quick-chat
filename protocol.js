@@ -6,8 +6,25 @@ import {
     isInteractiveQuestionTool,
     summarizeToolInput,
 } from './core/permissionPolicy.js';
+import {
+    buildBudgetedContextMessages,
+    buildCrossBackendPromptWithContext,
+    buildRuntimeContextSignature,
+    estimateTextTokens,
+    preparePromptWithinBudget,
+    sanitizeMessagesForModelContext,
+} from './core/contextManager.js';
 
-export {computePermissionScope, evaluatePermissionPolicy};
+export {
+    buildBudgetedContextMessages,
+    buildCrossBackendPromptWithContext,
+    buildRuntimeContextSignature,
+    computePermissionScope,
+    estimateTextTokens,
+    evaluatePermissionPolicy,
+    preparePromptWithinBudget,
+    sanitizeMessagesForModelContext,
+};
 
 const UTF8_ENC = new TextEncoder();
 export const MAX_ARGV_PROMPT_BYTES = 32 * 1024;
@@ -60,14 +77,21 @@ export function detailedMessages(messages) {
     return (Array.isArray(messages) ? messages : [])
         .filter(m => m && ['user', 'assistant'].includes(m.role))
         .map(m => ({
+            ...(m.id ? {id: m.id} : {}),
+            ...(m.turnId ? {turnId: m.turnId} : {}),
+            ...(m.replyTo ? {replyTo: m.replyTo} : {}),
             role: m.role,
             text: messageText(m),
             thinking: m.role === 'assistant' ? messageThinking(m) : '',
             createdAt: m.createdAt || '',
+            ...(typeof m.ts === 'number' && m.ts > 0 ? {ts: m.ts} : {}),
+            ...(m.backend ? {backend: m.backend} : {}),
             modelId: m.modelId || '',
             status: m.status || 'completed',
+            ...(m.partial ? {partial: true} : {}),
+            ...(m.errorMessage ? {errorMessage: m.errorMessage} : {}),
         }))
-        .filter(m => m.text.length > 0 || m.thinking.length > 0);
+        .filter(m => m.text.length > 0 || m.thinking.length > 0 || Boolean(m.errorMessage));
 }
 
 /**
@@ -410,27 +434,6 @@ export function buildModelSignature(backend, config = {}) {
     return `${backend}:${String(config.provider || '').trim()}:${String(config.model || '').trim()}`;
 }
 
-export function buildBudgetedContextMessages(messages, maxMessages = 24, maxChars = 28000) {
-    if (!Array.isArray(messages) || !messages.length) return [];
-    const selected = [];
-    let usedChars = 0;
-
-    for (let i = messages.length - 1; i >= 0 && selected.length < maxMessages; i--) {
-        const m = messages[i];
-        if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
-        const txt = messageText(m).trim();
-        if (!txt) continue;
-        if (selected.length > 0 && usedChars + txt.length > maxChars) {
-            break;
-        }
-        selected.push({role: m.role, content: txt});
-        usedChars += txt.length;
-    }
-
-    selected.reverse();
-    return selected;
-}
-
 const USER_DIR_MENTION_RE = /(?:桌面|下载|文档|图片|视频|音乐|主目录|家目录|\bdesktop\b|\bdownloads?\b|\bdocuments?\b|\bpictures?\b)/i;
 
 export function expandHomePath(rawPath, homeDir = '') {
@@ -491,19 +494,6 @@ export function augmentPromptWithDesktopContext(promptText, envDirs = null, {isF
     }
 
     return `[Ubuntu GNOME 用户目录环境：${parts.join('，')}${clashWarning}]\n${rawPrompt}`;
-}
-
-export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromptText, maxChars = 6000) {
-    const prior = buildBudgetedContextMessages(historyBeforePrompt, 8, maxChars);
-    if (!prior.length) return newPromptText;
-    const lines = prior.map(m => `${m.role === 'user' ? '用户' : '助手'}：${m.content}`);
-    return [
-        '[以下是当前随问会话的前序上下文，请自然承接回答最新问题]',
-        ...lines,
-        '',
-        '[最新问题]',
-        newPromptText,
-    ].join('\n');
 }
 
 function assertPromptWithinLimit(rawPrompt, {viaArgv = false} = {}) {
@@ -892,11 +882,20 @@ export function normalizeEvent(backend, record) {
         if (type === 'model.streaming') {
             const kind = record.payload?.kind;
             const delta = record.payload?.delta ?? '';
+            const segmentId = String(record.payload?.messageId || record.payload?.itemId || record.messageId || '');
             if (kind === 'text_delta' && delta) {
-                return {type: 'message_update', assistantMessageEvent: {type: 'text_delta', delta}};
+                return {
+                    type: 'message_update',
+                    ...(segmentId ? {segmentId} : {}),
+                    assistantMessageEvent: {type: 'text_delta', delta},
+                };
             }
             if (kind === 'reasoning_delta' && delta) {
-                return {type: 'message_update', assistantMessageEvent: {type: 'thinking_delta', delta}};
+                return {
+                    type: 'message_update',
+                    ...(segmentId ? {segmentId} : {}),
+                    assistantMessageEvent: {type: 'thinking_delta', delta},
+                };
             }
             return null;
         }
@@ -1083,8 +1082,13 @@ export function normalizeEvent(backend, record) {
         if (type === 'item.started' || type === 'item.updated' || type === 'item.completed') {
             const item = record.item;
             if (!item || typeof item !== 'object') return null;
+            const segmentId = item.id ? String(item.id) : '';
             if (item.type === 'reasoning' && typeof item.text === 'string' && item.text) {
-                return {type: 'thinking_snapshot', text: item.text};
+                return {
+                    type: 'thinking_snapshot',
+                    ...(segmentId ? {segmentId} : {}),
+                    text: item.text,
+                };
             }
             if (item.type === 'command_execution' || item.type === 'mcp_tool_call' || item.type === 'file_change') {
                 const toolCallId = item.id ? String(item.id) : '';
@@ -1116,9 +1120,21 @@ export function normalizeEvent(backend, record) {
             }
             if (item.type === 'agent_message' && typeof item.text === 'string') {
                 if (type === 'item.completed') {
-                    return {type: 'message_end', message: {role: 'assistant', content: item.text}};
+                    return {
+                        type: 'message_end',
+                        ...(segmentId ? {segmentId} : {}),
+                        message: {
+                            ...(segmentId ? {id: segmentId} : {}),
+                            role: 'assistant',
+                            content: item.text,
+                        },
+                    };
                 }
-                return {type: 'text_snapshot', text: item.text};
+                return {
+                    type: 'text_snapshot',
+                    ...(segmentId ? {segmentId} : {}),
+                    text: item.text,
+                };
             }
         }
         if (type === 'turn.completed') {

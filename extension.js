@@ -19,6 +19,7 @@ import {
 } from './protocol.js';
 import {getSessionsDir, resolveWorkspacePath} from './core/paths.js';
 import {loadOpenAIApiKey} from './core/secretStore.js';
+import {validateSessionId} from './core/sessionStore.js';
 import {
     detectEffectiveBackend,
     loadLocalBackendCatalog,
@@ -144,7 +145,8 @@ export default class QuickChat extends Extension {
                     this._flushPendingBackgroundWork();
                     if (this._client) {
                         const gen = this._generation;
-                        loadOpenAIApiKey(this._settings).then(k => {
+                        const curBaseUrl = this._getSettingString('openai-base-url', '').trim();
+                        loadOpenAIApiKey(this._settings, curBaseUrl).then(k => {
                             if (this._enabled && this._lifecycleGeneration === lifeGen && this._generation === gen) {
                                 this._client?.updateApiKey?.(k);
                             }
@@ -1253,7 +1255,8 @@ export default class QuickChat extends Extension {
 
     async _loadRuntimeConfig() {
         migrateGSettingsIfNeeded(this._settings);
-        const apiKey = await loadOpenAIApiKey(this._settings);
+        const openaiBaseUrl = this._getSettingString('openai-base-url', '').trim();
+        const apiKey = await loadOpenAIApiKey(this._settings, openaiBaseUrl);
         const eff = this._getEffectiveBackend();
         const activeModel = this._getBackendModel(eff);
         return {
@@ -1262,7 +1265,7 @@ export default class QuickChat extends Extension {
             codexPath: this._getSettingString('codex-path', '').trim(),
             provider: this._getBackendProvider(eff),
             model: activeModel,
-            openaiBaseUrl: this._getSettingString('openai-base-url', '').trim(),
+            openaiBaseUrl,
             openaiApiKey: apiKey,
             openaiModel: this._getSettingString('openai-model', '').trim() || activeModel,
             systemPrompt: this._getSettingString('system-prompt', '').trim(),
@@ -1289,12 +1292,17 @@ export default class QuickChat extends Extension {
         });
     }
 
-    _reconnectNow() {
+    async _reconnectNow() {
         if (!this._enabled || this._busy) return;
         if (this._configReconnectTimer) {
             this._clearTimer(this._configReconnectTimer);
             this._configReconnectTimer = 0;
         }
+        const oldClient = this._client;
+        if (oldClient) {
+            try { await oldClient.request('flush_session'); } catch (_) {}
+        }
+        if (!this._enabled || this._busy) return;
         this._stopClient();
         this._ensureClient();
     }
@@ -1332,7 +1340,9 @@ export default class QuickChat extends Extension {
                 if (!GLib.file_test(work, GLib.FileTest.IS_DIR)) throw new Error('配置的工作目录不存在');
 
                 let sessionId = this._getSettingString('session-id', '');
-                if (!sessionId) {
+                try {
+                    sessionId = validateSessionId(sessionId);
+                } catch (_) {
                     sessionId = GLib.uuid_string_random();
                     this._settings.set_string('session-id', sessionId);
                 }
@@ -1399,8 +1409,13 @@ export default class QuickChat extends Extension {
                 const effectiveMode = state.effectiveMode || config.mode;
                 const caps = state.capabilities || getBackendCapabilities(state.backend, effectiveMode);
                 const badge = caps.modeBadges?.[effectiveMode] || caps.modeBadges?.[config.mode] || '';
-                this._idleStatus = badge ? `${this._modelLabel} · ${badge}` : this._modelLabel;
-                this._setStatusIndicator('ready', this._idleStatus);
+                const httpWarnSuffix = state.endpointSecurity?.isRemotePlaintextHttp ? ' · ⚠️明文HTTP' : '';
+                this._idleStatus = (badge ? `${this._modelLabel} · ${badge}` : this._modelLabel) + httpWarnSuffix;
+                if (state.sessionUnsavedWarning) {
+                    this._setStatusIndicator('error', `⚠️ ${state.sessionUnsavedWarning}`);
+                } else {
+                    this._setStatusIndicator('ready', this._idleStatus);
+                }
                 this._setBusy(false);
                 this._scrollBottom(true);
             } catch (error) {
@@ -2980,6 +2995,11 @@ export default class QuickChat extends Extension {
             return;
         }
 
+        if (event.type === 'session_save_error') {
+            this._setStatusIndicator('error', `⚠️ ${event.message || '历史未保存'}`);
+            return;
+        }
+
         if ((event.type === 'bridge_warning' || event.type === 'mode_notice') && event.message) {
             if (!this._hasPendingApprovalNodes(this._live)) {
                 this._setStatusIndicator('busy', `ℹ️ ${event.message}`);
@@ -3229,7 +3249,7 @@ export default class QuickChat extends Extension {
             }
         }
 
-        if (event.type === 'message_end' && event.message?.role === 'assistant') {
+        if ((event.type === 'message_end' || event.type === 'message_final') && event.message?.role === 'assistant') {
             const text = messageText(event.message);
             const thinking = messageThinking(event.message);
             if (text || thinking || event.message.errorMessage) {
@@ -3258,7 +3278,11 @@ export default class QuickChat extends Extension {
             this._scrollBottom(false);
         }
 
-        if (event.type === 'agent_settled' || (event.type === 'agent_end' && event.willRetry === undefined)) {
+        if (
+            event.type === 'agent_settled' ||
+            event.type === 'turn_settled' ||
+            (event.type === 'agent_end' && event.willRetry === undefined)
+        ) {
             const terminalStatus = event.status || (event.aborted ? 'cancelled' : 'completed');
             const finishedText = this._live?.text || '';
             if (this._live) {
@@ -3309,7 +3333,7 @@ export default class QuickChat extends Extension {
                 this._setStatusIndicator('error', event.errorMessage || '输出中断（回答可能不完整）');
             } else if (terminalStatus === 'failed') {
                 this._setStatusIndicator('error', event.errorMessage ? `错误：${event.errorMessage}` : '执行失败');
-            } else if (!this._lastStatusText.startsWith('错误：')) {
+            } else if (!this._lastStatusText.startsWith('错误：') && !this._lastStatusText.startsWith('⚠️ 历史未保存')) {
                 this._setStatusIndicator('ready', this._idleStatus || '随问');
             }
 
@@ -3359,12 +3383,17 @@ export default class QuickChat extends Extension {
         }
     }
 
-    _newSession() {
+    async _newSession() {
         if (this._busy) return;
         if (this._modelPickerOpen) {
             this._toggleModelPicker(false);
         }
-        this._client?.revokeApprovedScopes?.();
+        const prevClient = this._client;
+        prevClient?.revokeApprovedScopes?.();
+        if (prevClient) {
+            try { await prevClient.request('flush_session'); } catch (_) {}
+        }
+        if (!this._enabled || this._busy) return;
         this._stopClient();
         this._draftInput = '';
         this._promptHistory = [];

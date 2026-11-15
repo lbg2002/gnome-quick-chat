@@ -2,6 +2,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {expandHomePath} from '../protocol.js';
 import {resolveRealPathWithLinkOps} from './permissionPolicy.js';
+import {resolveSafeSessionPaths} from './sessionEngine.js';
 import {cleanupStaleRuntimeFilesWithEnv} from '../runtime/cliProcessRunner.js';
 
 export const APP_DIR_NAME = 'gnome-quick-chat';
@@ -15,11 +16,11 @@ export function getSessionsDir() {
 }
 
 export function getSessionDir(sessionId) {
-    return GLib.build_filenamev([getSessionsDir(), sessionId]);
+    return resolveSafeSessionPaths(getSessionsDir(), sessionId).dir;
 }
 
 export function getLegacySessionFile(sessionId) {
-    return GLib.build_filenamev([getSessionsDir(), `${sessionId}.qc.json`]);
+    return resolveSafeSessionPaths(getSessionsDir(), sessionId).legacyPath;
 }
 
 export function resolveWorkspacePath(rawWorkspace = '') {

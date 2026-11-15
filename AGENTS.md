@@ -19,8 +19,8 @@
 | --- | --- | --- | --- | --- |
 | A | P0 | 移除 Pi、配置迁移、后端检测 | 三后端可用，旧安装可升级 | ✅ 已完成 |
 | B | P0 | 审批安全、回合状态、子进程取消 | 权限不扩大、回合隔离、失败准确 | ✅ 已完成 |
-| C | P0/P1 | 会话数据一致性、流协议与密钥 | 历史正确、流终止可靠、密钥不泄露 | 进行中 |
-| D | P1 | GNOME 主线程与长文本性能 | 有可复现性能数据及回归测试 | 待实施 |
+| C | P0/P1 | 会话数据一致性、流协议与密钥 | 历史正确、流终止可靠、密钥不泄露 | ✅ 已完成 |
+| D | P1 | GNOME 主线程与长文本性能 | 有可复现性能数据及回归测试 | 进行中 |
 | E | P1 | 模块化、配置和 GNOME 生命周期 | 可维护、可独立测试、安装可回滚 | 待实施 |
 | F | P2 | 桌面上下文、快捷动作、会话恢复 | 提升日常使用效率，不增加常驻负担 | 待实施 |
 
@@ -103,53 +103,53 @@
 
 验收：假 CLI 模拟正常结束、无标记 EOF、非零退出、stderr 后到、超时、创建子进程、取消后马上发送新任务；检查无残留进程与错误 UI 状态。
 
-## 4. C：会话、协议与密钥（P0/P1）
+## 4. C：会话、协议与密钥（P0/P1）— ✅ 已完成
 
-### C1. 修复 JSONL 压缩竞争和持久化一致性（P0）
+### C1. 修复 JSONL 压缩竞争和持久化一致性（P0）— ✅ 已完成
 
 现状：core/sessionStore.js appendMessage / _rewriteAllMessagesNow（199–237）。压缩任务在队列执行时读取实时 this.messages，会将后续待追加记录提前写入，导致重复消息。
 
-- 入队时生成不可变 record/snapshot；压缩任务仅写入其对应 revision 快照，之后的 append 只写自己的记录。元数据同样不能隐式读取后续变化的共享对象。
-- 给消息和回合添加稳定 ID、revision、role、createdAt、backend、modelId、replyTo、status。加载时按 ID 去重，保留顺序；旧数据迁移不丢失。
-- SessionStore.load 使用 single-flight Promise；同一 sessionId 的多实例写入通过共享队列/生命周期协调，避免旧客户端与新客户端同时写同一个文件。等待必要的写入完成再切换会话或重连。
-- appendLineAsync 必须检查写入及关闭结果；原子替换单文件不等于 meta 与 JSONL 跨文件事务。设计可恢复 revision/提交顺序，避免崩溃后元数据与日志不一致。
-- 写入失败可观察，UI 提示“历史未保存”，重试有界，不静默吞掉错误。损坏行隔离并记录，不能自动覆盖唯一历史副本。
-- 不要按单条消息无条件删除历史的另一半回合。当前 200 条限制可保留为默认热历史窗口，但完整历史与磁盘清理应明确用户策略；压缩按完整回合处理并测试单条超大消息。
-- 会话 ID 必须验证为受控格式，构建路径后保证处于数据根目录内；禁止相对路径逃逸。目录/文件权限保持私有。
+- [x] 入队时生成不可变 record/snapshot；压缩任务仅写入其对应 revision 快照，之后的 append 只写自己的记录。元数据同样不能隐式读取后续变化的共享对象。
+- [x] 给消息和回合添加稳定 ID、revision、role、createdAt、backend、modelId、replyTo、status。加载时按 ID 去重，保留顺序；旧数据迁移不丢失。
+- [x] SessionStore.load 使用 single-flight Promise；同一 sessionId 的多实例写入通过共享队列/生命周期协调，避免旧客户端与新客户端同时写同一个文件。等待必要的写入完成再切换会话或重连。
+- [x] appendLineAsync 必须检查写入及关闭结果；原子替换单文件不等于 meta 与 JSONL 跨文件事务。设计可恢复 revision/提交顺序，避免崩溃后元数据与日志不一致。
+- [x] 写入失败可观察，UI 提示“历史未保存”，重试有界，不静默吞掉错误。损坏行隔离并记录，不能自动覆盖唯一历史副本。
+- [x] 不要按单条消息无条件删除历史的另一半回合。当前 200 条限制可保留为默认热历史窗口，但完整历史与磁盘清理应明确用户策略；压缩按完整回合处理并测试单条超大消息。
+- [x] 会话 ID 必须验证为受控格式，构建路径后保证处于数据根目录内；禁止相对路径逃逸。目录/文件权限保持私有。
 
 测试：201 条触发压缩期间并发追加 202/203，重新读取后无重复或丢失；多实例/重连写入、断电式中断、损坏 JSONL 尾行、旧版迁移、写失败、超长记录。
 
-### C2. 统一三后端会话与上下文预算
+### C2. 统一三后端会话与上下文预算 — ✅ 已完成
 
-- 当前 SessionStore 已覆盖 ZCode/Codex/OpenAI，继续以其为唯一用户可见历史来源，不再按后端维护不一致的 UI 历史。
-- 后端 remoteSessionId 绑定 backend + 实际 provider/model/endpoint + workspace + permission mode 等关键运行上下文；不把旧会话 ID 传给其他后端。恢复失败时提示并使用受预算限制的本地历史重新开始。
-- 后端切换时，如果继续使用同一个逻辑会话，要在新后端首次请求中注入最近的相关历史；不能复用已经落后的远端会话导致遗漏其他后端回合。可使用 revision 绑定远端会话，或明确失效后重建。
-- 当前 buildBudgetedContextMessages（protocol.js 347–366）按消息数/字符数截断，最新超大消息可超过上限。改成完整回合选择，保证 system prompt 和当前问题空间，预留输出预算；优先采用后端提供的 token/context 信息，缺失时使用保守估算。超长当前问题显式提示截断或拒绝，不静默丢失。
-- 区分原始文本、思考、工具摘要、错误、取消、截断状态。错误提示和 UI 警告不得写进发送模型的正文。默认不将隐藏思考与敏感工具结果重新发送给云端。
-- 无需向量数据库、RAG 或复杂长期记忆。更早历史可选摘要，默认轻量。
+- [x] 当前 SessionStore 已覆盖 ZCode/Codex/OpenAI，继续以其为唯一用户可见历史来源，不再按后端维护不一致的 UI 历史。
+- [x] 后端 remoteSessionId 绑定 backend + 实际 provider/model/endpoint + workspace + permission mode 等关键运行上下文；不把旧会话 ID 传给其他后端。恢复失败时提示并使用受预算限制的本地历史重新开始。
+- [x] 后端切换时，如果继续使用同一个逻辑会话，要在新后端首次请求中注入最近的相关历史；不能复用已经落后的远端会话导致遗漏其他后端回合。可使用 revision 绑定远端会话，或明确失效后重建。
+- [x] 当前 buildBudgetedContextMessages（protocol.js 347–366）按消息数/字符数截断，最新超大消息可超过上限。改成完整回合选择，保证 system prompt 和当前问题空间，预留输出预算；优先采用后端提供的 token/context 信息，缺失时使用保守估算。超长当前问题显式提示截断或拒绝，不静默丢失。
+- [x] 区分原始文本、思考、工具摘要、错误、取消、截断状态。错误提示和 UI 警告不得写进发送模型的正文。默认不将隐藏思考与敏感工具结果重新发送给云端。
+- [x] 无需向量数据库、RAG 或复杂长期记忆。更早历史可选摘要，默认轻量。
 
-### C3. 流式事件规范与 SSE 完整性
+### C3. 流式事件规范与 SSE 完整性 — ✅ 已完成
 
 现状：piClient.js text_snapshot（929–949）将非前缀快照作为 delta，UI 又 append；extension.js message_end（2712–2725）以 includes 合并，可能重复/漏掉修正内容。
 
-- 明确 text_delta、text_replace、thinking_delta、thinking_replace、message_final、tool_start/update/end、permission_request/resolved、turn_settled 事件及 ID。完整快照覆盖而非追加；最终权威消息与 SessionStore 完全一致。
-- 多条 assistant 消息/工具调用按 messageId 或明确的回合聚合协议处理；不要依据字符串 contains 猜测重复。
-- OpenAI SSE 按事件而非单行解析：支持 CRLF、空行分隔、多行 data、注释、网络分片、UTF-8；识别 [DONE]、finish_reason、usage、API error。兼容合法的非流式 JSON 回退；对未结束的 EOF 标为 interrupted，不能在正文附加网络警告。
-- 响应流所有路径（正常、失败、取消、超时、HTTP 非 2xx）显式关闭/取消并释放；所有 Gio 异步调用正确 finish，迟到结果不更新当前回合。
-- 非 SSE body、HTTP 错误体、模型列表、单条 JSONL、思考/工具输出设置可配置或合理字节上限。错误信息脱敏且截断。
-- /models 先检查 HTTP 状态，再解析结构；用户选定模型优先于列表第一个模型。未知/不支持 reasoning_effort 时不强制发送；支持模型能力配置。
-- 设置连接、首字、流空闲、总时长分离的超时策略；Agent 长工具执行与等待审批不能简单以无文字 120s 判失败。禁止对有副作用的 Agent 请求自动重试。
+- [x] 明确 text_delta、text_replace、thinking_delta、thinking_replace、message_final、tool_start/update/end、permission_request/resolved、turn_settled 事件及 ID。完整快照覆盖而非追加；最终权威消息与 SessionStore 完全一致。
+- [x] 多条 assistant 消息/工具调用按 messageId 或明确的回合聚合协议处理；不要依据字符串 contains 猜测重复。
+- [x] OpenAI SSE 按事件而非单行解析：支持 CRLF、空行分隔、多行 data、注释、网络分片、UTF-8；识别 [DONE]、finish_reason、usage、API error。兼容合法的非流式 JSON 回退；对未结束的 EOF 标为 interrupted，不能在正文附加网络警告。
+- [x] 响应流所有路径（正常、失败、取消、超时、HTTP 非 2xx）显式关闭/取消并释放；所有 Gio 异步调用正确 finish，迟到结果不更新当前回合。
+- [x] 非 SSE body、HTTP 错误体、模型列表、单条 JSONL、思考/工具输出设置可配置或合理字节上限。错误信息脱敏且截断。
+- [x] /models 先检查 HTTP 状态，再解析结构；用户选定模型优先于列表第一个模型。未知/不支持 reasoning_effort 时不强制发送；支持模型能力配置。
+- [x] 设置连接、首字、流空闲、总时长分离的超时策略；Agent 长工具执行与等待审批不能简单以无文字 120s 判失败。禁止对有副作用的 Agent 请求自动重试。
 
-### C4. API Key 与隐私
+### C4. API Key 与隐私 — ✅ 已完成
 
 现状：core/secretStore.js 60–104 吞掉 password_clear_finish 错误；单一 account 标识与 GSettings 明文回退。prefs.js 90–118 异步加载/延迟写入，需防旧保存覆盖新值。
 
-- Keyring lookup/store/clear 按真实返回值和错误处理；删除失败不得显示成功，不得下次重新读取已声称删除的旧值。库返回 false 的语义按实际 libsecret API 区分。
-- 默认不默默回退明文；Keyring 不可用时可仅在本次运行保留内存密钥，或经用户显式同意兼容存储。迁移成功再清除旧明文。
-- 按 endpoint/provider 配置独立密钥标识，规范 URL；切换 Base URL 不得把旧端点密钥自动发送给新主机。远程明文 HTTP 需要明显提示，仅允许用户主动配置；不得禁用 TLS 验证。验证跨域重定向时不会泄露 Authorization。
-- 密钥编辑使用版本号/串行写队列，过期异步加载不得覆盖新输入；关闭设置窗前正确完成保存或提示未保存。避免日志、命令行、错误通知暴露密钥。
-- 默认不自动发送选区、文件正文、窗口标题等桌面上下文；用户可预览、移除后才发送。后台通知默认仅显示状态，不显示敏感回答预览。
-- 保留清除当前历史/导出/隐私设置，明确本地会话包含哪些内容。
+- [x] Keyring lookup/store/clear 按真实返回值和错误处理；删除失败不得显示成功，不得下次重新读取已声称删除的旧值。库返回 false 的语义按实际 libsecret API 区分。
+- [x] 默认不默默回退明文；Keyring 不可用时可仅在本次运行保留内存密钥，或经用户显式同意兼容存储。迁移成功再清除旧明文。
+- [x] 按 endpoint/provider 配置独立密钥标识，规范 URL；切换 Base URL 不得把旧端点密钥自动发送给新主机。远程明文 HTTP 需要明显提示，仅允许用户主动配置；不得禁用 TLS 验证。验证跨域重定向时不会泄露 Authorization。
+- [x] 密钥编辑使用版本号/串行写队列，过期异步加载不得覆盖新输入；关闭设置窗前正确完成保存或提示未保存。避免日志、命令行、错误通知暴露密钥。
+- [x] 默认不自动发送选区、文件正文、窗口标题等桌面上下文；用户可预览、移除后才发送。后台通知默认仅显示状态，不显示敏感回答预览。
+- [x] 保留清除当前历史/导出/隐私设置，明确本地会话包含哪些内容。
 
 ## 5. D：性能优化（P1）
 
