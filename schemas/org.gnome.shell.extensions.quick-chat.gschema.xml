@@ -136,5 +136,17 @@
       <default>true</default>
       <summary>Render Markdown formatting and code blocks</summary>
     </key>
+    <key name="favorite-models" type="as">
+      <default>[]</default>
+      <summary>User-starred favorite model keys for quick model picker</summary>
+    </key>
+    <key name="recent-models" type="as">
+      <default>[]</default>
+      <summary>Recently selected model keys for quick model picker</summary>
+    </key>
+    <key name="openai-cached-models" type="as">
+      <default>[]</default>
+      <summary>Cached non-sensitive OpenAI-compatible model IDs from last /models fetch</summary>
+    </key>
   </schema>
 </schemalist>

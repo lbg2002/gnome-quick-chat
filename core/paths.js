@@ -156,6 +156,137 @@ export function writePrivateFileSync(filePath, bytes) {
     }
 }
 
+/**
+ * Asynchronous counterpart to `writePrivateFileSync` (Stage D4) so sensitive 0600 temp files
+ * are created without synchronous stream writes on the GNOME Shell main thread.
+ */
+export function writePrivateFileAsync(filePath, bytes, cancellable = null) {
+    if (!filePath) {
+        return Promise.reject(new Error('缺少私有文件写入路径'));
+    }
+    const parent = GLib.path_get_dirname(filePath);
+    if (GLib.file_test(parent, GLib.FileTest.IS_SYMLINK)) {
+        return Promise.reject(new Error(`拒绝在符号链接目录中写入敏感文件：${parent}`));
+    }
+    GLib.mkdir_with_parents(parent, 0o700);
+    GLib.chmod(parent, 0o700);
+
+    if (GLib.file_test(filePath, GLib.FileTest.IS_SYMLINK) || GLib.file_test(filePath, GLib.FileTest.EXISTS)) {
+        return Promise.reject(new Error(`目标临时文件已存在或为符号链接，已拒绝覆盖：${filePath}`));
+    }
+
+    const gfile = Gio.File.new_for_path(filePath);
+    const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+
+    return new Promise((resolve, reject) => {
+        const failAndCleanup = err => {
+            removeFileQuietly(filePath);
+            reject(err);
+        };
+
+        gfile.create_async(Gio.FileCreateFlags.PRIVATE, GLib.PRIORITY_DEFAULT, cancellable, (f, createRes) => {
+            let outStream = null;
+            try {
+                outStream = f.create_finish(createRes);
+            } catch (createErr) {
+                failAndCleanup(createErr);
+                return;
+            }
+
+            const finalizeClose = () => {
+                outStream.close_async(GLib.PRIORITY_DEFAULT, cancellable, (st, closeRes) => {
+                    try {
+                        st.close_finish(closeRes);
+                    } catch (closeErr) {
+                        failAndCleanup(closeErr);
+                        return;
+                    }
+                    if (GLib.file_test(filePath, GLib.FileTest.IS_SYMLINK)) {
+                        failAndCleanup(new Error(`检测到符号链接替换，已中止敏感临时文件创建：${filePath}`));
+                        return;
+                    }
+                    if (GLib.chmod(filePath, 0o600) !== 0) {
+                        failAndCleanup(new Error(`无法将敏感临时文件设为 0600 权限：${filePath}`));
+                        return;
+                    }
+                    resolve(filePath);
+                });
+            };
+
+            if (payload.byteLength === 0) {
+                finalizeClose();
+                return;
+            }
+
+            outStream.write_all_async(payload, GLib.PRIORITY_DEFAULT, cancellable, (st, writeRes) => {
+                try {
+                    st.write_all_finish(writeRes);
+                } catch (writeErr) {
+                    try { st.close_async(GLib.PRIORITY_DEFAULT, null, () => {}); } catch (_) {}
+                    failAndCleanup(writeErr);
+                    return;
+                }
+                finalizeClose();
+            });
+        });
+    });
+}
+
+/**
+ * Reads a regular file asynchronously with a strict byte ceiling (`maxBytes`) before loading contents,
+ * preventing abnormally large files from blocking the GJS main thread.
+ * Returns `{exists: boolean, tooLarge: boolean, bytes: Uint8Array | null}`.
+ */
+export function readFileBytesBoundedAsync(filePath, maxBytes = 4 * 1024 * 1024, cancellable = null) {
+    if (!filePath) {
+        return Promise.resolve({exists: false, tooLarge: false, bytes: null});
+    }
+    const gfile = Gio.File.new_for_path(filePath);
+    return new Promise(resolve => {
+        gfile.query_info_async(
+            'standard::type,standard::size',
+            Gio.FileQueryInfoFlags.NONE,
+            GLib.PRIORITY_DEFAULT,
+            cancellable,
+            (f, infoRes) => {
+                let info = null;
+                try {
+                    info = f.query_info_finish(infoRes);
+                } catch (_) {
+                    resolve({exists: false, tooLarge: false, bytes: null});
+                    return;
+                }
+                if (!info || info.get_file_type() === Gio.FileType.DIRECTORY) {
+                    resolve({exists: false, tooLarge: false, bytes: null});
+                    return;
+                }
+                const size = Number(info.get_size?.() || 0);
+                if (maxBytes > 0 && size > maxBytes) {
+                    resolve({exists: true, tooLarge: true, bytes: null});
+                    return;
+                }
+                f.load_contents_async(cancellable, (lf, loadRes) => {
+                    try {
+                        const [ok, raw] = lf.load_contents_finish(loadRes);
+                        if (!ok || !raw) {
+                            resolve({exists: false, tooLarge: false, bytes: null});
+                            return;
+                        }
+                        const data = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+                        if (maxBytes > 0 && data.byteLength > maxBytes) {
+                            resolve({exists: true, tooLarge: true, bytes: null});
+                            return;
+                        }
+                        resolve({exists: true, tooLarge: false, bytes: data});
+                    } catch (_) {
+                        resolve({exists: false, tooLarge: false, bytes: null});
+                    }
+                });
+            }
+        );
+    });
+}
+
 export function removeFileQuietly(filePath) {
     if (!filePath) return;
     try {

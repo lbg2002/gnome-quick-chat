@@ -360,6 +360,42 @@ export function evaluateSubprocessOutcome({
     };
 }
 
+export const MAX_ZCODE_CONFIG_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on provider_config.json
+
+function validateAndBuildZCodeOverrideObject(personalObj, config) {
+    const desiredProvider = String(config?.provider || '').trim();
+    const desiredModel = String(config?.model || '').trim();
+    const reasoningEffort = String(config?.reasoningEffort || 'default').trim();
+    const mappedEffort = mapReasoningEffort(reasoningEffort);
+
+    const override = buildZCodePersonalConfigOverride(personalObj, {
+        provider: desiredProvider,
+        model: desiredModel,
+        reasoningEffort,
+    });
+    if (!override || !override.configObj) {
+        throw new Error('构建 ZCode 临时模型配置失败，已阻止静默回退至默认模型');
+    }
+
+    const catalog = Array.isArray(override.configObj?.config?.providerConfigRules?.providerRules)
+        ? override.configObj.config.providerConfigRules.providerRules
+        : [];
+    const providerExists = catalog.some(
+        r => String(r?.providerId || '').toLowerCase() === String(override.providerId || '').toLowerCase()
+    );
+    const appliedSel = override.configObj?.config?.defaultModelSelection;
+    if (
+        (desiredProvider || desiredModel) &&
+        (!override.providerId || !override.modelId || !appliedSel?.providerId || !appliedSel?.modelId || (desiredProvider && !providerExists))
+    ) {
+        throw new Error(
+            `无法将所选模型应用到 ZCode 配置（provider=${desiredProvider || '默认'}，model=${desiredModel || '默认'}），请在设置中重新选择可用模型`
+        );
+    }
+
+    return {override, mappedEffort};
+}
+
 /**
  * Pure-JS fail-closed ZCode personal config override builder + read-back verifier.
  * Never mutates ~/.zcode/v2/provider_config.json; throws explicit Error if user-selected
@@ -407,36 +443,16 @@ export function prepareZCodeConfigOverride(config, io) {
         };
     }
 
-    const override = buildZCodePersonalConfigOverride(personalObj, {
-        provider: desiredProvider,
-        model: desiredModel,
-        reasoningEffort,
-    });
-    if (!override || !override.configObj) {
-        throw new Error('构建 ZCode 临时模型配置失败，已阻止静默回退至默认模型');
-    }
-
-    const catalog = Array.isArray(override.configObj?.config?.providerConfigRules?.providerRules)
-        ? override.configObj.config.providerConfigRules.providerRules
-        : [];
-    const providerExists = catalog.some(
-        r => String(r?.providerId || '').toLowerCase() === String(override.providerId || '').toLowerCase()
-    );
-    const appliedSel = override.configObj?.config?.defaultModelSelection;
-    if (
-        (desiredProvider || desiredModel) &&
-        (!override.providerId || !override.modelId || !appliedSel?.providerId || !appliedSel?.modelId || (desiredProvider && !providerExists))
-    ) {
-        throw new Error(
-            `无法将所选模型应用到 ZCode 配置（provider=${desiredProvider || '默认'}，model=${desiredModel || '默认'}），请在设置中重新选择可用模型`
-        );
-    }
+    const {override} = validateAndBuildZCodeOverrideObject(personalObj, config);
 
     let tempFilePath = '';
     try {
         const runtimeDir = io.getRuntimeDir();
         tempFilePath = `${runtimeDir.replace(/\/+$/, '')}/zcode-provider-${io.makeUuid()}.json`;
         const bytes = UTF8_ENCODER.encode(JSON.stringify(override.configObj, null, 2));
+        if (bytes.byteLength > MAX_ZCODE_CONFIG_BYTES) {
+            throw new Error(`ZCode 临时配置文件超出大小上限（>${MAX_ZCODE_CONFIG_BYTES} 字节）`);
+        }
         io.writePrivateFile(tempFilePath, bytes);
 
         const verified = io.readJson(tempFilePath);
@@ -459,6 +475,90 @@ export function prepareZCodeConfigOverride(config, io) {
     } catch (err) {
         if (tempFilePath) {
             try { io.removeFile(tempFilePath); } catch (_) {}
+        }
+        throw new Error(`写入 ZCode 临时模型配置失败（${err.message}），已阻止使用未确认模型执行任务`);
+    }
+}
+
+/**
+ * Asynchronous version of `prepareZCodeConfigOverride` (Stage D4) so ZCode turns never
+ * block the GNOME Shell main thread with synchronous JSON file reads or writes.
+ */
+export async function prepareZCodeConfigOverrideAsync(config, asyncIo) {
+    if (!asyncIo || typeof asyncIo !== 'object') {
+        throw new Error('缺少异步 ZCode 配置文件 I/O 适配器');
+    }
+    const home = String(asyncIo.homeDir || '').trim();
+    const personalPath = `${home.replace(/\/+$/, '')}/.zcode/v2/provider_config.json`;
+
+    const desiredProvider = String(config?.provider || '').trim();
+    const desiredModel = String(config?.model || '').trim();
+    const reasoningEffort = String(config?.reasoningEffort || 'default').trim();
+    const mappedEffort = mapReasoningEffort(reasoningEffort);
+    const hasExplicitSelection = Boolean(desiredProvider || desiredModel || mappedEffort);
+
+    const exists = await asyncIo.fileExistsAsync(personalPath);
+    if (!exists) {
+        if (hasExplicitSelection) {
+            throw new Error(
+                '无法读取 ZCode 个人模型配置文件（~/.zcode/v2/provider_config.json），已阻止静默使用其他模型；请先在 ZCode 中完成登录与模型配置'
+            );
+        }
+        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
+    }
+
+    const personalObj = await asyncIo.readJsonAsync(personalPath, {maxBytes: MAX_ZCODE_CONFIG_BYTES});
+    if (!personalObj || typeof personalObj !== 'object') {
+        if (hasExplicitSelection) {
+            throw new Error(
+                '解析 ZCode 个人模型配置文件失败（~/.zcode/v2/provider_config.json 格式损坏或超出体积上限），已阻止静默回退至未知模型'
+            );
+        }
+        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
+    }
+
+    if (!hasExplicitSelection) {
+        const defSel = personalObj?.config?.defaultModelSelection;
+        return {
+            env: {},
+            tempFilePath: '',
+            resolvedProvider: defSel?.providerId || '',
+            resolvedModel: defSel?.modelId || '',
+        };
+    }
+
+    const {override} = validateAndBuildZCodeOverrideObject(personalObj, config);
+
+    let tempFilePath = '';
+    try {
+        const runtimeDir = asyncIo.getRuntimeDir();
+        tempFilePath = `${runtimeDir.replace(/\/+$/, '')}/zcode-provider-${asyncIo.makeUuid()}.json`;
+        const bytes = UTF8_ENCODER.encode(JSON.stringify(override.configObj, null, 2));
+        if (bytes.byteLength > MAX_ZCODE_CONFIG_BYTES) {
+            throw new Error(`ZCode 临时配置文件超出大小上限（>${MAX_ZCODE_CONFIG_BYTES} 字节）`);
+        }
+        await asyncIo.writePrivateFileAsync(tempFilePath, bytes);
+
+        const verified = await asyncIo.readJsonAsync(tempFilePath, {maxBytes: MAX_ZCODE_CONFIG_BYTES});
+        const verifiedSel = verified?.config?.defaultModelSelection;
+        if (
+            !verified ||
+            (override.providerId && verifiedSel?.providerId !== override.providerId) ||
+            (override.modelId && verifiedSel?.modelId !== override.modelId) ||
+            (mappedEffort && verifiedSel?.options?.reasoningLevel !== mappedEffort)
+        ) {
+            throw new Error('临时配置文件回读校验不一致');
+        }
+
+        return {
+            env: {ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: tempFilePath},
+            tempFilePath,
+            resolvedProvider: override.providerId,
+            resolvedModel: override.modelId,
+        };
+    } catch (err) {
+        if (tempFilePath) {
+            try { asyncIo.removeFile(tempFilePath); } catch (_) {}
         }
         throw new Error(`写入 ZCode 临时模型配置失败（${err.message}），已阻止使用未确认模型执行任务`);
     }

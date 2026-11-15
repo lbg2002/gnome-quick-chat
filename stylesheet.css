@@ -967,3 +967,73 @@
 .qc-stop-btn:hover {
     background-color: #e01b24;
 }
+
+/* Stage D3/D4: Searchable/Favorite/Paginated Model Picker & Tool Dot Overflow Pill */
+.qc-picker-search {
+    border-radius: 8px;
+    padding: 4px 9px;
+    font-size: 0.79em;
+}
+
+.qc-picker-model-cell {
+    spacing: 3px;
+}
+
+.qc-picker-star-btn {
+    padding: 3px 6px;
+    border-radius: 7px;
+    font-size: 0.77em;
+    background-color: rgba(128, 128, 128, 0.14);
+    color: rgba(255, 255, 255, 0.52);
+    transition-duration: 120ms;
+}
+
+.qc-light .qc-picker-star-btn {
+    color: rgba(0, 0, 0, 0.48);
+}
+
+.qc-picker-star-btn:hover {
+    background-color: rgba(128, 128, 128, 0.28);
+}
+
+.qc-picker-star-active {
+    color: #f8e45c;
+    background-color: rgba(246, 211, 45, 0.18);
+}
+
+.qc-light .qc-picker-star-active {
+    color: #c68000;
+    background-color: rgba(229, 165, 10, 0.14);
+}
+
+.qc-picker-page-label {
+    font-size: 0.75em;
+    color: rgba(255, 255, 255, 0.56);
+    padding: 0 4px;
+}
+
+.qc-light .qc-picker-page-label {
+    color: rgba(0, 0, 0, 0.55);
+}
+
+.qc-dot-folded-pill {
+    padding: 0 6px;
+    min-height: 15px;
+    border-radius: 999px;
+    font-size: 0.71em;
+    font-weight: 700;
+    background-color: rgba(128, 128, 128, 0.24);
+    color: rgba(255, 255, 255, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.qc-light .qc-dot-folded-pill {
+    background-color: rgba(0, 0, 0, 0.08);
+    color: rgba(0, 0, 0, 0.76);
+    border-color: rgba(0, 0, 0, 0.14);
+}
+
+.qc-dot-folded-pill:hover {
+    background-color: rgba(53, 132, 228, 0.30);
+}
+

@@ -1,0 +1,431 @@
+/**
+ * Pure-JS Unified Render Scheduler, Tool Dot Differ/Folder, UI Buffer Capper,
+ * and Windowed History Actor Controller (Stage D2 & D3, zero GJS dependencies).
+ */
+
+const UTF8_ENCODER = new TextEncoder();
+
+export const DEFAULT_INITIAL_HISTORY_COUNT = 24;
+export const DEFAULT_HISTORY_PAGE_SIZE = 24;
+export const DEFAULT_MAX_MOUNTED_ACTORS = 48;
+export const DEFAULT_MAX_VISIBLE_TOOL_DOTS = 10;
+
+export const UI_BUFFER_CAPS = Object.freeze({
+    maxThinkingDisplayBytes: 24 * 1024, // 24 KiB in thinking drawer unless expanded
+    maxToolDetailDisplayBytes: 16 * 1024, // 16 KiB in tool drawer unless expanded
+    maxCardStreamingBytes: 96 * 1024, // 96 KiB in live card body during streaming unless expanded
+    maxInMemoryFieldChars: 512 * 1024, // 512K chars safety ceiling against runaway infinite output
+});
+
+const BACKEND_FALLBACK_LABELS = Object.freeze({
+    zcode: 'ZCode',
+    codex: 'Codex',
+    openai: 'OpenAI API',
+});
+
+/**
+ * Computes adaptive render batching delay (ms):
+ * - Immediate (`0ms`) for the very first visible token or urgent approval/terminal states.
+ * - `60ms` (50–100ms target) for normal short/medium streaming.
+ * - `95ms–165ms` (100–200ms target) when text is long or main-thread render duration rises.
+ */
+export function computeAdaptiveRenderDelayMs({
+    isFirstVisibleRender = false,
+    urgentImmediate = false,
+    textLength = 0,
+    lastRenderDurationMs = 0,
+} = {}) {
+    if (urgentImmediate || isFirstVisibleRender) {
+        return 0;
+    }
+    if (lastRenderDurationMs >= 14 || textLength > 12000) {
+        return 165;
+    }
+    if (lastRenderDurationMs >= 9 || textLength > 6000) {
+        return 130;
+    }
+    if (lastRenderDurationMs >= 5 || textLength > 2000) {
+        return 90;
+    }
+    return 60;
+}
+
+/**
+ * Computes canonical CSS class set & signature for a single tool dot so callers only touch St.Widget
+ * style classes when `styleKey` actually changed.
+ */
+export function computeToolDotVisualState(node, selectedNodeId = null) {
+    let colorClass = 'qc-dot-tool-ok';
+    const status = node?.status || 'done';
+    if (status === 'pending_approval' || status === 'sending_approval') {
+        colorClass = 'qc-dot-tool-pending';
+    } else if (status === 'denied' || status === 'error') {
+        colorClass = 'qc-dot-tool-error';
+    } else if (status === 'interrupted') {
+        colorClass = 'qc-dot-tool-interrupted';
+    } else if (status === 'running') {
+        colorClass = 'qc-dot-tool-running';
+    }
+    const isSelected = Boolean(node?.id && selectedNodeId === node.id);
+    const styleKey = `${colorClass}|${isSelected ? 'sel' : 'nosel'}`;
+    return {
+        colorClass,
+        isSelected,
+        styleKey,
+    };
+}
+
+/**
+ * Partitions tool nodes into visible dots vs folded older completed dots so `dotsRow` never
+ * overflows horizontally when an Agent executes dozens of tools in one turn.
+ */
+export function partitionToolDotsForLayout(toolNodes, {
+    maxVisibleDots = DEFAULT_MAX_VISIBLE_TOOL_DOTS,
+    expanded = false,
+    selectedNodeId = null,
+} = {}) {
+    const list = Array.isArray(toolNodes) ? toolNodes : [];
+    if (expanded || list.length <= maxVisibleDots) {
+        return {
+            isFolded: false,
+            foldedCount: 0,
+            visibleIds: new Set(list.map(n => n.id)),
+        };
+    }
+
+    const pinnedIds = new Set();
+    for (const n of list) {
+        if (
+            n.id === selectedNodeId ||
+            n.status === 'pending_approval' ||
+            n.status === 'sending_approval' ||
+            n.status === 'running' ||
+            n.status === 'error' ||
+            n.status === 'denied'
+        ) {
+            pinnedIds.add(n.id);
+        }
+    }
+
+    const budget = Math.max(4, maxVisibleDots - 1);
+    const visibleIds = new Set(pinnedIds);
+    for (let i = list.length - 1; i >= 0 && visibleIds.size < budget; i--) {
+        visibleIds.add(list[i].id);
+    }
+
+    const foldedCount = Math.max(0, list.length - visibleIds.size);
+    if (foldedCount <= 1) {
+        return {
+            isFolded: false,
+            foldedCount: 0,
+            visibleIds: new Set(list.map(n => n.id)),
+        };
+    }
+
+    return {
+        isFolded: true,
+        foldedCount,
+        visibleIds,
+    };
+}
+
+/**
+ * Caps live UI buffer display by UTF-8 byte budget without mutating the underlying raw text
+ * used for copying or disk persistence.
+ */
+export function formatDisplayBufferWithCap(rawText, {
+    maxDisplayBytes = UI_BUFFER_CAPS.maxThinkingDisplayBytes,
+    expanded = false,
+    tailPreview = false,
+} = {}) {
+    const str = String(rawText ?? '');
+    if (!str) {
+        return {displayText: '', isTruncatedForUi: false, fullByteLength: 0};
+    }
+    const encoded = UTF8_ENCODER.encode(str);
+    if (expanded || encoded.byteLength <= maxDisplayBytes) {
+        return {displayText: str, isTruncatedForUi: false, fullByteLength: encoded.byteLength};
+    }
+
+    const approxRatio = Math.max(0.05, maxDisplayBytes / encoded.byteLength);
+    const sliceChars = Math.max(256, Math.floor(str.length * approxRatio));
+    const kbTotal = Math.ceil(encoded.byteLength / 1024);
+
+    if (tailPreview) {
+        const tail = str.slice(Math.max(0, str.length - sliceChars));
+        return {
+            displayText: `… [前文已折叠，共 ${kbTotal} KB，可点击复制完整内容]\n${tail}`,
+            isTruncatedForUi: true,
+            fullByteLength: encoded.byteLength,
+        };
+    }
+
+    const head = str.slice(0, sliceChars);
+    return {
+        displayText: `${head}\n\n… [内容较长共 ${kbTotal} KB，UI 仅展示摘要；可展开或点击复制获取完整原文]`,
+        isTruncatedForUi: true,
+        fullByteLength: encoded.byteLength,
+    };
+}
+
+export function appendBoundedInMemoryText(existingText, deltaText, maxChars = UI_BUFFER_CAPS.maxInMemoryFieldChars) {
+    const next = String(existingText || '') + String(deltaText || '');
+    if (next.length <= maxChars) return next;
+    return `${next.slice(0, maxChars)}\n… [内存缓冲已达安全上限]`;
+}
+
+/**
+ * Formats a stored message's real `createdAt` / `ts` instead of stamping current time on reload.
+ */
+export function formatMessageTimestamp(msgOrRaw, nowMs = Date.now()) {
+    let tsMs = 0;
+    if (msgOrRaw && typeof msgOrRaw === 'object') {
+        if (typeof msgOrRaw.ts === 'number' && Number.isFinite(msgOrRaw.ts) && msgOrRaw.ts > 0) {
+            tsMs = msgOrRaw.ts;
+        } else if (typeof msgOrRaw.createdAt === 'string' && msgOrRaw.createdAt.trim()) {
+            const parsed = Date.parse(msgOrRaw.createdAt);
+            if (!Number.isNaN(parsed)) tsMs = parsed;
+        }
+    } else if (typeof msgOrRaw === 'number' && Number.isFinite(msgOrRaw) && msgOrRaw > 0) {
+        tsMs = msgOrRaw;
+    } else if (typeof msgOrRaw === 'string' && msgOrRaw.trim()) {
+        const parsed = Date.parse(msgOrRaw);
+        if (!Number.isNaN(parsed)) tsMs = parsed;
+    }
+
+    const d = new Date(tsMs > 0 ? tsMs : nowMs);
+    const now = new Date(nowMs);
+    const pad = n => String(n).padStart(2, '0');
+    const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+    if (
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate()
+    ) {
+        return hhmm;
+    }
+    if (d.getFullYear() === now.getFullYear()) {
+        return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hhmm}`;
+    }
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hhmm}`;
+}
+
+export function resolveAssistantDisplayModel(msg, fallbackModelLabel = '随问') {
+    if (msg && typeof msg === 'object') {
+        const explicit = String(msg.modelId || '').trim();
+        if (explicit) return explicit;
+        const backend = String(msg.backend || '').trim().toLowerCase();
+        if (BACKEND_FALLBACK_LABELS[backend]) return BACKEND_FALLBACK_LABELS[backend];
+    }
+    return String(fallbackModelLabel || '随问');
+}
+
+/**
+ * Manages the full session history (`allMessages`) while keeping at most `maxMountedActors` (~48)
+ * message card Actors mounted in the GNOME Shell St.BoxLayout at any moment!
+ *
+ * Strictly maintains chronological order in BOTH `allMessages` and `mountedRefs`,
+ * fixing the `_prependOlderHistoryBatch` `unshift` order-inversion defect.
+ */
+export class HistoryWindowController {
+    constructor({
+        initialPageSize = DEFAULT_INITIAL_HISTORY_COUNT,
+        pageSize = DEFAULT_HISTORY_PAGE_SIZE,
+        maxMountedActors = DEFAULT_MAX_MOUNTED_ACTORS,
+    } = {}) {
+        this._initialPageSize = Math.max(2, Number(initialPageSize) || DEFAULT_INITIAL_HISTORY_COUNT);
+        this._pageSize = Math.max(2, Number(pageSize) || DEFAULT_HISTORY_PAGE_SIZE);
+        this._maxMounted = Math.max(this._initialPageSize, Number(maxMountedActors) || DEFAULT_MAX_MOUNTED_ACTORS);
+
+        this.allMessages = [];
+        this.mountedCards = [];
+        this.windowStart = 0;
+        this.windowEnd = 0;
+    }
+
+    get hasOlder() {
+        return this.windowStart > 0;
+    }
+
+    get olderRemainingCount() {
+        return Math.max(0, this.windowStart);
+    }
+
+    get hasNewer() {
+        return this.windowEnd < this.allMessages.length;
+    }
+
+    get newerRemainingCount() {
+        return Math.max(0, this.allMessages.length - this.windowEnd);
+    }
+
+    clear() {
+        this.allMessages = [];
+        this.mountedCards = [];
+        this.windowStart = 0;
+        this.windowEnd = 0;
+    }
+
+    reset(allDetailedMessages = []) {
+        this.allMessages = Array.isArray(allDetailedMessages) ? [...allDetailedMessages] : [];
+        this.mountedCards = [];
+        const total = this.allMessages.length;
+        this.windowStart = Math.max(0, total - this._initialPageSize);
+        this.windowEnd = total;
+        return {
+            initialSlice: this.allMessages.slice(this.windowStart, this.windowEnd),
+            windowStart: this.windowStart,
+            windowEnd: this.windowEnd,
+        };
+    }
+
+    registerMountedInitialCards(cards) {
+        this.mountedCards = Array.isArray(cards) ? [...cards] : [];
+    }
+
+    /**
+     * Computes the next older chronological slice to prepend at index 0, and trims off-screen
+     * bottom cards if `mountedCards.length > maxMountedActors` (never evicting `protectedCard`).
+     */
+    planPrependOlderBatch({protectedCard = null} = {}) {
+        if (this.windowStart <= 0) {
+            return {slice: [], newWindowStart: this.windowStart, evictBottomCount: 0};
+        }
+        const nextStart = Math.max(0, this.windowStart - this._pageSize);
+        const slice = this.allMessages.slice(nextStart, this.windowStart);
+        const projectedMounted = this.mountedCards.length + slice.length;
+        let evictBottomCount = Math.max(0, projectedMounted - this._maxMounted);
+
+        // Never evict a protected live streaming card from the bottom!
+        if (evictBottomCount > 0 && protectedCard) {
+            const maxSafeEvict = Math.max(0, this.mountedCards.indexOf(protectedCard));
+            if (this.mountedCards.includes(protectedCard)) {
+                evictBottomCount = Math.min(evictBottomCount, maxSafeEvict);
+            }
+        }
+        return {
+            slice,
+            newWindowStart: nextStart,
+            evictBottomCount,
+        };
+    }
+
+    /**
+     * Commits prepended cards in exact chronological order (`[...prependedCardsInChronoOrder, ...existing]`)
+     * — NEVER reversing order via looped `unshift`!
+     */
+    commitPrependedBatch(prependedCardsInChronoOrder, newWindowStart, evictBottomCount = 0) {
+        this.windowStart = newWindowStart;
+        // Insert in exact chronological order at the front of `mountedCards`
+        this.mountedCards.splice(0, 0, ...prependedCardsInChronoOrder);
+
+        const evictedBottomCards = [];
+        while (evictBottomCount > 0 && this.mountedCards.length > 1) {
+            const removed = this.mountedCards.pop();
+            evictedBottomCards.push(removed);
+            this.windowEnd = Math.max(this.windowStart, this.windowEnd - 1);
+            evictBottomCount--;
+        }
+        return evictedBottomCards;
+    }
+
+    /**
+     * Appends a newly created runtime message & card at the end of the session, recycling oldest
+     * mounted Actors from the top when exceeding `maxMountedActors` (unless user is scrolled up reading).
+     */
+    appendRuntimeCard(msgRecord, card, {allowRecycleTop = true, protectedCard = null} = {}) {
+        // If user had paged way up (`hasNewer === true`), snap back to tail window first or append to data only
+        const wasAtTail = !this.hasNewer;
+        this.allMessages.push(msgRecord);
+
+        if (!wasAtTail) {
+            return {mountedAtTail: false, evictedTopCards: []};
+        }
+
+        this.mountedCards.push(card);
+        this.windowEnd = this.allMessages.length;
+
+        const evictedTopCards = [];
+        if (allowRecycleTop) {
+            while (this.mountedCards.length > this._maxMounted) {
+                const candidate = this.mountedCards[0];
+                if (!candidate || candidate === protectedCard || candidate === card) {
+                    break;
+                }
+                this.mountedCards.shift();
+                this.windowStart++;
+                evictedTopCards.push(candidate);
+            }
+        }
+
+        return {
+            mountedAtTail: true,
+            evictedTopCards,
+        };
+    }
+
+    updateStoredMessageById(messageId, patch) {
+        if (!messageId || !patch) return false;
+        for (let i = this.allMessages.length - 1; i >= 0; i--) {
+            if (this.allMessages[i]?.id === messageId) {
+                this.allMessages[i] = {...this.allMessages[i], ...patch};
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Resolves the exact user prompt text to retry for a given assistant card using `replyTo` / `messageId`
+     * across the FULL `allMessages` history (even if the user card was recycled out of `mountedCards`).
+     */
+    findRetryPromptForCard(assistantCard) {
+        if (!assistantCard) return '';
+
+        const replyToId = String(assistantCard.replyTo || '').trim();
+        if (replyToId) {
+            const exactUser = this.allMessages.find(m => m && m.id === replyToId && m.role === 'user');
+            if (exactUser && exactUser.text?.trim()) {
+                return exactUser.text.trim();
+            }
+            const mountedUser = this.mountedCards.find(c => c && c.messageId === replyToId && c.role === 'user');
+            if (mountedUser && mountedUser.text?.trim()) {
+                return mountedUser.text.trim();
+            }
+        }
+
+        // Fallback 1: locate `assistantCard.messageId` in `allMessages` and walk backwards
+        if (assistantCard.messageId) {
+            const msgIdx = this.allMessages.findIndex(m => m && m.id === assistantCard.messageId);
+            if (msgIdx > 0) {
+                for (let i = msgIdx - 1; i >= 0; i--) {
+                    const m = this.allMessages[i];
+                    if (m?.role === 'user' && m.text?.trim()) {
+                        return m.text.trim();
+                    }
+                }
+            }
+        }
+
+        // Fallback 2: walk backwards in `mountedCards` (now guaranteed strictly chronological!)
+        const cardIdx = this.mountedCards.indexOf(assistantCard);
+        if (cardIdx >= 0) {
+            const globalIdx = this.windowStart + cardIdx;
+            for (let i = globalIdx - 1; i >= 0; i--) {
+                const m = this.allMessages[i];
+                if (m?.role === 'user' && m.text?.trim()) {
+                    return m.text.trim();
+                }
+            }
+            for (let i = cardIdx - 1; i >= 0; i--) {
+                const c = this.mountedCards[i];
+                if (c?.role === 'user' && c.text?.trim()) {
+                    return c.text.trim();
+                }
+            }
+        }
+
+        return '';
+    }
+}

@@ -22,15 +22,39 @@ import {loadOpenAIApiKey} from './core/secretStore.js';
 import {validateSessionId} from './core/sessionStore.js';
 import {
     detectEffectiveBackend,
-    loadLocalBackendCatalog,
+    invalidateBackendDetectionCaches,
+    loadLocalBackendCatalogAsync,
     migrateGSettingsIfNeeded,
+    peekCachedBackendCatalog,
 } from './core/backendDetect.js';
+import {
+    DEFAULT_PICKER_PAGE_SIZE,
+    filterAndRankModels,
+    flattenCatalogModelEntries,
+    makeModelEntryKey,
+    recordRecentModelKey,
+    toggleFavoriteModelKey,
+} from './core/modelCatalogCache.js';
+import {
+    DEFAULT_HISTORY_PAGE_SIZE,
+    DEFAULT_INITIAL_HISTORY_COUNT,
+    DEFAULT_MAX_MOUNTED_ACTORS,
+    HistoryWindowController,
+    UI_BUFFER_CAPS,
+    appendBoundedInMemoryText,
+    computeAdaptiveRenderDelayMs,
+    computeToolDotVisualState,
+    formatDisplayBufferWithCap,
+    formatMessageTimestamp,
+    partitionToolDotsForLayout,
+    resolveAssistantDisplayModel,
+} from './core/renderScheduler.js';
 import {DateMenuIntegration} from './ui/dateMenuIntegration.js';
 import {renderCardBodyIncremental} from './ui/markdownRenderer.js';
 
 const V = Clutter.Orientation.VERTICAL;
 const H = Clutter.Orientation.HORIZONTAL;
-const HISTORY_PAGE_SIZE = 24;
+const HISTORY_PAGE_SIZE = DEFAULT_HISTORY_PAGE_SIZE;
 
 const QUICK_PROMPTS = [
     {label: '💡 解释命令或报错', prompt: '请帮我解释下面这段 Linux 命令或终端报错的含义，并给出解决建议：\n'},
@@ -66,11 +90,6 @@ function wrapLabel(text, style = '') {
     return label;
 }
 
-function formatNowTime() {
-    const now = GLib.DateTime.new_now_local();
-    return now ? now.format('%H:%M') : '';
-}
-
 let nextLifecycleGeneration = 0;
 
 export default class QuickChat extends Extension {
@@ -91,15 +110,26 @@ export default class QuickChat extends Extension {
         this._historyIndex = -1;
         this._draftInput = '';
         this._userScrolledUp = false;
+        this._scrollPendingAnimate = false;
         this._needsReconnect = false;
         this._lastStatusState = '';
         this._lastStatusText = '';
+        this._lastAiBadgeState = '';
         this._hasPendingBackgroundRender = false;
         this._hasUnreadBackgroundReply = false;
-        this._allHistoryMessages = [];
-        this._historyStartIndex = 0;
+        this._historyWindow = new HistoryWindowController({
+            initialPageSize: DEFAULT_INITIAL_HISTORY_COUNT,
+            pageSize: DEFAULT_HISTORY_PAGE_SIZE,
+            maxMountedActors: DEFAULT_MAX_MOUNTED_ACTORS,
+        });
+        this._cardList = this._historyWindow.mountedCards;
         this._loadMoreBtn = null;
+        this._loadNewerBtn = null;
         this._modelPickerOpen = false;
+        this._modelPickerQuery = '';
+        this._modelPickerPage = 0;
+        this._modelPickerRefreshing = false;
+        this._modelPickerBgGen = 0;
 
         this._settings = this.getSettings();
         migrateGSettingsIfNeeded(this._settings);
@@ -428,27 +458,38 @@ export default class QuickChat extends Extension {
 
     _updateAiTabBadge() {
         if (!this._aiBadge) return;
-        const hasPendingApproval = Boolean(
-            this._live?.toolNodes?.some(n => n.status === 'pending_approval')
-        );
+        let nextState = 'hidden';
+        if (!(this._tab === 'ai' && this._dateIntegration?.dateMenu?.menu?.isOpen)) {
+            const hasPendingApproval = Boolean(
+                this._live?.toolNodes?.some(n => n.status === 'pending_approval')
+            );
+            if (hasPendingApproval) {
+                nextState = 'pending';
+            } else if (this._busy) {
+                nextState = 'busy';
+            } else if (this._hasUnreadBackgroundReply) {
+                nextState = 'unread';
+            }
+        }
+
+        if (this._lastAiBadgeState === nextState) {
+            return;
+        }
+        this._lastAiBadgeState = nextState;
+
         for (const cls of ['qc-ai-dot-busy', 'qc-ai-dot-pending', 'qc-ai-dot-unread']) {
             this._aiBadge.remove_style_class_name(cls);
         }
 
-        if (this._tab === 'ai' && this._dateIntegration?.dateMenu?.menu?.isOpen) {
-            this._aiBadge.visible = false;
-            return;
-        }
-
-        if (hasPendingApproval) {
+        if (nextState === 'pending') {
             this._aiBadge.text = '!';
             this._aiBadge.add_style_class_name('qc-ai-dot-pending');
             this._aiBadge.visible = true;
-        } else if (this._busy) {
+        } else if (nextState === 'busy') {
             this._aiBadge.text = '●';
             this._aiBadge.add_style_class_name('qc-ai-dot-busy');
             this._aiBadge.visible = true;
-        } else if (this._hasUnreadBackgroundReply) {
+        } else if (nextState === 'unread') {
             this._aiBadge.text = '●';
             this._aiBadge.add_style_class_name('qc-ai-dot-unread');
             this._aiBadge.visible = true;
@@ -572,8 +613,12 @@ export default class QuickChat extends Extension {
         });
         this._jumpBottomBtn.connect('clicked', () => {
             this._userScrolledUp = false;
+            if (this._historyWindow?.hasNewer) {
+                this._restoreLatestHistoryWindow();
+                return;
+            }
             this._updateJumpBottomVisibility();
-            this._scrollBottom(true);
+            this._scrollBottom(true, true);
         });
         this._scrollStack.add_child(this._jumpBottomBtn);
 
@@ -697,6 +742,54 @@ export default class QuickChat extends Extension {
         }
         this._settings.set_string('provider', providerId);
         this._settings.set_string('model', modelId);
+
+        if (modelId && this._hasKey('recent-models')) {
+            const curRecents = this._settings.get_strv('recent-models') || [];
+            const nextRecents = recordRecentModelKey(
+                curRecents,
+                makeModelEntryKey(effectiveBackend, providerId, modelId)
+            );
+            this._settings.set_strv('recent-models', nextRecents);
+        }
+    }
+
+    _toggleFavoriteModel(entryKey) {
+        if (!entryKey || !this._hasKey('favorite-models')) return;
+        const curFavs = this._settings.get_strv('favorite-models') || [];
+        const nextFavs = toggleFavoriteModelKey(curFavs, entryKey);
+        this._settings.set_strv('favorite-models', nextFavs);
+    }
+
+    _refreshModelCatalogInBackground(effectiveBackend, forceRefresh = false) {
+        if (!this._enabled || effectiveBackend === 'unconfigured') return;
+        const lifeGen = this._lifecycleGeneration;
+        const bgGen = ++this._modelPickerBgGen;
+        this._modelPickerRefreshing = true;
+
+        const runRefresh = async () => {
+            if (effectiveBackend === 'openai') {
+                if (this._client && this._ready) {
+                    const res = await this._client.request('get_models', {forceRefresh});
+                    if (Array.isArray(res?.models) && res.models.length > 0 && this._hasKey('openai-cached-models')) {
+                        this._settings.set_strv('openai-cached-models', res.models.slice(0, 120));
+                    }
+                }
+                return;
+            }
+            await loadLocalBackendCatalogAsync(effectiveBackend, {forceRefresh});
+        };
+
+        runRefresh()
+            .catch(() => {})
+            .finally(() => {
+                if (!this._enabled || this._lifecycleGeneration !== lifeGen || bgGen !== this._modelPickerBgGen) {
+                    return;
+                }
+                this._modelPickerRefreshing = false;
+                if (this._modelPickerOpen) {
+                    this._renderModelPickerResultsSection?.();
+                }
+            });
     }
 
     _setBackendEffort(effectiveBackend, effortId) {
@@ -742,7 +835,7 @@ export default class QuickChat extends Extension {
             this._modelPickerBox.add_child(noticeRow);
         }
 
-        // Row 1: Backend switcher chips
+        // Row 1: Backend switcher chips + manual async catalog refresh button
         const backendRow = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-picker-row',
@@ -766,6 +859,7 @@ export default class QuickChat extends Extension {
                 item.label,
                 () => {
                     this._dismissMigrationNotice();
+                    this._modelPickerPage = 0;
                     this._settings.set_string('backend', item.id);
                     this._populateModelPicker();
                 },
@@ -774,68 +868,207 @@ export default class QuickChat extends Extension {
             );
             backendRow.add_child(chip);
         }
+        backendRow.add_child(new St.Widget({x_expand: true}));
+        if (effectiveBackend !== 'unconfigured') {
+            const refreshCatalogBtn = button(
+                '↻',
+                () => {
+                    invalidateBackendDetectionCaches('catalog');
+                    this._refreshModelCatalogInBackground(effectiveBackend, true);
+                    this._renderModelPickerResultsSection?.();
+                },
+                'qc-picker-chip',
+                '后台异步刷新模型目录'
+            );
+            backendRow.add_child(refreshCatalogBtn);
+        }
         this._modelPickerBox.add_child(backendRow);
 
-        // Row 2: Discovered Models for effectiveBackend
-        const catalog = loadLocalBackendCatalog(effectiveBackend);
-        const curProvider = this._getBackendProvider(effectiveBackend);
-        const curModel = this._getBackendModel(effectiveBackend);
-
-        const modelEntries = [];
-        const seen = new Set();
-        for (const prov of catalog.providers) {
-            for (const m of prov.models) {
-                const key = `${prov.id}::${m}`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    modelEntries.push({providerId: prov.id, providerName: prov.name, modelId: m});
-                }
-            }
-        }
-
-        if (modelEntries.length > 0) {
-            const modelsWrap = new St.BoxLayout({
-                orientation: V,
-                style_class: 'qc-picker-models',
+        // Row 2: Search / Filter Entry (kept intact while typing so IME & cursor focus never drop!)
+        if (effectiveBackend !== 'unconfigured') {
+            const searchEntry = new St.Entry({
+                style_class: 'qc-picker-search',
+                hint_text: effectiveBackend === 'openai'
+                    ? '搜索已缓存模型，或输入自定义模型 ID 按回车切换…'
+                    : '搜索模型或 Provider（★ 收藏优先展示）…',
+                can_focus: true,
                 x_expand: true,
             });
-
-            // Group up to 10 models in compact 2-per-row layout
-            const topEntries = modelEntries.slice(0, 10);
-            for (let i = 0; i < topEntries.length; i += 2) {
-                const line = new St.BoxLayout({orientation: H, style_class: 'qc-picker-row', x_expand: true});
-                for (const entry of topEntries.slice(i, i + 2)) {
-                    const isSelected = entry.modelId === curModel && (!curProvider || entry.providerId === curProvider);
-                    const suffix = catalog.providers.length > 1 ? ` (${entry.providerName || entry.providerId})` : '';
-                    const lbl = `${isSelected ? '✓ ' : ''}${entry.modelId}${suffix}`;
-                    const mBtn = button(
-                        lbl,
-                        () => {
-                            this._setBackendModelSelection(effectiveBackend, entry.providerId, entry.modelId);
-                            this._toggleModelPicker(false);
-                        },
-                        isSelected ? 'qc-picker-model-btn qc-picker-chip-active' : 'qc-picker-model-btn',
-                        lbl
-                    );
-                    mBtn.x_expand = true;
-                    line.add_child(mBtn);
-                }
-                modelsWrap.add_child(line);
+            if (this._modelPickerQuery) {
+                searchEntry.set_text(this._modelPickerQuery);
             }
-            this._modelPickerBox.add_child(modelsWrap);
-        } else {
-            const hint = wrapLabel(
-                effectiveBackend === 'unconfigured'
-                    ? '未检测到可用引擎：请安装 ZCode / Codex CLI，或点击下方「更多设置…」配置 OpenAI API。'
-                    : effectiveBackend === 'openai'
-                        ? `当前自定义模型：${curModel || '自动发现'}（可在设置中在线拉取列表）`
-                        : '未检测到预设模型列表，将使用后端默认模型。',
-                'qc-picker-empty'
-            );
-            this._modelPickerBox.add_child(hint);
+            const sct = searchEntry.clutter_text;
+            sct.connect('text-changed', () => {
+                this._modelPickerQuery = searchEntry.get_text();
+                this._modelPickerPage = 0;
+                this._renderModelPickerResultsSection?.();
+            });
+            sct.connect('activate', () => {
+                const typed = searchEntry.get_text().trim();
+                if (!typed) return;
+                if (effectiveBackend === 'openai') {
+                    this._setBackendModelSelection('openai', '', typed);
+                    this._toggleModelPicker(false);
+                }
+            });
+            this._modelPickerBox.add_child(searchEntry);
         }
 
-        // Row 3: Reasoning effort quick selector + link to full settings
+        // Row 3: Dynamic Model Results Container (cached-first + background async refresh)
+        const resultsSection = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-picker-models',
+            x_expand: true,
+        });
+        this._modelPickerBox.add_child(resultsSection);
+
+        const renderResultsSection = () => {
+            if (!resultsSection.get_parent()) return;
+            resultsSection.destroy_all_children();
+
+            const eff = this._getEffectiveBackend();
+            const catalog = peekCachedBackendCatalog(eff);
+            const curProvider = this._getBackendProvider(eff);
+            const curModel = this._getBackendModel(eff);
+
+            const extraModels = [];
+            if (eff === 'openai' && this._hasKey('openai-cached-models')) {
+                for (const m of this._settings.get_strv('openai-cached-models') || []) {
+                    if (m) extraModels.push({providerId: '', modelId: m});
+                }
+            }
+            if (curModel) {
+                extraModels.push({providerId: curProvider, modelId: curModel});
+            }
+
+            const allEntries = flattenCatalogModelEntries(catalog, {
+                backend: eff,
+                extraModels,
+            });
+            const favoriteKeys = this._hasKey('favorite-models')
+                ? (this._settings.get_strv('favorite-models') || [])
+                : [];
+            const recentKeys = this._hasKey('recent-models')
+                ? (this._settings.get_strv('recent-models') || [])
+                : [];
+
+            const ranked = filterAndRankModels(allEntries, {
+                query: this._modelPickerQuery,
+                favoriteKeys,
+                recentKeys,
+                selectedProviderId: curProvider,
+                selectedModelId: curModel,
+                page: this._modelPickerPage,
+                pageSize: DEFAULT_PICKER_PAGE_SIZE,
+            });
+            this._modelPickerPage = ranked.page;
+
+            if (ranked.items.length > 0) {
+                for (let i = 0; i < ranked.items.length; i += 2) {
+                    const line = new St.BoxLayout({orientation: H, style_class: 'qc-picker-row', x_expand: true});
+                    for (const entry of ranked.items.slice(i, i + 2)) {
+                        const cell = new St.BoxLayout({
+                            orientation: H,
+                            style_class: 'qc-picker-model-cell',
+                            x_expand: true,
+                            y_align: Clutter.ActorAlign.CENTER,
+                        });
+                        const suffix = catalog.providers.length > 1 && entry.providerName
+                            ? ` (${entry.providerName})`
+                            : '';
+                        const lbl = `${entry.isSelected ? '✓ ' : ''}${entry.modelId}${suffix}`;
+                        const mBtn = button(
+                            lbl,
+                            () => {
+                                this._setBackendModelSelection(eff, entry.providerId, entry.modelId);
+                                this._toggleModelPicker(false);
+                            },
+                            entry.isSelected ? 'qc-picker-model-btn qc-picker-chip-active' : 'qc-picker-model-btn',
+                            lbl
+                        );
+                        mBtn.x_expand = true;
+                        cell.add_child(mBtn);
+
+                        const starBtn = button(
+                            entry.isFavorite ? '★' : '☆',
+                            () => {
+                                this._toggleFavoriteModel(entry.key);
+                                renderResultsSection();
+                            },
+                            entry.isFavorite ? 'qc-picker-star-btn qc-picker-star-active' : 'qc-picker-star-btn',
+                            entry.isFavorite ? '取消收藏该模型' : '收藏该模型（置顶显示）'
+                        );
+                        cell.add_child(starBtn);
+                        line.add_child(cell);
+                    }
+                    resultsSection.add_child(line);
+                }
+
+                if (ranked.totalPages > 1) {
+                    const pageRow = new St.BoxLayout({
+                        orientation: H,
+                        style_class: 'qc-picker-row',
+                        y_align: Clutter.ActorAlign.CENTER,
+                    });
+                    const prevBtn = button('‹ 上页', () => {
+                        if (ranked.hasPrevPage) {
+                            this._modelPickerPage = ranked.page - 1;
+                            renderResultsSection();
+                        }
+                    }, 'qc-picker-chip', '上一页模型');
+                    prevBtn.reactive = ranked.hasPrevPage;
+
+                    const pageInfo = new St.Label({
+                        text: `${ranked.page + 1} / ${ranked.totalPages}（共 ${ranked.totalFiltered} 项）`,
+                        style_class: 'qc-picker-page-label',
+                        x_expand: true,
+                        x_align: Clutter.ActorAlign.CENTER,
+                        y_align: Clutter.ActorAlign.CENTER,
+                    });
+
+                    const nextBtn = button('下页 ›', () => {
+                        if (ranked.hasNextPage) {
+                            this._modelPickerPage = ranked.page + 1;
+                            renderResultsSection();
+                        }
+                    }, 'qc-picker-chip', '下一页模型');
+                    nextBtn.reactive = ranked.hasNextPage;
+
+                    pageRow.add_child(prevBtn);
+                    pageRow.add_child(pageInfo);
+                    pageRow.add_child(nextBtn);
+                    resultsSection.add_child(pageRow);
+                }
+            } else {
+                const emptyText = eff === 'unconfigured'
+                    ? '未检测到可用引擎：请安装 ZCode / Codex CLI，或点击下方「更多设置…」配置 OpenAI API。'
+                    : this._modelPickerQuery.trim()
+                        ? (eff === 'openai'
+                            ? `无匹配缓存模型，可直接按回车使用「${this._modelPickerQuery.trim()}」`
+                            : `未找到匹配「${this._modelPickerQuery.trim()}」的模型`)
+                        : this._modelPickerRefreshing
+                            ? '正在后台异步加载模型目录…'
+                            : eff === 'openai'
+                                ? `当前自定义模型：${curModel || '自动发现'}（点击右上角 ↻ 可在线拉取列表）`
+                                : '未检测到预设模型列表，将使用后端默认模型。';
+                resultsSection.add_child(wrapLabel(emptyText, 'qc-picker-empty'));
+            }
+            this._dateIntegration?.nudgeLayout();
+        };
+
+        this._renderModelPickerResultsSection = renderResultsSection;
+        renderResultsSection();
+
+        const initialPeek = peekCachedBackendCatalog(effectiveBackend);
+        if (
+            effectiveBackend !== 'unconfigured' &&
+            effectiveBackend !== 'openai' &&
+            (!initialPeek.fromCache || initialPeek.stale)
+        ) {
+            this._refreshModelCatalogInBackground(effectiveBackend, false);
+        }
+
+        // Row 4: Reasoning effort quick selector + link to full settings
         const footerRow = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-picker-row',
@@ -998,7 +1231,7 @@ export default class QuickChat extends Extension {
 
     _updateJumpBottomVisibility() {
         if (!this._jumpBottomBtn) return;
-        const shouldShow = this._userScrolledUp;
+        const shouldShow = this._userScrolledUp || Boolean(this._historyWindow?.hasNewer);
         if (shouldShow && !this._jumpBottomBtn.visible) {
             this._jumpBottomBtn.opacity = 0;
             this._jumpBottomBtn.translation_y = 6;
@@ -1039,9 +1272,18 @@ export default class QuickChat extends Extension {
             'agent-mode',
             'session-id',
         ]);
+        const cacheInvalidateKeys = new Set([
+            'backend',
+            'zcode-path',
+            'codex-path',
+            'openai-base-url',
+        ]);
 
         const onBackendConfigChanged = keyName => {
             if (!this._enabled) return;
+            if (cacheInvalidateKeys.has(keyName)) {
+                invalidateBackendDetectionCaches();
+            }
             if (scopeBoundaryKeys.has(keyName)) {
                 this._client?.revokeApprovedScopes?.();
             }
@@ -1433,84 +1675,246 @@ export default class QuickChat extends Extension {
         return task;
     }
 
+    _destroyCardActor(card) {
+        if (!card) return;
+        if (card.renderTimer) {
+            this._clearTimer(card.renderTimer);
+            card.renderTimer = 0;
+        }
+        if (card.box) {
+            try { card.box.destroy(); } catch (_) {}
+            card.box = null;
+        }
+    }
+
     _renderInitialHistory(allDetailed) {
         this._clearMessages();
-        this._allHistoryMessages = Array.isArray(allDetailed) ? allDetailed : [];
-        for (const msg of this._allHistoryMessages) {
+        const normalized = Array.isArray(allDetailed) ? allDetailed : [];
+        for (const msg of normalized) {
             if (msg.role === 'user' && msg.text) {
                 this._recordPromptHistory(msg.text);
             }
         }
-        if (!this._allHistoryMessages.length) {
-            this._historyStartIndex = 0;
+        const {initialSlice} = this._historyWindow.reset(normalized);
+        this._cardList = this._historyWindow.mountedCards;
+        if (!initialSlice.length) {
             return;
         }
 
-        this._historyStartIndex = Math.max(0, this._allHistoryMessages.length - HISTORY_PAGE_SIZE);
-        this._syncLoadMoreHistoryButton();
-
-        const recentSlice = this._allHistoryMessages.slice(this._historyStartIndex);
-        for (const msg of recentSlice) {
-            this._addMessage(msg.role, msg.text, {
+        const mounted = [];
+        for (const msg of initialSlice) {
+            const card = this._addMessage(msg.role, msg.text, {
                 animate: false,
                 thinking: msg.thinking || '',
                 scrollOnAdd: false,
+                trackInHistoryWindow: false,
+                messageId: msg.id || '',
+                turnId: msg.turnId || '',
+                replyTo: msg.replyTo || '',
+                createdAt: msg.createdAt || '',
+                ts: msg.ts || 0,
+                modelId: msg.modelId || '',
+                backend: msg.backend || '',
+                errorMessage: msg.errorMessage || '',
             });
+            mounted.push(card);
         }
+        this._historyWindow.registerMountedInitialCards(mounted);
+        this._cardList = this._historyWindow.mountedCards;
+        this._syncHistoryWindowButtons();
     }
 
-    _syncLoadMoreHistoryButton() {
-        if (this._historyStartIndex <= 0) {
+    _syncHistoryWindowButtons() {
+        if (!this._messages || !this._historyWindow) return;
+
+        if (!this._historyWindow.hasOlder) {
             if (this._loadMoreBtn) {
                 try { this._loadMoreBtn.destroy(); } catch (_) {}
                 this._loadMoreBtn = null;
             }
-            return;
-        }
-        const remaining = this._historyStartIndex;
-        const label = `↑ 加载更早的 ${Math.min(HISTORY_PAGE_SIZE, remaining)} 条对话（剩余 ${remaining} 条）`;
-        if (!this._loadMoreBtn) {
-            this._loadMoreBtn = button(
-                label,
-                () => this._prependOlderHistoryBatch(),
-                'qc-load-more-btn',
-                '加载更早的历史对话'
-            );
-            this._messages.insert_child_at_index(this._loadMoreBtn, 0);
         } else {
-            this._loadMoreBtn.label = label;
+            const remaining = this._historyWindow.olderRemainingCount;
+            const label = `↑ 加载更早的 ${Math.min(HISTORY_PAGE_SIZE, remaining)} 条对话（剩余 ${remaining} 条）`;
+            if (!this._loadMoreBtn) {
+                this._loadMoreBtn = button(
+                    label,
+                    () => this._prependOlderHistoryBatch(),
+                    'qc-load-more-btn',
+                    '加载更早的历史对话'
+                );
+                this._messages.insert_child_at_index(this._loadMoreBtn, 0);
+            } else {
+                this._loadMoreBtn.label = label;
+            }
+        }
+
+        if (!this._historyWindow.hasNewer) {
+            if (this._loadNewerBtn) {
+                try { this._loadNewerBtn.destroy(); } catch (_) {}
+                this._loadNewerBtn = null;
+            }
+        } else {
+            const newerRemaining = this._historyWindow.newerRemainingCount;
+            const newerLabel = `↓ 返回最新对话（已回收底部 ${newerRemaining} 条不可见消息以节省内存）`;
+            if (!this._loadNewerBtn) {
+                this._loadNewerBtn = button(
+                    newerLabel,
+                    () => this._restoreLatestHistoryWindow(),
+                    'qc-load-more-btn',
+                    '回到最新历史窗口'
+                );
+                this._messages.add_child(this._loadNewerBtn);
+            } else {
+                this._loadNewerBtn.label = newerLabel;
+                try {
+                    this._messages.set_child_above_sibling(this._loadNewerBtn, null);
+                } catch (_) {}
+            }
         }
     }
 
     _prependOlderHistoryBatch() {
-        if (this._historyStartIndex <= 0 || !this._messages) return;
+        if (!this._historyWindow?.hasOlder || !this._messages) return;
         const adj = this._scroll?.vadjustment;
         const prevUpper = adj ? adj.upper : 0;
         const prevValue = adj ? adj.value : 0;
+        const anchorBox = this._historyWindow.mountedCards[0]?.box || null;
+        let anchorPrevY = 0;
+        try {
+            if (anchorBox) anchorPrevY = anchorBox.get_allocation_box().y1;
+        } catch (_) {}
 
-        const nextStart = Math.max(0, this._historyStartIndex - HISTORY_PAGE_SIZE);
-        const slice = this._allHistoryMessages.slice(nextStart, this._historyStartIndex);
-        this._historyStartIndex = nextStart;
-        this._syncLoadMoreHistoryButton();
+        const {slice, newWindowStart, evictBottomCount} = this._historyWindow.planPrependOlderBatch({
+            protectedCard: this._live,
+        });
+        if (!slice.length) return;
 
         const baseInsertIdx = this._loadMoreBtn ? 1 : 0;
+        const prependedCards = [];
         slice.forEach((msg, offset) => {
-            this._addMessage(msg.role, msg.text, {
+            const card = this._addMessage(msg.role, msg.text, {
                 animate: false,
                 thinking: msg.thinking || '',
                 insertIndex: baseInsertIdx + offset,
                 scrollOnAdd: false,
+                trackInHistoryWindow: false,
+                messageId: msg.id || '',
+                turnId: msg.turnId || '',
+                replyTo: msg.replyTo || '',
+                createdAt: msg.createdAt || '',
+                ts: msg.ts || 0,
+                modelId: msg.modelId || '',
+                backend: msg.backend || '',
+                errorMessage: msg.errorMessage || '',
             });
+            prependedCards.push(card);
         });
 
-        // Preserve viewport scroll anchor after prepending above
+        const evictedBottom = this._historyWindow.commitPrependedBatch(
+            prependedCards,
+            newWindowStart,
+            evictBottomCount
+        );
+        for (const oldCard of evictedBottom) {
+            this._destroyCardActor(oldCard);
+        }
+        this._cardList = this._historyWindow.mountedCards;
+        this._syncHistoryWindowButtons();
+        this._updateJumpBottomVisibility();
+
+        // Preserve exact visual anchor of `anchorBox` even when bottom Actors were evicted simultaneously!
         this._scheduleTimeout(20, () => {
             if (!adj) return;
-            const deltaUpper = Math.max(0, adj.upper - prevUpper);
+            let shiftPx = Math.max(0, adj.upper - prevUpper);
+            try {
+                if (anchorBox && anchorBox.get_parent() === this._messages) {
+                    const anchorNewY = anchorBox.get_allocation_box().y1;
+                    if (anchorNewY >= anchorPrevY) {
+                        shiftPx = anchorNewY - anchorPrevY;
+                    }
+                }
+            } catch (_) {}
             this._programmaticScroll = true;
-            adj.value = prevValue + deltaUpper;
+            adj.value = Math.max(adj.lower, prevValue + shiftPx);
             this._programmaticScroll = false;
         });
+    }
+
+    _restoreLatestHistoryWindow() {
+        if (!this._messages || !this._historyWindow) return;
+        const all = [...this._historyWindow.allMessages];
+        const liveCard = this._live;
+        const liveBox = liveCard?.box || null;
+
+        if (liveBox && liveBox.get_parent() === this._messages) {
+            try { this._messages.remove_child(liveBox); } catch (_) {}
+        }
+
+        for (const c of this._historyWindow.mountedCards) {
+            if (c !== liveCard) {
+                this._destroyCardActor(c);
+            }
+        }
+        if (this._loadMoreBtn) {
+            try { this._loadMoreBtn.destroy(); } catch (_) {}
+            this._loadMoreBtn = null;
+        }
+        if (this._loadNewerBtn) {
+            try { this._loadNewerBtn.destroy(); } catch (_) {}
+            this._loadNewerBtn = null;
+        }
+
+        if (!liveCard) {
+            const {initialSlice} = this._historyWindow.reset(all);
+            const mounted = initialSlice.map(msg => this._addMessage(msg.role, msg.text, {
+                animate: false,
+                thinking: msg.thinking || '',
+                scrollOnAdd: false,
+                trackInHistoryWindow: false,
+                messageId: msg.id || '',
+                turnId: msg.turnId || '',
+                replyTo: msg.replyTo || '',
+                createdAt: msg.createdAt || '',
+                ts: msg.ts || 0,
+                modelId: msg.modelId || '',
+                backend: msg.backend || '',
+                errorMessage: msg.errorMessage || '',
+            }));
+            this._historyWindow.registerMountedInitialCards(mounted);
+        } else {
+            const liveMsgIdx = liveCard.messageId
+                ? all.findIndex(m => m && m.id === liveCard.messageId)
+                : -1;
+            const beforeLive = liveMsgIdx >= 0 ? all.slice(0, liveMsgIdx) : all;
+            const startIdx = Math.max(0, beforeLive.length - (DEFAULT_INITIAL_HISTORY_COUNT - 1));
+            const mountedBefore = beforeLive.slice(startIdx).map(msg => this._addMessage(msg.role, msg.text, {
+                animate: false,
+                thinking: msg.thinking || '',
+                scrollOnAdd: false,
+                trackInHistoryWindow: false,
+                messageId: msg.id || '',
+                turnId: msg.turnId || '',
+                replyTo: msg.replyTo || '',
+                createdAt: msg.createdAt || '',
+                ts: msg.ts || 0,
+                modelId: msg.modelId || '',
+                backend: msg.backend || '',
+                errorMessage: msg.errorMessage || '',
+            }));
+            if (liveBox) {
+                this._messages.add_child(liveBox);
+            }
+            this._historyWindow.allMessages = all;
+            this._historyWindow.windowStart = startIdx;
+            this._historyWindow.windowEnd = all.length;
+            this._historyWindow.registerMountedInitialCards([...mountedBefore, liveCard]);
+        }
+
+        this._cardList = this._historyWindow.mountedCards;
+        this._syncHistoryWindowButtons();
+        this._userScrolledUp = false;
+        this._updateJumpBottomVisibility();
+        this._scrollBottom(true, true);
     }
 
     _recordPromptHistory(text) {
@@ -1527,11 +1931,14 @@ export default class QuickChat extends Extension {
         if (this._live?.renderTimer) {
             this._clearTimer(this._live.renderTimer);
         }
+        for (const c of this._historyWindow?.mountedCards || []) {
+            if (c?.renderTimer) this._clearTimer(c.renderTimer);
+        }
         this._live = null;
-        this._cardList = [];
-        this._allHistoryMessages = [];
-        this._historyStartIndex = 0;
+        this._historyWindow?.clear();
+        this._cardList = this._historyWindow ? this._historyWindow.mountedCards : [];
         this._loadMoreBtn = null;
+        this._loadNewerBtn = null;
         this._empty = null;
         this._messages.destroy_all_children();
         this._buildEmptyState();
@@ -1580,6 +1987,7 @@ export default class QuickChat extends Extension {
         renderCardBodyIncremental(card, {
             markdownEnabled: this._markdownEnabled(),
             placeholderText,
+            isStreaming: card === this._live && this._busy,
             onCreateCodeCopyButton: getCodeTextFn => {
                 const codeCopyBtn = button('复制代码', () => {
                     this._copyWithFeedback(codeCopyBtn, getCodeTextFn, '复制代码');
@@ -1589,9 +1997,252 @@ export default class QuickChat extends Extension {
         });
     }
 
+    /**
+     * Lazily builds the compact colored-dot trace row only when an assistant card actually emits
+     * thinking or tool activity — keeping plain Q&A cards zero-overhead.
+     */
+    _ensureCardTraceHeader(card) {
+        if (!card || card.role !== 'assistant' || card.traceBox || !card.box) {
+            return card?.traceBox || null;
+        }
+        const traceBox = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-trace-box',
+            x_expand: true,
+            visible: false,
+        });
+
+        const dotsRow = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-trace-dots-row',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+
+        const thinkingDot = new St.Button({
+            style_class: 'qc-dot-circle qc-dot-thinking',
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            accessible_name: '思考过程',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        thinkingDot.connect('clicked', () => {
+            card.selectedNodeId = card.selectedNodeId === 'thinking' ? null : 'thinking';
+            this._updateCardActivity(card);
+        });
+        thinkingDot.connect('notify::hover', () => {
+            card.hoveredNodeId = thinkingDot.hover
+                ? 'thinking'
+                : (card.hoveredNodeId === 'thinking' ? null : card.hoveredNodeId);
+            this._updateTraceHint(card);
+        });
+        dotsRow.add_child(thinkingDot);
+
+        const toolDotsBox = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-tool-dots-box',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        dotsRow.add_child(toolDotsBox);
+
+        const foldedDotsBtn = button('+0', () => {
+            card.dotsExpanded = !card.dotsExpanded;
+            card.allToolDotsDirty = true;
+            this._updateCardActivity(card);
+        }, 'qc-dot-folded-pill', '展开或收起折叠的工具轨迹圆点');
+        foldedDotsBtn.visible = false;
+        dotsRow.add_child(foldedDotsBtn);
+
+        const traceHintLabel = new St.Label({
+            text: '',
+            style_class: 'qc-trace-hint',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        dotsRow.add_child(traceHintLabel);
+        traceBox.add_child(dotsRow);
+
+        card.box.insert_child_at_index(traceBox, 1);
+
+        card.traceBox = traceBox;
+        card.dotsRow = dotsRow;
+        card.thinkingDot = thinkingDot;
+        card.toolDotsBox = toolDotsBox;
+        card.foldedDotsBtn = foldedDotsBtn;
+        card.traceHintLabel = traceHintLabel;
+        return traceBox;
+    }
+
+    /**
+     * Lazily allocates the collapsible detail/approval/question drawer only when a dot is selected
+     * or a tool approval / interactive question needs user input.
+     */
+    _ensureCardDetailDrawer(card) {
+        if (!card || card.role !== 'assistant' || card.detailDrawer) {
+            return card?.detailDrawer || null;
+        }
+        const traceBox = this._ensureCardTraceHeader(card);
+        if (!traceBox) return null;
+
+        const detailDrawer = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-trace-drawer',
+            x_expand: true,
+            visible: false,
+        });
+
+        const drawerHeader = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-drawer-header',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const drawerTitle = wrapLabel('', 'qc-drawer-title');
+        drawerTitle.x_expand = true;
+        drawerHeader.add_child(drawerTitle);
+
+        const drawerCopyBtn = button('复制详情', () => {
+            if (card.selectedNodeId === 'thinking') {
+                this._copyWithFeedback(drawerCopyBtn, () => card.thinking || '', '复制详情');
+                return;
+            }
+            const sel = (card.toolNodes || []).find(n => n.id === card.selectedNodeId);
+            if (!sel) return;
+            const fullDetail = [
+                sel.fullCommand || sel.displayPath || sel.summary || sel.toolName,
+                sel.detail || '',
+            ].filter(Boolean).join('\n\n');
+            this._copyWithFeedback(drawerCopyBtn, () => fullDetail, '复制详情');
+        }, 'qc-drawer-close', '复制完整思考或工具详情');
+        drawerHeader.add_child(drawerCopyBtn);
+
+        const drawerCloseBtn = button('收起', () => {
+            card.selectedNodeId = null;
+            this._updateCardActivity(card);
+        }, 'qc-drawer-close', '收起详情');
+        drawerHeader.add_child(drawerCloseBtn);
+        detailDrawer.add_child(drawerHeader);
+
+        const drawerSummary = wrapLabel('', 'qc-approval-summary');
+        drawerSummary.visible = false;
+        detailDrawer.add_child(drawerSummary);
+
+        const drawerExpandBtn = button('▼ 展开完整内容', () => {
+            if (card.selectedNodeId === 'thinking') {
+                card.thinkingExpanded = !card.thinkingExpanded;
+                this._updateCardActivity(card);
+                return;
+            }
+            const sel = (card.toolNodes || []).find(n => n.id === card.selectedNodeId);
+            if (sel) {
+                sel.detailsExpanded = !sel.detailsExpanded;
+                this._updateCardActivity(card);
+            }
+        }, 'qc-drawer-close', '展开或收起完整长文本');
+        drawerExpandBtn.visible = false;
+        detailDrawer.add_child(drawerExpandBtn);
+
+        const questionFormBox = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-question-form',
+            x_expand: true,
+            visible: false,
+        });
+        detailDrawer.add_child(questionFormBox);
+
+        const drawerBody = wrapLabel('', 'qc-drawer-body');
+        drawerBody.visible = false;
+        detailDrawer.add_child(drawerBody);
+
+        const drawerActions = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-approval-actions',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        const allowBtn = button(
+            '✓ 仅本次允许',
+            () => this._submitActiveToolDecision(card, 'allow', false),
+            'qc-approval-btn qc-approval-allow',
+            '仅允许本次工具调用，不记住范围'
+        );
+        const alwaysBtn = button(
+            '✓ 范围允许',
+            () => this._submitActiveToolDecision(card, 'allow', true),
+            'qc-approval-btn qc-approval-always',
+            '在当前会话内对明确绑定的安全范围授权'
+        );
+        const denyBtn = button(
+            '✕ 拒绝',
+            () => this._submitActiveToolDecision(card, 'deny', false),
+            'qc-approval-btn qc-approval-deny',
+            '拒绝本次工具调用'
+        );
+        drawerActions.add_child(allowBtn);
+        drawerActions.add_child(alwaysBtn);
+        drawerActions.add_child(denyBtn);
+        detailDrawer.add_child(drawerActions);
+
+        const questionActions = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-approval-actions',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        const submitAnswerBtn = button(
+            '✓ 提交回答',
+            () => this._submitQuestionDecision(card, 'answer'),
+            'qc-approval-btn qc-approval-allow',
+            '提交所选回答并继续'
+        );
+        const skipAnswerBtn = button(
+            '⏭ 交由 AI 判断',
+            () => this._submitQuestionDecision(card, 'skip'),
+            'qc-approval-btn qc-approval-always',
+            '不指定偏好，交由 AI 自行判断'
+        );
+        const cancelQuestionBtn = button(
+            '✕ 取消',
+            () => this._submitQuestionDecision(card, 'deny'),
+            'qc-approval-btn qc-approval-deny',
+            '取消本次提问'
+        );
+        questionActions.add_child(submitAnswerBtn);
+        questionActions.add_child(skipAnswerBtn);
+        questionActions.add_child(cancelQuestionBtn);
+        detailDrawer.add_child(questionActions);
+
+        traceBox.add_child(detailDrawer);
+
+        card.detailDrawer = detailDrawer;
+        card.drawerTitle = drawerTitle;
+        card.drawerCopyBtn = drawerCopyBtn;
+        card.drawerSummary = drawerSummary;
+        card.drawerExpandBtn = drawerExpandBtn;
+        card.questionFormBox = questionFormBox;
+        card.renderedQuestionNodeId = null;
+        card.renderedQuestionWidgets = null;
+        card.drawerBody = drawerBody;
+        card.drawerActions = drawerActions;
+        card.allowBtn = allowBtn;
+        card.alwaysBtn = alwaysBtn;
+        card.denyBtn = denyBtn;
+        card.questionActions = questionActions;
+        card.submitAnswerBtn = submitAnswerBtn;
+        card.skipAnswerBtn = skipAnswerBtn;
+        card.cancelQuestionBtn = cancelQuestionBtn;
+        return detailDrawer;
+    }
+
     _syncToolNodeDotStyle(card, node) {
         const btn = node?.dotBtn;
         if (!btn) return;
+        const vis = computeToolDotVisualState(node, card.selectedNodeId);
+        if (node._lastStyleKey === vis.styleKey) {
+            return;
+        }
+        node._lastStyleKey = vis.styleKey;
         for (const cls of [
             'qc-dot-tool-ok',
             'qc-dot-tool-pending',
@@ -1602,18 +2253,8 @@ export default class QuickChat extends Extension {
         ]) {
             btn.remove_style_class_name(cls);
         }
-        if (node.status === 'pending_approval' || node.status === 'sending_approval') {
-            btn.add_style_class_name('qc-dot-tool-pending');
-        } else if (node.status === 'denied' || node.status === 'error') {
-            btn.add_style_class_name('qc-dot-tool-error');
-        } else if (node.status === 'interrupted') {
-            btn.add_style_class_name('qc-dot-tool-interrupted');
-        } else if (node.status === 'running') {
-            btn.add_style_class_name('qc-dot-tool-running');
-        } else {
-            btn.add_style_class_name('qc-dot-tool-ok');
-        }
-        if (card.selectedNodeId === node.id) {
+        btn.add_style_class_name(vis.colorClass);
+        if (vis.isSelected) {
             btn.add_style_class_name('qc-dot-selected');
         }
     }
@@ -1631,54 +2272,54 @@ export default class QuickChat extends Extension {
 
         const targetId = card.hoveredNodeId || card.selectedNodeId;
         if (targetId === 'thinking') {
-            card.traceHintLabel.text = card.selectedNodeId === 'thinking'
+            const next = card.selectedNodeId === 'thinking'
                 ? '思考过程（点击灰圆收起）'
                 : '思考过程（点击展开）';
+            if (card.traceHintLabel.text !== next) card.traceHintLabel.text = next;
             return;
         }
         if (targetId) {
             const node = tools.find(n => n.id === targetId);
             if (node) {
                 const brief = this._formatShortHint(node.summary, 28);
-                if (node.isQuestion) {
-                    card.traceHintLabel.text = brief
-                        ? `问答: ${brief}`
-                        : '交互式提问（点击小圆查看）';
-                } else {
-                    card.traceHintLabel.text = brief
-                        ? `${node.toolName}: ${brief}`
-                        : `${node.toolName}（点击小圆切换详情）`;
-                }
+                const next = node.isQuestion
+                    ? (brief ? `问答: ${brief}` : '交互式提问（点击小圆查看）')
+                    : (brief ? `${node.toolName}: ${brief}` : `${node.toolName}（点击小圆切换详情）`);
+                if (card.traceHintLabel.text !== next) card.traceHintLabel.text = next;
                 return;
             }
         }
 
         const pendingNode = tools.find(n => n.status === 'pending_approval' || n.status === 'sending_approval');
         if (pendingNode) {
+            let next = '';
             if (pendingNode.isQuestion) {
                 const brief = this._formatShortHint(pendingNode.summary, 24);
-                card.traceHintLabel.text = pendingNode.status === 'sending_approval'
+                next = pendingNode.status === 'sending_approval'
                     ? '⏳ 正在提交回答…'
                     : (brief ? `💬 待回答: ${brief}` : '💬 待您回答问题');
             } else {
-                card.traceHintLabel.text = pendingNode.status === 'sending_approval'
+                next = pendingNode.status === 'sending_approval'
                     ? `⏳ 正在发送授权: ${pendingNode.toolName}`
                     : `⚠️ 待审批: ${pendingNode.toolName}`;
             }
+            if (card.traceHintLabel.text !== next) card.traceHintLabel.text = next;
             return;
         }
         const runningNode = tools.find(n => n.status === 'running');
         if (runningNode) {
-            card.traceHintLabel.text = runningNode.isQuestion
+            const next = runningNode.isQuestion
                 ? '正在提交回答并继续…'
                 : `正在执行 ${runningNode.toolName}…`;
+            if (card.traceHintLabel.text !== next) card.traceHintLabel.text = next;
             return;
         }
 
         const segs = [];
         if (hasThinking) segs.push('思考');
         if (tools.length > 0) segs.push(`${tools.length} 项工具`);
-        card.traceHintLabel.text = segs.length ? `${segs.join(' · ')}（点击小圆查看）` : '';
+        const next = segs.length ? `${segs.join(' · ')}（点击小圆查看）` : '';
+        if (card.traceHintLabel.text !== next) card.traceHintLabel.text = next;
     }
 
     _hideQuestionForm(card) {
@@ -1888,45 +2529,110 @@ export default class QuickChat extends Extension {
     }
 
     _updateCardActivity(card) {
-        if (!card || card.role !== 'assistant' || !card.traceBox) return;
+        if (!card || card.role !== 'assistant') return;
         const hasThinking = Boolean(card.thinking && card.thinking.trim());
         const tools = card.toolNodes || [];
         if (!hasThinking && tools.length === 0) {
-            card.traceBox.visible = false;
+            if (card.traceBox) card.traceBox.visible = false;
             return;
         }
+
+        this._ensureCardTraceHeader(card);
+        if (!card.traceBox) return;
         card.traceBox.visible = true;
 
-        // 1. Update grey Thinking dot
+        // 1. Diff grey Thinking dot
         if (card.thinkingDot) {
-            card.thinkingDot.visible = hasThinking;
-            if (card.selectedNodeId === 'thinking') {
-                card.thinkingDot.add_style_class_name('qc-dot-selected');
-            } else {
-                card.thinkingDot.remove_style_class_name('qc-dot-selected');
+            const thinkingSel = card.selectedNodeId === 'thinking';
+            const thinkingKey = `${hasThinking ? '1' : '0'}|${thinkingSel ? 'sel' : 'nosel'}`;
+            if (card._lastThinkingDotKey !== thinkingKey) {
+                card._lastThinkingDotKey = thinkingKey;
+                card.thinkingDot.visible = hasThinking;
+                if (thinkingSel) {
+                    card.thinkingDot.add_style_class_name('qc-dot-selected');
+                } else {
+                    card.thinkingDot.remove_style_class_name('qc-dot-selected');
+                }
             }
         }
 
-        // 2. Update each Tool dot's color & selection ring
-        for (const node of tools) {
-            this._syncToolNodeDotStyle(card, node);
+        // 2. Partition tool dots for horizontal overflow & update only changed dots
+        const selectionChanged = card._lastSelectedNodeId !== card.selectedNodeId;
+        if (selectionChanged && card._lastSelectedNodeId && card._lastSelectedNodeId !== 'thinking') {
+            card.dirtyToolNodeIds.add(card._lastSelectedNodeId);
         }
+        if (selectionChanged && card.selectedNodeId && card.selectedNodeId !== 'thinking') {
+            card.dirtyToolNodeIds.add(card.selectedNodeId);
+        }
+        card._lastSelectedNodeId = card.selectedNodeId;
+
+        const foldLayout = partitionToolDotsForLayout(tools, {
+            expanded: Boolean(card.dotsExpanded),
+            selectedNodeId: card.selectedNodeId,
+        });
+        const needFullDotSweep = Boolean(
+            card.allToolDotsDirty ||
+            card._lastFoldCount !== foldLayout.foldedCount ||
+            card._lastIsFolded !== foldLayout.isFolded
+        );
+        card._lastFoldCount = foldLayout.foldedCount;
+        card._lastIsFolded = foldLayout.isFolded;
+
+        if (card.foldedDotsBtn) {
+            if (foldLayout.isFolded) {
+                const foldLbl = `+${foldLayout.foldedCount}`;
+                if (card.foldedDotsBtn.label !== foldLbl) card.foldedDotsBtn.label = foldLbl;
+                card.foldedDotsBtn.visible = true;
+            } else if (card.dotsExpanded && tools.length > 10) {
+                if (card.foldedDotsBtn.label !== '收起') card.foldedDotsBtn.label = '收起';
+                card.foldedDotsBtn.visible = true;
+            } else {
+                card.foldedDotsBtn.visible = false;
+            }
+        }
+
+        if (needFullDotSweep) {
+            for (const node of tools) {
+                if (node.dotBtn) {
+                    const shouldShow = foldLayout.visibleIds.has(node.id);
+                    if (node.dotBtn.visible !== shouldShow) node.dotBtn.visible = shouldShow;
+                }
+                this._syncToolNodeDotStyle(card, node);
+            }
+        } else if (card.dirtyToolNodeIds.size > 0) {
+            for (const node of tools) {
+                if (card.dirtyToolNodeIds.has(node.id)) {
+                    if (node.dotBtn) {
+                        const shouldShow = foldLayout.visibleIds.has(node.id);
+                        if (node.dotBtn.visible !== shouldShow) node.dotBtn.visible = shouldShow;
+                    }
+                    this._syncToolNodeDotStyle(card, node);
+                }
+            }
+        }
+        card.dirtyToolNodeIds.clear();
+        card.allToolDotsDirty = false;
 
         // 3. Update inline hint caption next to dots
         this._updateTraceHint(card);
 
-        // 4. Update collapsible detail drawer below dots
+        // 4. Lazily construct & update collapsible detail drawer ONLY when a dot is selected
         const selId = card.selectedNodeId;
         if (!selId) {
-            this._hideQuestionForm(card);
-            card.detailDrawer.visible = false;
+            if (card.detailDrawer) {
+                this._hideQuestionForm(card);
+                card.detailDrawer.visible = false;
+            }
             return;
         }
 
+        this._ensureCardDetailDrawer(card);
+        if (!card.detailDrawer) return;
+
         if (selId === 'thinking') {
             this._hideQuestionForm(card);
-            if (card.drawerExpandBtn) card.drawerExpandBtn.visible = false;
             if (!hasThinking) {
+                if (card.drawerExpandBtn) card.drawerExpandBtn.visible = false;
                 card.detailDrawer.visible = false;
                 return;
             }
@@ -1934,8 +2640,19 @@ export default class QuickChat extends Extension {
             card.detailDrawer.remove_style_class_name('qc-drawer-pending');
             card.drawerTitle.text = '💭 思考过程';
             card.drawerSummary.visible = false;
-            card.drawerBody.text = card.thinking.trim();
+            const cappedThinking = formatDisplayBufferWithCap(card.thinking.trim(), {
+                maxDisplayBytes: UI_BUFFER_CAPS.maxThinkingDisplayBytes,
+                expanded: Boolean(card.thinkingExpanded),
+            });
+            card.drawerBody.text = cappedThinking.displayText;
             card.drawerBody.visible = true;
+            if (card.drawerExpandBtn) {
+                const showExpand = cappedThinking.isTruncatedForUi || Boolean(card.thinkingExpanded);
+                card.drawerExpandBtn.visible = showExpand;
+                if (showExpand) {
+                    card.drawerExpandBtn.label = card.thinkingExpanded ? '▲ 收起长思考' : '▼ 展开完整思考';
+                }
+            }
             card.drawerActions.visible = false;
             return;
         }
@@ -2058,18 +2775,15 @@ export default class QuickChat extends Extension {
                     : `${primaryTargetText.slice(0, 260)}…`;
                 card.drawerSummary.text = `${preview}（共 ${primaryTargetText.length} 字符，可展开查看完整内容）`;
             } else {
-                card.drawerSummary.text = primaryTargetText;
+                const cappedPrimary = formatDisplayBufferWithCap(primaryTargetText, {
+                    maxDisplayBytes: UI_BUFFER_CAPS.maxToolDetailDisplayBytes,
+                    expanded: Boolean(node.detailsExpanded),
+                });
+                card.drawerSummary.text = cappedPrimary.displayText;
             }
             card.drawerSummary.visible = true;
         } else {
             card.drawerSummary.visible = false;
-        }
-
-        if (card.drawerExpandBtn) {
-            card.drawerExpandBtn.visible = isLongPrimary;
-            if (isLongPrimary) {
-                card.drawerExpandBtn.label = node.detailsExpanded ? '▲ 收起长文本' : '▼ 展开完整内容';
-            }
         }
 
         const extraLines = [];
@@ -2110,14 +2824,28 @@ export default class QuickChat extends Extension {
             extraLines.push(node.detail);
         }
 
+        let isExtraTruncated = false;
         if (extraLines.length > 0) {
-            card.drawerBody.text = extraLines.join('\n');
+            const cappedExtra = formatDisplayBufferWithCap(extraLines.join('\n'), {
+                maxDisplayBytes: UI_BUFFER_CAPS.maxToolDetailDisplayBytes,
+                expanded: Boolean(node.detailsExpanded),
+            });
+            isExtraTruncated = cappedExtra.isTruncatedForUi;
+            card.drawerBody.text = cappedExtra.displayText;
             card.drawerBody.visible = true;
         } else if (!card.drawerSummary.visible) {
             card.drawerBody.text = `工具名称：${node.toolName}`;
             card.drawerBody.visible = true;
         } else {
             card.drawerBody.visible = false;
+        }
+
+        if (card.drawerExpandBtn) {
+            const showExpand = isLongPrimary || isExtraTruncated || (Boolean(node.detailsExpanded) && extraLines.join('\n').length > 260);
+            card.drawerExpandBtn.visible = showExpand;
+            if (showExpand) {
+                card.drawerExpandBtn.label = node.detailsExpanded ? '▲ 收起长文本' : '▼ 展开完整内容';
+            }
         }
 
         card.drawerActions.visible = isAwaiting;
@@ -2144,8 +2872,15 @@ export default class QuickChat extends Extension {
             thinking = '',
             insertIndex = -1,
             scrollOnAdd = true,
+            trackInHistoryWindow = true,
             turnId = '',
             messageId = '',
+            replyTo = '',
+            createdAt = '',
+            ts = 0,
+            modelId = '',
+            backend = '',
+            errorMessage = '',
         } = options;
         this._empty?.hide();
 
@@ -2155,41 +2890,74 @@ export default class QuickChat extends Extension {
             x_expand: true,
         });
 
+        const displayModel = role === 'user'
+            ? '我'
+            : resolveAssistantDisplayModel({modelId, backend}, this._modelLabel || '随问');
+        const effectiveTs = ts > 0 ? ts : (createdAt ? Date.parse(createdAt) || Date.now() : Date.now());
+        const displayTime = formatMessageTimestamp({ts: effectiveTs, createdAt});
+
         const top = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-message-header',
             y_align: Clutter.ActorAlign.CENTER,
         });
         const name = new St.Label({
-            text: role === 'user' ? '我' : (this._modelLabel || '随问'),
+            text: displayModel,
             style_class: 'qc-role',
             y_align: Clutter.ActorAlign.CENTER,
         });
         top.add_child(name);
 
         const time = new St.Label({
-            text: formatNowTime(),
+            text: displayTime,
             style_class: 'qc-time',
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
         });
         top.add_child(time);
 
+        const initialText = text || (errorMessage ? `⚠️ ${errorMessage}` : '');
+        if (errorMessage && !text) {
+            box.add_style_class_name('qc-message-error');
+        }
+
+        const effectiveMsgId = String(messageId || `${role}_${GLib.uuid_string_random()}`);
         const card = {
             role,
             turnId: String(turnId || ''),
-            messageId: String(messageId || ''),
+            messageId: effectiveMsgId,
+            replyTo: String(replyTo || ''),
+            modelId: String(modelId || (role === 'assistant' ? (this._modelLabel || '') : '')),
+            backend: String(backend || ''),
+            roleLabel: name,
             box,
-            text: text || '',
+            text: initialText,
             thinking: thinking || '',
             thinkingHadContent: Boolean(thinking && thinking.trim()),
+            thinkingExpanded: false,
             toolNodes: [],
+            dirtyToolNodeIds: new Set(),
+            allToolDotsDirty: false,
+            dotsExpanded: false,
             selectedNodeId: null,
+            _lastSelectedNodeId: null,
+            _lastThinkingDotKey: '',
+            _lastFoldCount: 0,
+            _lastIsFolded: false,
             hoveredNodeId: null,
             activeTool: false,
+            traceBox: null,
+            detailDrawer: null,
             renderTimer: 0,
             renderState: null,
-            dirty: {text: true, thinking: Boolean(thinking), tools: Boolean(thinking)},
+            hasRenderedFirstToken: Boolean(initialText && initialText.trim()),
+            lastRenderDurationMs: 0,
+            dirty: {
+                text: true,
+                thinking: Boolean(thinking),
+                tools: Boolean(thinking),
+                toolsUrgent: false,
+            },
         };
 
         if (role === 'assistant') {
@@ -2203,191 +2971,6 @@ export default class QuickChat extends Extension {
         top.add_child(copyBtn);
         box.add_child(top);
 
-        if (role === 'assistant') {
-            const traceBox = new St.BoxLayout({
-                orientation: V,
-                style_class: 'qc-trace-box',
-                x_expand: true,
-                visible: false,
-            });
-
-            const dotsRow = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-trace-dots-row',
-                x_expand: true,
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-
-            const thinkingDot = new St.Button({
-                style_class: 'qc-dot-circle qc-dot-thinking',
-                can_focus: true,
-                reactive: true,
-                track_hover: true,
-                accessible_name: '思考过程',
-                y_align: Clutter.ActorAlign.CENTER,
-                visible: false,
-            });
-            thinkingDot.connect('clicked', () => {
-                card.selectedNodeId = card.selectedNodeId === 'thinking' ? null : 'thinking';
-                this._updateCardActivity(card);
-            });
-            thinkingDot.connect('notify::hover', () => {
-                card.hoveredNodeId = thinkingDot.hover
-                    ? 'thinking'
-                    : (card.hoveredNodeId === 'thinking' ? null : card.hoveredNodeId);
-                this._updateTraceHint(card);
-            });
-            dotsRow.add_child(thinkingDot);
-
-            const toolDotsBox = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-tool-dots-box',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-            dotsRow.add_child(toolDotsBox);
-
-            const traceHintLabel = new St.Label({
-                text: '',
-                style_class: 'qc-trace-hint',
-                x_expand: true,
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-            dotsRow.add_child(traceHintLabel);
-            traceBox.add_child(dotsRow);
-
-            const detailDrawer = new St.BoxLayout({
-                orientation: V,
-                style_class: 'qc-trace-drawer',
-                x_expand: true,
-                visible: false,
-            });
-
-            const drawerHeader = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-drawer-header',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-            const drawerTitle = wrapLabel('', 'qc-drawer-title');
-            drawerTitle.x_expand = true;
-            drawerHeader.add_child(drawerTitle);
-
-            const drawerCloseBtn = button('收起', () => {
-                card.selectedNodeId = null;
-                this._updateCardActivity(card);
-            }, 'qc-drawer-close', '收起详情');
-            drawerHeader.add_child(drawerCloseBtn);
-            detailDrawer.add_child(drawerHeader);
-
-            const drawerSummary = wrapLabel('', 'qc-approval-summary');
-            drawerSummary.visible = false;
-            detailDrawer.add_child(drawerSummary);
-
-            const drawerExpandBtn = button('▼ 展开完整内容', () => {
-                const sel = (card.toolNodes || []).find(n => n.id === card.selectedNodeId);
-                if (sel) {
-                    sel.detailsExpanded = !sel.detailsExpanded;
-                    this._updateCardActivity(card);
-                }
-            }, 'qc-drawer-close', '展开或收起完整命令与参数');
-            drawerExpandBtn.visible = false;
-            detailDrawer.add_child(drawerExpandBtn);
-
-            const questionFormBox = new St.BoxLayout({
-                orientation: V,
-                style_class: 'qc-question-form',
-                x_expand: true,
-                visible: false,
-            });
-            detailDrawer.add_child(questionFormBox);
-
-            const drawerBody = wrapLabel('', 'qc-drawer-body');
-            drawerBody.visible = false;
-            detailDrawer.add_child(drawerBody);
-
-            const drawerActions = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-approval-actions',
-                y_align: Clutter.ActorAlign.CENTER,
-                visible: false,
-            });
-            const allowBtn = button(
-                '✓ 仅本次允许',
-                () => this._submitActiveToolDecision(card, 'allow', false),
-                'qc-approval-btn qc-approval-allow',
-                '仅允许本次工具调用，不记住范围'
-            );
-            const alwaysBtn = button(
-                '✓ 范围允许',
-                () => this._submitActiveToolDecision(card, 'allow', true),
-                'qc-approval-btn qc-approval-always',
-                '在当前会话内对明确绑定的安全范围授权'
-            );
-            const denyBtn = button(
-                '✕ 拒绝',
-                () => this._submitActiveToolDecision(card, 'deny', false),
-                'qc-approval-btn qc-approval-deny',
-                '拒绝本次工具调用'
-            );
-            drawerActions.add_child(allowBtn);
-            drawerActions.add_child(alwaysBtn);
-            drawerActions.add_child(denyBtn);
-            detailDrawer.add_child(drawerActions);
-
-            const questionActions = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-approval-actions',
-                y_align: Clutter.ActorAlign.CENTER,
-                visible: false,
-            });
-            const submitAnswerBtn = button(
-                '✓ 提交回答',
-                () => this._submitQuestionDecision(card, 'answer'),
-                'qc-approval-btn qc-approval-allow',
-                '提交所选回答并继续'
-            );
-            const skipAnswerBtn = button(
-                '⏭ 交由 AI 判断',
-                () => this._submitQuestionDecision(card, 'skip'),
-                'qc-approval-btn qc-approval-always',
-                '不指定偏好，交由 AI 自行判断'
-            );
-            const cancelQuestionBtn = button(
-                '✕ 取消',
-                () => this._submitQuestionDecision(card, 'deny'),
-                'qc-approval-btn qc-approval-deny',
-                '取消本次提问'
-            );
-            questionActions.add_child(submitAnswerBtn);
-            questionActions.add_child(skipAnswerBtn);
-            questionActions.add_child(cancelQuestionBtn);
-            detailDrawer.add_child(questionActions);
-
-            traceBox.add_child(detailDrawer);
-            box.add_child(traceBox);
-
-            card.traceBox = traceBox;
-            card.dotsRow = dotsRow;
-            card.thinkingDot = thinkingDot;
-            card.toolDotsBox = toolDotsBox;
-            card.traceHintLabel = traceHintLabel;
-            card.detailDrawer = detailDrawer;
-            card.drawerTitle = drawerTitle;
-            card.drawerSummary = drawerSummary;
-            card.drawerExpandBtn = drawerExpandBtn;
-            card.questionFormBox = questionFormBox;
-            card.renderedQuestionNodeId = null;
-            card.renderedQuestionWidgets = null;
-            card.drawerBody = drawerBody;
-            card.drawerActions = drawerActions;
-            card.allowBtn = allowBtn;
-            card.alwaysBtn = alwaysBtn;
-            card.denyBtn = denyBtn;
-            card.questionActions = questionActions;
-            card.submitAnswerBtn = submitAnswerBtn;
-            card.skipAnswerBtn = skipAnswerBtn;
-            card.cancelQuestionBtn = cancelQuestionBtn;
-        }
-
         const bodyBox = new St.BoxLayout({
             orientation: V,
             style_class: 'qc-message-body',
@@ -2395,6 +2978,29 @@ export default class QuickChat extends Extension {
         });
         box.add_child(bodyBox);
         card.bodyBox = bodyBox;
+
+        const executeFlushPass = (forceAll = false) => {
+            const t0 = GLib.get_monotonic_time();
+            if (
+                forceAll ||
+                card.dirty.tools ||
+                card.dirty.toolsUrgent ||
+                (card.dirty.thinking && card.selectedNodeId === 'thinking')
+            ) {
+                this._updateCardActivity(card);
+                card.dirty.tools = false;
+                card.dirty.toolsUrgent = false;
+                card.dirty.thinking = false;
+            }
+            if (forceAll || card.dirty.text) {
+                this._renderCardBody(card);
+                card.dirty.text = false;
+                if (card.text && card.text.trim()) {
+                    card.hasRenderedFirstToken = true;
+                }
+            }
+            card.lastRenderDurationMs = Math.max(0, (GLib.get_monotonic_time() - t0) / 1000);
+        };
 
         card.flushRender = (forceAll = false) => {
             if (card.renderTimer) {
@@ -2406,15 +3012,7 @@ export default class QuickChat extends Extension {
                 this._updateAiTabBadge();
                 return;
             }
-            if (forceAll || card.dirty.tools || (card.dirty.thinking && card.selectedNodeId === 'thinking')) {
-                this._updateCardActivity(card);
-                card.dirty.tools = false;
-                card.dirty.thinking = false;
-            }
-            if (forceAll || card.dirty.text) {
-                this._renderCardBody(card);
-                card.dirty.text = false;
-            }
+            executeFlushPass(forceAll);
         };
 
         card.scheduleRender = () => {
@@ -2423,34 +3021,39 @@ export default class QuickChat extends Extension {
                 this._updateAiTabBadge();
                 return;
             }
-            if (card.dirty.tools) {
-                this._updateCardActivity(card);
-                card.dirty.tools = false;
-            }
-            if (!card.dirty.text && !(card.dirty.thinking && card.selectedNodeId === 'thinking')) {
+            const needsTools = card.dirty.tools || card.dirty.toolsUrgent || (card.dirty.thinking && card.selectedNodeId === 'thinking');
+            const needsText = card.dirty.text;
+            if (!needsTools && !needsText) {
                 return;
             }
-            if (card.renderTimer) return;
 
-            const len = card.text.length;
-            const intervalMs = len > 4000 ? 110 : len > 1500 ? 75 : 48;
-            card.renderTimer = this._scheduleTimeout(intervalMs, () => {
+            const delayMs = computeAdaptiveRenderDelayMs({
+                isFirstVisibleRender: Boolean(needsText && !card.hasRenderedFirstToken && card.text.length > 0),
+                urgentImmediate: Boolean(card.dirty.toolsUrgent),
+                textLength: card.text.length,
+                lastRenderDurationMs: card.lastRenderDurationMs,
+            });
+
+            if (delayMs <= 0) {
+                if (card.renderTimer) {
+                    this._clearTimer(card.renderTimer);
+                    card.renderTimer = 0;
+                }
+                executeFlushPass(false);
+                this._scrollBottom(false, false);
+                return;
+            }
+
+            if (card.renderTimer) return;
+            card.renderTimer = this._scheduleTimeout(delayMs, () => {
                 card.renderTimer = 0;
                 if (!this._isChatVisible()) {
                     this._hasPendingBackgroundRender = true;
                     this._updateAiTabBadge();
                     return;
                 }
-                if (card.dirty.tools || (card.dirty.thinking && card.selectedNodeId === 'thinking')) {
-                    this._updateCardActivity(card);
-                    card.dirty.tools = false;
-                    card.dirty.thinking = false;
-                }
-                if (card.dirty.text) {
-                    this._renderCardBody(card);
-                    card.dirty.text = false;
-                }
-                this._scrollBottom(false);
+                executeFlushPass(false);
+                this._scrollBottom(false, false);
             });
         };
 
@@ -2458,12 +3061,38 @@ export default class QuickChat extends Extension {
 
         if (insertIndex >= 0) {
             this._messages.insert_child_at_index(box, insertIndex);
-            if (!this._cardList) this._cardList = [];
-            this._cardList.unshift(card);
+        } else if (this._loadNewerBtn && this._loadNewerBtn.get_parent() === this._messages) {
+            const idx = Math.max(0, this._messages.get_n_children() - 1);
+            this._messages.insert_child_at_index(box, idx);
         } else {
             this._messages.add_child(box);
-            if (!this._cardList) this._cardList = [];
-            this._cardList.push(card);
+        }
+
+        if (trackInHistoryWindow && this._historyWindow) {
+            const storedRecord = {
+                id: effectiveMsgId,
+                turnId: card.turnId,
+                replyTo: card.replyTo,
+                role,
+                text: card.text,
+                thinking: card.thinking,
+                createdAt: createdAt || new Date(effectiveTs).toISOString(),
+                ts: effectiveTs,
+                backend: card.backend,
+                modelId: card.modelId,
+                status: 'completed',
+            };
+            const {evictedTopCards} = this._historyWindow.appendRuntimeCard(storedRecord, card, {
+                allowRecycleTop: !this._userScrolledUp,
+                protectedCard: this._live,
+            });
+            for (const oldTop of evictedTopCards) {
+                this._destroyCardActor(oldTop);
+            }
+            this._cardList = this._historyWindow.mountedCards;
+            if (evictedTopCards.length > 0) {
+                this._syncHistoryWindowButtons();
+            }
         }
 
         if (animate && this._animEnabled() && this._isChatVisible()) {
@@ -2478,21 +3107,17 @@ export default class QuickChat extends Extension {
         }
 
         if (scrollOnAdd) {
-            this._scrollBottom(role === 'user');
+            this._scrollBottom(role === 'user', role === 'user');
         }
         return card;
     }
 
     _retryForAssistantCard(assistantCard) {
-        if (this._busy || !this._cardList) return;
-        const idx = this._cardList.indexOf(assistantCard);
-        for (let i = (idx >= 0 ? idx - 1 : this._cardList.length - 1); i >= 0; i--) {
-            const c = this._cardList[i];
-            if (c?.role === 'user' && c.text?.trim()) {
-                this._entry.set_text(c.text.trim());
-                this._send();
-                return;
-            }
+        if (this._busy || !this._historyWindow) return;
+        const promptText = this._historyWindow.findRetryPromptForCard(assistantCard);
+        if (promptText) {
+            this._entry.set_text(promptText);
+            this._send();
         }
     }
 
@@ -2503,22 +3128,27 @@ export default class QuickChat extends Extension {
         }
     }
 
-    _scrollBottom(force = false) {
+    _scrollBottom(force = false, animate = force) {
         if (!this._isChatVisible() && !force) return;
         if (force) {
             this._userScrolledUp = false;
             this._updateJumpBottomVisibility();
         }
         if (this._userScrolledUp && !force) return;
+        if (animate) {
+            this._scrollPendingAnimate = true;
+        }
         if (this._scrollIdle) return;
         this._scrollIdle = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             this._scrollIdle = 0;
+            const shouldAnimate = Boolean(this._scrollPendingAnimate && this._animEnabled());
+            this._scrollPendingAnimate = false;
             const adj = this._scroll?.vadjustment;
             if (!adj) return GLib.SOURCE_REMOVE;
             const target = Math.max(adj.lower, adj.upper - adj.page_size);
             if (Math.abs(adj.value - target) < 1) return GLib.SOURCE_REMOVE;
             this._programmaticScroll = true;
-            if (this._animEnabled() && adj.ease) {
+            if (shouldAnimate && adj.ease) {
                 try {
                     const p = adj.ease(target, {
                         duration: 130,
@@ -2558,13 +3188,19 @@ export default class QuickChat extends Extension {
         }
         if (!this._enabled || this._busy) return;
 
+        if (this._historyWindow?.hasNewer) {
+            this._restoreLatestHistoryWindow();
+        }
+
         const lifeGen = this._lifecycleGeneration;
         const generation = this._generation;
         const turnId = `turn_${GLib.uuid_string_random()}`;
+        const userMessageId = `user_${GLib.uuid_string_random()}`;
         const messageId = `msg_${GLib.uuid_string_random()}`;
 
         this._activeTurnState = {
             turnId,
+            userMessageId,
             messageId,
             sessionId: this._currentSessionId || '',
             clientGeneration: generation,
@@ -2574,7 +3210,11 @@ export default class QuickChat extends Extension {
 
         this._recordPromptHistory(text);
         this._entry.set_text('');
-        this._addMessage('user', text, {animate: true});
+        this._addMessage('user', text, {
+            animate: true,
+            turnId,
+            messageId: userMessageId,
+        });
         this._live = null;
         this._setBusy(true);
         this._setStatusIndicator('busy', '思考与生成中…');
@@ -2583,6 +3223,7 @@ export default class QuickChat extends Extension {
             const result = await this._client.request('prompt', {
                 message: text,
                 turnId,
+                userMessageId,
                 messageId,
                 clientGeneration: generation,
                 lifecycleGeneration: lifeGen,
@@ -2623,10 +3264,16 @@ export default class QuickChat extends Extension {
                 animate: true,
                 turnId: event?.turnId || this._activeTurnState?.turnId || '',
                 messageId: event?.messageId || this._activeTurnState?.messageId || '',
+                replyTo: event?.replyTo || this._activeTurnState?.userMessageId || '',
+                modelId: event?.modelId || this._modelLabel || '',
+                backend: this._getEffectiveBackend(),
             });
         } else {
             if (event?.turnId && !this._live.turnId) this._live.turnId = event.turnId;
             if (event?.messageId && !this._live.messageId) this._live.messageId = event.messageId;
+            if (!this._live.replyTo && this._activeTurnState?.userMessageId) {
+                this._live.replyTo = this._activeTurnState.userMessageId;
+            }
         }
         return this._live;
     }
@@ -2665,6 +3312,7 @@ export default class QuickChat extends Extension {
         }
 
         if (!node) {
+            this._ensureCardTraceHeader(card);
             const index = card.toolNodes.length + 1;
             const id = `tool_${index}_${Date.now()}`;
             const defaultScope = computePermissionScope(toolName || '工具', info.summary || '');
@@ -2708,6 +3356,7 @@ export default class QuickChat extends Extension {
                 userAnswerSummary: '',
                 deliveryError: '',
                 dotBtn: null,
+                _lastStyleKey: '',
             };
 
             if (card.toolDotsBox) {
@@ -2730,10 +3379,14 @@ export default class QuickChat extends Extension {
                     this._updateTraceHint(card);
                 });
                 node.dotBtn = dotBtn;
+                node._lastStyleKey = 'qc-dot-tool-running|nosel';
                 card.toolDotsBox.add_child(dotBtn);
             }
 
             card.toolNodes.push(node);
+            if (card.toolNodes.length > 10) {
+                card.allToolDotsDirty = true;
+            }
         } else {
             if (requestId && !node.requestId) node.requestId = requestId;
             if (toolCallId && !node.toolCallId) node.toolCallId = toolCallId;
@@ -2792,6 +3445,7 @@ export default class QuickChat extends Extension {
         if (typeof info.duration === 'number' && info.duration > 0) {
             node.duration = info.duration;
         }
+        card.dirtyToolNodeIds?.add(node.id);
         return node;
     }
 
@@ -2827,7 +3481,9 @@ export default class QuickChat extends Extension {
 
         target.status = 'sending_approval';
         target.deliveryError = '';
+        card.dirtyToolNodeIds?.add(target.id);
         card.dirty.tools = true;
+        card.dirty.toolsUrgent = true;
         if (!card.text) card.dirty.text = true;
         card.scheduleRender();
         this._setStatusIndicator('busy', skipAll ? '正在通知 AI 自行判断…' : '正在提交您的回答…');
@@ -2863,7 +3519,9 @@ export default class QuickChat extends Extension {
             target.status = 'pending_approval';
             target.deliveryError = '回答未送达后端进程，请点击重试';
             card.selectedNodeId = target.id;
+            card.dirtyToolNodeIds?.add(target.id);
             card.dirty.tools = true;
+            card.dirty.toolsUrgent = true;
             card.flushRender(true);
             this._setStatusIndicator('error', '⚠️ 回答未送达后端，请重试');
             return;
@@ -2872,6 +3530,7 @@ export default class QuickChat extends Extension {
         target.status = 'running';
         target.approvalState = skipAll ? 'skipped' : 'answered';
         target.userAnswerSummary = answerSummary;
+        card.dirtyToolNodeIds?.add(target.id);
 
         const nextPending = card.toolNodes.find(n => n.status === 'pending_approval');
         card.selectedNodeId = nextPending ? nextPending.id : null;
@@ -2880,6 +3539,7 @@ export default class QuickChat extends Extension {
             this._activeTurnState.state = nextPending ? 'awaiting_approval' : 'streaming';
         }
         card.dirty.tools = true;
+        card.dirty.toolsUrgent = true;
         if (!card.text) card.dirty.text = true;
         card.scheduleRender();
         this._updateAiTabBadge();
@@ -2909,7 +3569,9 @@ export default class QuickChat extends Extension {
         // Transition explicitly to `sending_approval` until delivery is confirmed!
         target.status = 'sending_approval';
         target.deliveryError = '';
+        card.dirtyToolNodeIds?.add(target.id);
         card.dirty.tools = true;
+        card.dirty.toolsUrgent = true;
         if (!card.text) card.dirty.text = true;
         card.scheduleRender();
         this._setStatusIndicator('busy', `正在发送 ${target.toolName} 授权指令…`);
@@ -2944,7 +3606,9 @@ export default class QuickChat extends Extension {
             target.status = 'pending_approval';
             target.deliveryError = '授权指令未送达后端进程，请点击按钮重试';
             card.selectedNodeId = target.id;
+            card.dirtyToolNodeIds?.add(target.id);
             card.dirty.tools = true;
+            card.dirty.toolsUrgent = true;
             card.flushRender(true);
             this._setStatusIndicator('error', `⚠️ ${target.toolName} 授权未送达，请重试`);
             return;
@@ -2953,12 +3617,14 @@ export default class QuickChat extends Extension {
         // Delivery confirmed! Move to `running` (only turns green `done` when tool_execution_end arrives) or `denied`
         target.status = allow ? 'running' : 'denied';
         target.approvalState = allow ? (effectiveAlwaysAllow ? 'always' : 'allowed') : 'denied';
+        card.dirtyToolNodeIds?.add(target.id);
 
         if (effectiveAlwaysAllow && target.scopeKey) {
             for (const other of card.toolNodes) {
                 if (other.status === 'pending_approval' && other.scopeKey === target.scopeKey) {
                     other.status = 'running';
                     other.approvalState = 'always';
+                    card.dirtyToolNodeIds?.add(other.id);
                 }
             }
         }
@@ -2970,6 +3636,7 @@ export default class QuickChat extends Extension {
             this._activeTurnState.state = nextPending ? 'awaiting_approval' : 'streaming';
         }
         card.dirty.tools = true;
+        card.dirty.toolsUrgent = true;
         if (!card.text) card.dirty.text = true;
         card.scheduleRender();
         this._updateAiTabBadge();
@@ -2986,6 +3653,29 @@ export default class QuickChat extends Extension {
 
     _onEvent(event) {
         if (!event) return;
+
+        if (event.type === 'models_discovered' && event.backend === 'openai' && Array.isArray(event.models)) {
+            if (this._hasKey('openai-cached-models') && event.models.length > 0) {
+                const seen = new Set();
+                const ids = [];
+                for (const m of event.models) {
+                    const clean = String(m || '').trim();
+                    if (!clean || seen.has(clean)) continue;
+                    seen.add(clean);
+                    ids.push(clean);
+                    if (ids.length >= 300) break;
+                }
+                const existing = this._getSettingStrv('openai-cached-models');
+                if (ids.length > 0 && ids.join('\n') !== existing.join('\n')) {
+                    this._settings.set_strv('openai-cached-models', ids);
+                    if (this._modelPickerOpen) {
+                        this._renderModelPickerResultsSection();
+                    }
+                }
+            }
+            return;
+        }
+
         // Strict per-turn UI isolation (Stage B3): ignore any late events belonging to a previous turn!
         if (
             event.turnId &&
@@ -3014,12 +3704,18 @@ export default class QuickChat extends Extension {
                     : '';
                 this._modelLabel = event.modelId;
                 this._idleStatus = `${event.modelId}${suffix}`;
+                if (this._live) {
+                    this._live.modelId = event.modelId;
+                    if (this._live.roleLabel) {
+                        this._live.roleLabel.text = event.modelId;
+                    }
+                }
             }
             if (this._activeTurnState && !this._hasPendingApprovalNodes(this._live)) {
                 this._activeTurnState.state = 'streaming';
             }
             if (this._live && this._live.text && !this._live.text.endsWith('\n')) {
-                this._live.text += '\n\n';
+                this._live.text = appendBoundedInMemoryText(this._live.text, '\n\n');
                 this._live.dirty.text = true;
             }
         }
@@ -3029,7 +3725,7 @@ export default class QuickChat extends Extension {
             const awaiting = this._hasPendingApprovalNodes(this._live);
             if (delta?.type === 'thinking_delta' && delta.delta) {
                 const card = this._ensureLiveCard(event);
-                card.thinking += delta.delta;
+                card.thinking = appendBoundedInMemoryText(card.thinking, delta.delta);
                 card.dirty.thinking = true;
                 if (!card.thinkingHadContent && card.thinking.trim()) {
                     card.thinkingHadContent = true;
@@ -3043,7 +3739,7 @@ export default class QuickChat extends Extension {
                 card.scheduleRender();
             } else if (delta?.type === 'thinking_replace' && typeof delta.thinking === 'string') {
                 const card = this._ensureLiveCard(event);
-                card.thinking = delta.thinking;
+                card.thinking = appendBoundedInMemoryText('', delta.thinking);
                 card.dirty.thinking = true;
                 if (!card.thinkingHadContent && card.thinking.trim()) {
                     card.thinkingHadContent = true;
@@ -3057,7 +3753,7 @@ export default class QuickChat extends Extension {
                 card.scheduleRender();
             } else if (delta?.type === 'text_delta' && delta.delta) {
                 const card = this._ensureLiveCard(event);
-                card.text += delta.delta;
+                card.text = appendBoundedInMemoryText(card.text, delta.delta);
                 card.dirty.text = true;
                 if (!awaiting) {
                     if (this._activeTurnState) this._activeTurnState.state = 'streaming';
@@ -3066,7 +3762,7 @@ export default class QuickChat extends Extension {
                 card.scheduleRender();
             } else if (delta?.type === 'text_replace' && typeof delta.text === 'string') {
                 const card = this._ensureLiveCard(event);
-                card.text = delta.text;
+                card.text = appendBoundedInMemoryText('', delta.text);
                 card.dirty.text = true;
                 if (!awaiting) {
                     if (this._activeTurnState) this._activeTurnState.state = 'streaming';
@@ -3088,6 +3784,7 @@ export default class QuickChat extends Extension {
             });
             if (node && node.status !== 'pending_approval' && node.status !== 'sending_approval' && node.status !== 'denied') {
                 node.status = 'running';
+                card.dirtyToolNodeIds?.add(node.id);
             }
             card.activeTool = true;
             card.dirty.tools = true;
@@ -3133,6 +3830,7 @@ export default class QuickChat extends Extension {
             if (node) {
                 node.status = 'pending_approval';
                 node.approvalState = 'pending';
+                card.dirtyToolNodeIds?.add(node.id);
                 if (!this._hasPendingApprovalNodes(card) || !card.selectedNodeId) {
                     card.selectedNodeId = node.id;
                 } else {
@@ -3147,6 +3845,7 @@ export default class QuickChat extends Extension {
             }
             card.activeTool = true;
             card.dirty.tools = true;
+            card.dirty.toolsUrgent = true;
             if (!card.text) card.dirty.text = true;
             if (node?.isQuestion) {
                 const brief = this._formatShortHint(node.summary, 20);
@@ -3156,7 +3855,7 @@ export default class QuickChat extends Extension {
             }
             this._updateAiTabBadge();
             card.scheduleRender();
-            this._scrollBottom(true);
+            this._scrollBottom(true, true);
         }
 
         if (event.type === 'permission_resolved') {
@@ -3183,6 +3882,7 @@ export default class QuickChat extends Extension {
                             ? (event.autoApproved ? 'always' : (node.isQuestion ? 'answered' : 'allowed'))
                             : 'denied';
                     }
+                    card.dirtyToolNodeIds?.add(node.id);
                     if (card.selectedNodeId === node.id) {
                         const nextPending = card.toolNodes.find(n => n.status === 'pending_approval');
                         card.selectedNodeId = nextPending ? nextPending.id : null;
@@ -3194,6 +3894,7 @@ export default class QuickChat extends Extension {
                         : 'streaming';
                 }
                 card.dirty.tools = true;
+                card.dirty.toolsUrgent = true;
                 this._updateAiTabBadge();
                 card.scheduleRender();
             }
@@ -3222,6 +3923,7 @@ export default class QuickChat extends Extension {
                     if (node.status !== 'denied') {
                         node.status = event.isError ? 'error' : 'done';
                     }
+                    this._live.dirtyToolNodeIds?.add(node.id);
                 }
                 this._live.activeTool = this._live.toolNodes.some(
                     n => n.status === 'running' || n.status === 'pending_approval' || n.status === 'sending_approval'
@@ -3239,6 +3941,7 @@ export default class QuickChat extends Extension {
                 for (const node of this._live.toolNodes) {
                     if (node.status === 'running' && (!confirmedIds || (node.toolCallId && confirmedIds.has(node.toolCallId)))) {
                         node.status = 'done';
+                        this._live.dirtyToolNodeIds?.add(node.id);
                     }
                 }
                 this._live.activeTool = this._live.toolNodes.some(
@@ -3267,15 +3970,21 @@ export default class QuickChat extends Extension {
                 if (event.message.errorMessage && !card.text) {
                     card.text = `⚠️ ${event.message.errorMessage}`;
                     card.dirty.text = true;
-                    card.box.add_style_class_name('qc-message-error');
+                    card.box?.add_style_class_name('qc-message-error');
                 }
                 card.activeTool = false;
+                this._historyWindow?.updateStoredMessageById(card.messageId, {
+                    text: card.text,
+                    thinking: card.thinking,
+                    modelId: card.modelId || this._modelLabel || '',
+                    ...(event.message.errorMessage ? {errorMessage: event.message.errorMessage} : {}),
+                });
                 card.flushRender();
             }
             if (event.message.errorMessage) {
                 this._setStatusIndicator('error', `错误：${event.message.errorMessage}`);
             }
-            this._scrollBottom(false);
+            this._scrollBottom(false, false);
         }
 
         if (
@@ -3291,18 +4000,27 @@ export default class QuickChat extends Extension {
                         if (node.status === 'pending_approval' || node.status === 'sending_approval') {
                             node.status = 'denied';
                             node.approvalState = 'denied';
+                            this._live.dirtyToolNodeIds?.add(node.id);
                             if (this._live.selectedNodeId === node.id) {
                                 this._live.selectedNodeId = null;
                             }
                         } else if (node.status === 'running') {
                             // Never fake tool completion on settle/cancel/failure (Stage B3)!
                             node.status = 'interrupted';
+                            this._live.dirtyToolNodeIds?.add(node.id);
                         }
                     }
                 }
                 this._live.activeTool = false;
                 this._live.dirty.tools = true;
+                this._live.dirty.toolsUrgent = true;
                 this._live.dirty.text = true;
+                this._historyWindow?.updateStoredMessageById(this._live.messageId, {
+                    text: this._live.text,
+                    thinking: this._live.thinking,
+                    modelId: this._live.modelId || this._modelLabel || '',
+                    status: terminalStatus,
+                });
                 this._live.flushRender();
             }
 
@@ -3398,6 +4116,8 @@ export default class QuickChat extends Extension {
         this._draftInput = '';
         this._promptHistory = [];
         this._historyIndex = -1;
+        this._modelPickerQuery = '';
+        this._modelPickerPage = 0;
         this._settings.set_string('session-id', GLib.uuid_string_random());
         this._clearMessages();
         this._entry.set_text('');
@@ -3476,11 +4196,13 @@ export default class QuickChat extends Extension {
 
         this._wrapper = this._chat = null;
         this._sendButton = this._stopButton = this._newButton = this._clipAskBtn = this._reconnectButton = null;
-        this._statusBtn = this._modelChevron = this._modelPickerBox = this._loadMoreBtn = null;
+        this._statusBtn = this._modelChevron = this._modelPickerBox = this._loadMoreBtn = this._loadNewerBtn = null;
+        this._modelPickerResultsSection = this._modelPickerSearchEntry = this._modelPickerRefreshBtn = null;
         this._entry = this._scroll = this._scrollStack = this._messages = this._jumpBottomBtn = null;
         this._status = this._statusDot = this._notifBadge = this._aiBadge = null;
+        this._historyWindow?.clear();
+        this._historyWindow = null;
         this._cardList = null;
-        this._allHistoryMessages = [];
         this._settings = null;
     }
 }

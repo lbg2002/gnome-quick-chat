@@ -11,8 +11,10 @@ import {
 } from './protocol.js';
 import {
     detectBackendSelection,
-    loadLocalBackendCatalog,
+    invalidateBackendDetectionCaches,
+    loadLocalBackendCatalogAsync,
     migrateGSettingsIfNeeded,
+    peekCachedBackendCatalog,
 } from './core/backendDetect.js';
 import {attachCrossOriginRedirectGuard} from './backendClient.js';
 import {
@@ -748,9 +750,12 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         let currentCatalog = {backendLabel: '', providers: []};
         let providerValues = [''];
         let modelValues = [''];
-        let onlineOpenAIModels = [];
+        let onlineOpenAIModels = hasKey('openai-cached-models')
+            ? [...(s.get_strv('openai-cached-models') || [])]
+            : [];
         let syncingUi = false;
         let syncingModeCombo = false;
+        let catalogBgGen = 0;
 
         const syncBackendCapabilitiesUi = eff => {
             const rawMode = getStr('agent-mode', 'readonly') || 'readonly';
@@ -846,7 +851,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             syncingUi = false;
         };
 
-        const rebuildProviderAndModelUi = (statusNote = '') => {
+        const rebuildProviderAndModelUi = (statusNote = '', skipAsyncRefresh = false) => {
             const configured = getStr('backend', 'auto') || 'auto';
             const selection = getSelection();
             const eff = selection.effectiveBackend;
@@ -874,7 +879,18 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
             syncBackendCapabilitiesUi(eff);
 
-            currentCatalog = loadLocalBackendCatalog(eff);
+            const cached = peekCachedBackendCatalog(eff);
+            currentCatalog = cached;
+            if (!isOpenAI && !isUnconfigured && (!cached.fromCache || cached.stale) && !skipAsyncRefresh) {
+                const bgGen = ++catalogBgGen;
+                loadLocalBackendCatalogAsync(eff).then(loaded => {
+                    if (bgGen === catalogBgGen && getEffectiveBackend() === eff && loaded) {
+                        currentCatalog = loaded;
+                        rebuildProviderAndModelUi(statusNote, true);
+                    }
+                }).catch(() => {});
+            }
+
             if (!isOpenAI && !isUnconfigured) {
                 autoRepairSwappedProviderAndModel(eff, currentCatalog.providers);
             }
@@ -914,7 +930,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 catalogGroup.description = '尚未检测到可用后端：可在上方直接填写 OpenAI 兼容接口地址，或安装 ZCode / Codex CLI。';
             } else if (isOpenAI) {
                 catalogGroup.description = onlineOpenAIModels.length
-                    ? `自定义 API：已在线拉取 ${onlineOpenAIModels.length} 个可选模型。`
+                    ? `自定义 API：已缓存 / 拉取 ${onlineOpenAIModels.length} 个可选模型。`
                     : '自定义 API：点击右上角「查询 / 刷新模型」可从 /v1/models 拉取在线模型列表。';
             } else {
                 catalogGroup.description = `${currentCatalog.backendLabel}：已只读扫描到 ${currentCatalog.providers.length} 个 Provider、${totalModels} 个预设模型。`;
@@ -931,6 +947,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 // Flush any pending key edit to its original endpoint BEFORE switching to the new endpoint!
                 flushPendingDebouncedSave();
                 onlineOpenAIModels = [];
+                if (hasKey('openai-cached-models')) {
+                    s.set_strv('openai-cached-models', []);
+                }
+                invalidateBackendDetectionCaches();
                 try { activeModelsCancellable?.cancel?.(); } catch (_) {}
                 loadSecretForCurrentEndpoint();
             }
@@ -1004,8 +1024,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const reqCancellable = new Gio.Cancellable();
             activeModelsCancellable = reqCancellable;
 
+            invalidateBackendDetectionCaches();
             const eff = getEffectiveBackend();
-            currentCatalog = loadLocalBackendCatalog(eff);
+            currentCatalog = await loadLocalBackendCatalogAsync(eff, {forceRefresh: true});
 
             let targetBaseUrl = '';
             let targetApiKey = '';
@@ -1018,9 +1039,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 const curProv = getActiveProvider(eff);
                 targetProviderObj = (curProv && currentCatalog.providers.find(p => p.id === curProv))
                     || currentCatalog.providers.find(p => p.baseUrl);
-                if (targetProviderObj?.baseUrl) {
+                // Only query local CLI provider endpoints that do not require persisted plaintext keys
+                if (targetProviderObj?.baseUrl && targetProviderObj.apiKey) {
                     targetBaseUrl = targetProviderObj.baseUrl;
-                    targetApiKey = targetProviderObj.apiKey || '';
+                    targetApiKey = targetProviderObj.apiKey;
                 }
             }
 
@@ -1032,7 +1054,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 rebuildProviderAndModelUi(
                     eff === 'openai' || eff === 'unconfigured'
                         ? '⚠️ 请先在上方填写接口地址 (Base URL)'
-                        : `✓ 已重新扫描 ${currentCatalog.backendLabel} 本地配置（共 ${currentCatalog.providers.length} 个 Provider）`
+                        : `✓ 已重新扫描 ${currentCatalog.backendLabel} 本地配置（共 ${currentCatalog.providers.length} 个 Provider）`,
+                    true
                 );
                 return;
             }
@@ -1047,7 +1070,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             if (!msg) {
                 refreshBtn.sensitive = true;
                 refreshBtnContent.label = '查询 / 刷新模型';
-                rebuildProviderAndModelUi(`❌ 无效的接口地址：${modelsUrl}`);
+                rebuildProviderAndModelUi(`❌ 无效的接口地址：${modelsUrl}`, true);
                 return;
             }
             attachCrossOriginRedirectGuard(msg, modelsUrl);
@@ -1076,16 +1099,19 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     });
                     const ids = parsed.models;
                     if (!ids.length) {
-                        rebuildProviderAndModelUi('⚠️ 在线接口未返回模型列表，已使用本地配置');
+                        rebuildProviderAndModelUi('⚠️ 在线接口未返回模型列表，已使用本地配置', true);
                         return;
                     }
                     if (eff === 'openai' || eff === 'unconfigured') {
                         onlineOpenAIModels = ids;
+                        if (hasKey('openai-cached-models')) {
+                            s.set_strv('openai-cached-models', ids.slice(0, 120));
+                        }
                         // User-selected model ALWAYS takes precedence over models[0]!
                         if (!preferred && parsed.selectedModel) {
                             setStr('openai-model', parsed.selectedModel);
                         }
-                        rebuildProviderAndModelUi(`✓ 连接成功：从 ${modelsUrl} 拉取到 ${ids.length} 个在线模型`);
+                        rebuildProviderAndModelUi(`✓ 连接成功：从 ${modelsUrl} 拉取到 ${ids.length} 个在线模型`, true);
                     } else {
                         if (targetProviderObj) {
                             targetProviderObj.models = Array.from(new Set([...ids, ...targetProviderObj.models]));
@@ -1099,7 +1125,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                         apiKey: targetApiKey,
                         maxChars: 200,
                     });
-                    rebuildProviderAndModelUi(`⚠️ 在线查询未成功（${cleanErr}），已保留现有配置`);
+                    rebuildProviderAndModelUi(`⚠️ 在线查询未成功（${cleanErr}），已保留现有配置`, true);
                 }
             });
         });

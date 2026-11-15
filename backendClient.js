@@ -19,7 +19,10 @@ import {
     createGioCliEnv,
     detectBackendSelection,
     findExecutableInDirs,
+    loadLocalBackendCatalogAsync,
+    peekCachedBackendCatalog,
     probeCliCapabilities,
+    readJsonFileAsync,
     readJsonFileSync,
 } from './core/backendDetect.js';
 import {UNCONFIGURED_BACKEND_MESSAGE} from './core/configMigration.js';
@@ -27,7 +30,9 @@ import {
     cleanupStaleRuntimeFiles,
     getPrivateRuntimeDir,
     getUserSpecialDirs,
+    readFileBytesBoundedAsync,
     removeFileQuietly,
+    writePrivateFileAsync,
     writePrivateFileSync,
 } from './core/paths.js';
 import {
@@ -45,6 +50,7 @@ import {
     evaluateSubprocessOutcome,
     isSafeProcessGroupId,
     prepareZCodeConfigOverride,
+    prepareZCodeConfigOverrideAsync,
     validateCliPromptLength,
     wrapArgvWithSetsid,
 } from './runtime/cliProcessRunner.js';
@@ -162,6 +168,21 @@ function createDefaultZCodeConfigIo() {
     };
 }
 
+function createDefaultZCodeConfigAsyncIo() {
+    return {
+        homeDir: GLib.get_home_dir(),
+        fileExistsAsync: async p => {
+            const info = await readFileBytesBoundedAsync(p, 16);
+            return info.exists;
+        },
+        readJsonAsync: (p, opts = {}) => readJsonFileAsync(p, opts.maxBytes),
+        getRuntimeDir: getPrivateRuntimeDir,
+        makeUuid: () => GLib.uuid_string_random(),
+        writePrivateFileAsync: (p, bytes) => writePrivateFileAsync(p, bytes),
+        removeFile: removeFileQuietly,
+    };
+}
+
 /**
  * Generates and verifies an isolated 0600 temporary ZCode personal provider config file
  * inside XDG_RUNTIME_DIR/gnome-quick-chat without modifying ~/.zcode/v2/provider_config.json.
@@ -172,6 +193,10 @@ function createDefaultZCodeConfigIo() {
  */
 export function createIsolatedZCodeConfigOverride(config, ioEnv = null) {
     return prepareZCodeConfigOverride(config, ioEnv || createDefaultZCodeConfigIo());
+}
+
+export function createIsolatedZCodeConfigOverrideAsync(config, asyncIoEnv = null) {
+    return prepareZCodeConfigOverrideAsync(config, asyncIoEnv || createDefaultZCodeConfigAsyncIo());
 }
 
 export function resolveBackendRuntime(config = {}) {
@@ -239,24 +264,11 @@ export function resolveBackendRuntime(config = {}) {
             }
             : {};
 
-        // Inspect personal config read-only to display accurate initial model label
-        const home = GLib.get_home_dir();
-        const personalObj = readJsonFileSync(GLib.build_filenamev([home, '.zcode', 'v2', 'provider_config.json']));
-        const preview = personalObj
-            ? buildZCodePersonalConfigOverride(personalObj, {
-                provider: config.provider || '',
-                model: config.model || '',
-                reasoningEffort: config.reasoningEffort || 'default',
-            })
-            : null;
-        const resolvedProvider = preview?.providerId
-            || config.provider
-            || personalObj?.config?.defaultModelSelection?.providerId
-            || '';
-        const effectiveModel = preview?.modelId
-            || config.model
-            || personalObj?.config?.defaultModelSelection?.modelId
-            || '';
+        // Stage D4: peek sanitized catalog cache first (zero synchronous provider_config.json I/O);
+        // `get_state` asynchronously populates the default model label if cache is cold.
+        const cachedCat = peekCachedBackendCatalog('zcode');
+        const resolvedProvider = String(config.provider || cachedCat.defaultProviderId || '').trim();
+        const effectiveModel = String(config.model || cachedCat.defaultModelId || '').trim();
         const label = effectiveModel || 'ZCode';
 
         let bridgePath = '';
@@ -470,6 +482,16 @@ export class BackendClient {
         }
 
         if (type === 'get_state') {
+            if (this._backend === 'zcode' && !this._runtime.resolvedModel && !this._config?.model) {
+                try {
+                    const cat = await loadLocalBackendCatalogAsync('zcode');
+                    if (!this._closed && cat?.defaultModelId && !this._runtime.resolvedModel) {
+                        this._runtime.resolvedProvider = this._runtime.resolvedProvider || cat.defaultProviderId || '';
+                        this._runtime.resolvedModel = cat.defaultModelId;
+                        this._runtime.label = cat.defaultModelId;
+                    }
+                } catch (_) {}
+            }
             const endpointSec = this._backend === 'openai'
                 ? inspectEndpointSecurity(this._runtime?.baseUrl || '')
                 : null;
@@ -490,6 +512,19 @@ export class BackendClient {
                 sessionUnsavedWarning: this._store?.lastWriteError
                     ? `历史未保存：${this._store.lastWriteError.message}`
                     : '',
+            };
+        }
+        if (type === 'get_models') {
+            if (this._backend === 'openai') {
+                return this._fetchOpenAIModelsListAsync(fields.cancellable || null);
+            }
+            const cat = await loadLocalBackendCatalogAsync(this._backend, {
+                forceRefresh: Boolean(fields.forceRefresh),
+            });
+            return {
+                backend: this._backend,
+                catalog: cat,
+                models: [],
             };
         }
         if (type === 'get_messages') {
@@ -715,11 +750,8 @@ export class BackendClient {
         turn.clearApprovalWatchdog = clearApproval;
     }
 
-    _discoverOpenAIModelAsync(cancellable) {
+    _fetchOpenAIModelsListAsync(cancellable = null) {
         const userPreferredModel = String(this._runtime.modelId || '').trim();
-        if (userPreferredModel) {
-            return Promise.resolve(userPreferredModel);
-        }
         const modelsUrl = this._runtime.modelsUrl;
         const apiKey = this._runtime.apiKey || '';
         return new Promise((resolve, reject) => {
@@ -743,21 +775,52 @@ export class BackendClient {
                         preferredModel: userPreferredModel,
                         apiKey,
                     });
-                    if (!parsed.selectedModel) {
-                        reject(new Error('未指定模型 ID，且 /models 未返回可用模型；请在设置中填写模型 ID'));
-                        return;
+                    this._runtime.modelMetadata = {
+                        ...(this._runtime.modelMetadata || {}),
+                        ...(parsed.metadataById || {}),
+                    };
+                    if (!this._closed && Array.isArray(parsed.models) && parsed.models.length > 0) {
+                        this._event({
+                            type: 'models_discovered',
+                            backend: 'openai',
+                            models: parsed.models.slice(0, 200),
+                            clientGeneration: this._clientGeneration,
+                        });
                     }
-                    this._runtime.modelId = parsed.selectedModel;
-                    this._runtime.resolvedModel = parsed.selectedModel;
-                    this._runtime.label = parsed.selectedModel;
-                    this._runtime.modelMetadata = parsed.metadataById || {};
-                    resolve(parsed.selectedModel);
+                    resolve({
+                        backend: 'openai',
+                        models: parsed.models || [],
+                        selectedModel: parsed.selectedModel || '',
+                    });
                 } catch (e) {
                     const cleanMsg = redactSensitiveText(e?.message || String(e), {apiKey, maxChars: 240});
-                    reject(new Error(`请在设置中填写模型 ID（${cleanMsg}）`));
+                    reject(new Error(cleanMsg));
                 }
             });
         });
+    }
+
+    async _discoverOpenAIModelAsync(cancellable) {
+        const userPreferredModel = String(this._runtime.modelId || '').trim();
+        if (userPreferredModel) {
+            return userPreferredModel;
+        }
+        try {
+            const parsed = await this._fetchOpenAIModelsListAsync(cancellable);
+            if (!parsed.selectedModel) {
+                throw new Error('未指定模型 ID，且 /models 未返回可用模型；请在设置中填写模型 ID');
+            }
+            this._runtime.modelId = parsed.selectedModel;
+            this._runtime.resolvedModel = parsed.selectedModel;
+            this._runtime.label = parsed.selectedModel;
+            return parsed.selectedModel;
+        } catch (e) {
+            const cleanMsg = redactSensitiveText(e?.message || String(e), {
+                apiKey: this._runtime.apiKey || '',
+                maxChars: 240,
+            });
+            throw new Error(`请在设置中填写模型 ID（${cleanMsg}）`);
+        }
     }
 
     async _runOpenAITurn(promptText, turnMeta = {}) {
@@ -1118,10 +1181,10 @@ export class BackendClient {
         return {disposition: 'streaming', turnId: turn.id};
     }
 
-    _runSingleTurnSubprocess(promptText, turnMeta = {}) {
+    async _runSingleTurnSubprocess(promptText, turnMeta = {}) {
         const budgetCheck = preparePromptWithinBudget(promptText, {allowTruncate: false});
         if (!budgetCheck.ok) {
-            return Promise.reject(new Error(budgetCheck.warning || '当前提问超出单次输入上限'));
+            throw new Error(budgetCheck.warning || '当前提问超出单次输入上限');
         }
 
         const cancellable = new Gio.Cancellable();
@@ -1158,7 +1221,7 @@ export class BackendClient {
         if (requireBridgeHandshake && !this._runtime?.bridgePath) {
             const err = new Error('未找到 ZCode 权限审批桥接模块（zcodeBridge.cjs），已阻止在需审批模式下启动任务');
             this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
-            return Promise.reject(err);
+            throw err;
         }
 
         let zcodeIsolated = {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
@@ -1173,11 +1236,11 @@ export class BackendClient {
             });
 
             if (this._backend === 'zcode') {
-                zcodeIsolated = createIsolatedZCodeConfigOverride(this._config);
+                zcodeIsolated = await createIsolatedZCodeConfigOverrideAsync(this._config);
                 if (zcodeIsolated.tempFilePath) {
                     turn.tempFiles.push(zcodeIsolated.tempFilePath);
                 }
-                if (zcodeIsolated.resolvedModel) {
+                if (zcodeIsolated.resolvedModel && !this._closed) {
                     this._runtime.resolvedProvider = zcodeIsolated.resolvedProvider || this._runtime.resolvedProvider;
                     this._runtime.resolvedModel = zcodeIsolated.resolvedModel;
                     this._runtime.label = zcodeIsolated.resolvedModel;
@@ -1189,9 +1252,14 @@ export class BackendClient {
                         runtimeDir,
                         `zcode-prompt-${GLib.uuid_string_random()}.txt`,
                     ]);
-                    writePrivateFileSync(promptTempFilePath, Encoder.encode(effectiveCliPrompt));
+                    await writePrivateFileAsync(promptTempFilePath, Encoder.encode(effectiveCliPrompt), turn.cancellable);
                     turn.tempFiles.push(promptTempFilePath);
                 }
+            }
+
+            if (!this._turns.isCurrent(turn)) {
+                turn.tempFiles.splice(0).forEach(removeFileQuietly);
+                return {disposition: 'cancelled', turnId: turn.id};
             }
 
             const spawnConfig = {
@@ -1211,12 +1279,18 @@ export class BackendClient {
                     stdinPrompt: useCodexStdin,
                 });
         } catch (prepErr) {
-            this._turns.finalizeTurn(turn, {
-                status: 'failed',
-                errorText: prepErr.message,
-                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
-            });
-            return Promise.reject(prepErr);
+            turn.tempFiles.splice(0).forEach(removeFileQuietly);
+            if (this._turns.isCurrent(turn)) {
+                this._turns.finalizeTurn(turn, {
+                    status: turn.aborted ? 'cancelled' : 'failed',
+                    errorText: turn.aborted ? '' : prepErr.message,
+                    onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+                });
+            }
+            if (turn.aborted) {
+                return {disposition: 'cancelled', turnId: turn.id};
+            }
+            throw prepErr;
         }
 
         const ctxCfg = this._getSessionContextConfig();
