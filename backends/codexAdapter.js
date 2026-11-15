@@ -121,6 +121,9 @@ export class CodexAdapter extends BaseBackendAdapter {
                 turnId: turn.id,
                 role: 'user',
                 content: budgetCheck.promptText,
+                ...(turnMeta.displayUserText ? {displayText: turnMeta.displayUserText} : {}),
+                ...(turnMeta.userCreatedAt ? {createdAt: turnMeta.userCreatedAt} : {}),
+                ...(turnMeta.userTs ? {ts: turnMeta.userTs} : {}),
             },
             'codex',
             ctxCfg

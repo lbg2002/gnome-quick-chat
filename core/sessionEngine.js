@@ -191,12 +191,21 @@ export function normalizeStoredMessage(raw, {
 
     const bounded = truncateContentToByteBudget(cloneDeepJson(raw.content ?? ''), Math.max(4096, maxRecordBytes - 1024));
 
+    const finishReason = typeof raw.finishReason === 'string' && raw.finishReason.trim()
+        ? raw.finishReason.trim().slice(0, 40)
+        : '';
+
+    const displayText = typeof raw.displayText === 'string' && raw.displayText.trim()
+        ? raw.displayText.slice(0, 65536)
+        : '';
+
     const record = {
         id,
         ...(turnId ? {turnId} : {}),
         revision,
         role,
         content: bounded.content,
+        ...(displayText ? {displayText} : {}),
         createdAt,
         ts,
         backend,
@@ -205,6 +214,7 @@ export function normalizeStoredMessage(raw, {
         status,
         ...(raw.partial || bounded.truncated ? {partial: true} : {}),
         ...(bounded.truncated ? {truncated: true} : {}),
+        ...(finishReason ? {finishReason} : {}),
         ...(typeof raw.errorMessage === 'string' && raw.errorMessage ? {errorMessage: raw.errorMessage} : {}),
     };
 
@@ -766,6 +776,112 @@ export class SessionStoreEngine {
         });
     }
 
+    /**
+     * Rewinds session history cleanly to the point right BEFORE `targetMessageId`'s user turn
+     * (used by in-place Regenerate `↻` and Edit Question `✎`).
+     *
+     * Architectural Invariant (Stage F3):
+     * Because external CLI `resume` (`--resume` / `codex exec resume`) cannot roll back remote session turns,
+     * rewinding history ALWAYS invalidates `remoteSessionId` (`remoteSessionReset: true`) so the next turn
+     * starts a fresh CLI session and reconstructs exact local context via `buildCrossBackendPromptWithContext`
+     * — NEVER pretending remote history rolled back!
+     */
+    rewindFromUserMessage(targetMessageId, {archiveRemoved = true} = {}) {
+        const cleanId = String(targetMessageId || '').trim();
+        if (!cleanId) {
+            return {
+                ok: false,
+                error: '缺少需要回退的消息标识',
+                removedMessages: [],
+                targetUserMessage: null,
+                remoteSessionReset: false,
+                writePromise: Promise.resolve(),
+            };
+        }
+
+        let splitIdx = this.messages.findIndex(m => m && m.id === cleanId);
+        if (splitIdx >= 0 && this.messages[splitIdx]?.role !== 'user') {
+            const targetMsg = this.messages[splitIdx];
+            const replyTo = String(targetMsg?.replyTo || '').trim();
+            if (replyTo) {
+                const replyUserIdx = this.messages.findIndex(m => m && m.id === replyTo && m.role === 'user');
+                if (replyUserIdx >= 0) splitIdx = replyUserIdx;
+            }
+            if (this.messages[splitIdx]?.role !== 'user') {
+                for (let i = splitIdx - 1; i >= 0; i--) {
+                    if (this.messages[i]?.role === 'user') {
+                        splitIdx = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (splitIdx < 0 || this.messages[splitIdx]?.role !== 'user') {
+            return {
+                ok: false,
+                error: '未在当前会话中找到对应的提问记录',
+                removedMessages: [],
+                targetUserMessage: null,
+                remoteSessionReset: false,
+                writePromise: Promise.resolve(),
+            };
+        }
+
+        const targetUserMessage = cloneDeepJson(this.messages[splitIdx]);
+        const removedMessages = this.messages.slice(splitIdx).map(cloneDeepJson);
+        const retainedSnapshot = this.messages.slice(0, splitIdx).map(cloneDeepJson);
+        this.messages = retainedSnapshot.map(cloneDeepJson);
+
+        const hadRemoteSession = Boolean(this.meta.remoteSessionId);
+        const rev = ++this._revision;
+        this.meta.remoteSessionId = '';
+        this.meta.remoteSyncedRevision = 0;
+        this.meta.lastRemoteResetReason = 'history_rewound';
+        this.meta.committedRevision = rev;
+        this.meta.updatedAt = Date.now();
+        this._needsLeadingNewlineOnAppend = false;
+
+        const metaSnapshot = cloneDeepJson(this.meta);
+        const hadPriorCorruptLines = this.corruptLineCount > 0;
+        const corruptOriginalSnapshot = this._initialCorruptSnapshot;
+        let archiveWritten = false;
+        let jsonlWritten = false;
+
+        const writePromise = this._enqueueWrite('rewind_from_user_turn', async () => {
+            if (hadPriorCorruptLines) {
+                const backupPath = `${this.jsonlPath}.corrupt-backup`;
+                if (!(await this._io.exists(backupPath))) {
+                    const rawOrig = corruptOriginalSnapshot !== null
+                        ? corruptOriginalSnapshot
+                        : ((await this._io.exists(this.jsonlPath)) ? await this._io.readText(this.jsonlPath) : '');
+                    await this._io.replaceFile(backupPath, rawOrig);
+                }
+            }
+            if (!archiveWritten && archiveRemoved && this._keepArchive && removedMessages.length > 0) {
+                const archiveLines = removedMessages.map(m => JSON.stringify(m)).join('\n') + '\n';
+                await this._io.appendLine(this.archivePath, archiveLines);
+                archiveWritten = true;
+            }
+            if (!jsonlWritten) {
+                const jsonlBody = retainedSnapshot.map(m => JSON.stringify(m)).join('\n')
+                    + (retainedSnapshot.length ? '\n' : '');
+                await this._io.replaceFile(this.jsonlPath, jsonlBody);
+                jsonlWritten = true;
+            }
+            await this._io.replaceFile(this.metaPath, JSON.stringify(metaSnapshot, null, 2));
+        });
+
+        return {
+            ok: true,
+            targetUserMessage,
+            removedMessages,
+            retainedCount: this.messages.length,
+            remoteSessionReset: hadRemoteSession,
+            writePromise,
+        };
+    }
+
     flush() {
         return sharedSessionWriteChains.get(this._coordKey) || Promise.resolve();
     }
@@ -815,6 +931,290 @@ export class SessionStoreEngine {
         });
         return nextChain;
     }
+}
+
+/**
+ * Builds a clean continuation prompt anchored to the tail of a partial/truncated assistant message (Stage F3).
+ */
+export function buildContinuationPrompt(partialAssistantText = '') {
+    const clean = String(partialAssistantText || '').trim();
+    if (!clean) {
+        return '请继续完成上一条未完成的回答。';
+    }
+    const tailSnippet = clean.slice(-140).replace(/\s+/g, ' ');
+    return `请紧接上一条未完成的回答末尾继续输出剩余内容（无需重复上文，上一条末尾为：「${tailSnippet}」）。`;
+}
+
+function extractReadableMessageBody(msg) {
+    if (!msg) return '';
+    if (typeof msg.displayText === 'string' && msg.displayText.trim()) {
+        return msg.displayText.trim();
+    }
+    if (typeof msg.text === 'string') {
+        return msg.text.trim();
+    }
+    if (typeof msg.content === 'string') {
+        return msg.content.trim();
+    }
+    if (Array.isArray(msg.content)) {
+        return msg.content
+            .filter(p => p && p.type === 'text')
+            .map(p => String(p.text || ''))
+            .join('\n')
+            .trim();
+    }
+    return '';
+}
+
+/**
+ * Exports a session's conversation messages as clean Markdown or JSON (Stage F3 & F4).
+ */
+export function exportSessionFormatted(messages = [], meta = {}, {
+    sessionId = '',
+    format = 'markdown',
+    exportedAtIso = new Date().toISOString(),
+} = {}) {
+    const validMsgs = (Array.isArray(messages) ? messages : [])
+        .filter(m => m && (m.role === 'user' || m.role === 'assistant'));
+
+    if (format === 'json') {
+        return JSON.stringify({
+            exportedAt: exportedAtIso,
+            sessionId: String(sessionId || ''),
+            backend: String(meta?.backend || ''),
+            messageCount: validMsgs.length,
+            messages: validMsgs.map(m => ({
+                id: m.id || '',
+                role: m.role,
+                text: extractReadableMessageBody(m),
+                createdAt: m.createdAt || '',
+                backend: m.backend || '',
+                modelId: m.modelId || '',
+                status: m.status || 'completed',
+                ...(m.partial ? {partial: true} : {}),
+                ...(m.finishReason ? {finishReason: m.finishReason} : {}),
+            })),
+        }, null, 2);
+    }
+
+    const lines = [
+        '# Quick Chat（随问）对话导出',
+        '',
+        `- 会话 ID：\`${sessionId || 'current'}\``,
+        `- 导出时间：${exportedAtIso}`,
+        `- 消息数量：${validMsgs.length}`,
+        '',
+        '---',
+        '',
+    ];
+
+    for (const m of validMsgs) {
+        const speaker = m.role === 'user'
+            ? '🙋 我'
+            : `✦ ${m.modelId || m.backend || '助手'}`;
+        const timeTag = m.createdAt ? ` (${m.createdAt})` : '';
+        const statusTag = m.partial
+            ? ' [未完成/已截断]'
+            : (m.finishReason === 'length' ? ' [达到长度上限]' : '');
+        lines.push(`### ${speaker}${timeTag}${statusTag}`);
+        lines.push('');
+        lines.push(extractReadableMessageBody(m) || '（无正文）');
+        lines.push('');
+    }
+    return lines.join('\n');
+}
+
+/**
+ * Lists valid stored session directories under `sessionsRootDir` sorted newest-first (Stage F4).
+ */
+export async function inspectSessionsWithIo(sessionsRootDir, io) {
+    if (!sessionsRootDir || !io || typeof io.listDir !== 'function') return [];
+    let entries = [];
+    try {
+        entries = await io.listDir(sessionsRootDir);
+    } catch (_) {
+        return [];
+    }
+
+    const sessions = [];
+    for (const entry of entries) {
+        const name = typeof entry === 'string' ? entry : String(entry?.name || '');
+        const isDir = typeof entry === 'object' ? Boolean(entry?.isDir) : true;
+        const isSymlink = typeof entry === 'object' ? Boolean(entry?.isSymlink) : false;
+        if (!name || !isDir || isSymlink) continue;
+
+        let paths = null;
+        try {
+            paths = resolveSafeSessionPaths(sessionsRootDir, name);
+        } catch (_) {
+            continue;
+        }
+
+        let updatedAt = 0;
+        let backend = '';
+        let messageCount = 0;
+        let previewTitle = '';
+
+        try {
+            if (await io.exists(paths.metaPath)) {
+                const metaRaw = await io.readText(paths.metaPath);
+                const metaObj = JSON.parse(metaRaw);
+                if (metaObj && typeof metaObj === 'object') {
+                    updatedAt = Number(metaObj.updatedAt || 0);
+                    backend = String(metaObj.backend || '');
+                }
+            }
+        } catch (_) {}
+
+        try {
+            if (await io.exists(paths.jsonlPath)) {
+                const rawLines = String(await io.readText(paths.jsonlPath) || '')
+                    .split(/\r?\n/)
+                    .filter(l => l.trim().length > 0);
+                messageCount = rawLines.length;
+                for (const line of rawLines) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj?.role === 'user') {
+                            const body = extractReadableMessageBody(obj).replace(/\s+/g, ' ');
+                            if (body) {
+                                previewTitle = body.length > 28 ? `${body.slice(0, 28)}…` : body;
+                                break;
+                            }
+                        }
+                    } catch (_) {}
+                }
+                if (!updatedAt && typeof io.statMtimeMs === 'function') {
+                    updatedAt = await io.statMtimeMs(paths.jsonlPath);
+                }
+            }
+        } catch (_) {}
+
+        if (messageCount > 0 || updatedAt > 0) {
+            sessions.push({
+                sessionId: paths.sessionId,
+                updatedAt: updatedAt || 0,
+                backend,
+                messageCount,
+                previewTitle: previewTitle || paths.sessionId.slice(0, 8),
+            });
+        }
+    }
+
+    sessions.sort((a, b) => (b.updatedAt - a.updatedAt) || b.sessionId.localeCompare(a.sessionId));
+    return sessions;
+}
+
+/**
+ * Resolves the single best previous session to restore (`恢复上一个会话`, Stage F4).
+ */
+export function resolvePreviousSessionId(sessions = [], {
+    currentSessionId = '',
+    preferredPreviousId = '',
+} = {}) {
+    const list = Array.isArray(sessions) ? sessions : [];
+    const cleanPreferred = String(preferredPreviousId || '').trim();
+    if (cleanPreferred && cleanPreferred !== currentSessionId) {
+        const hit = list.find(s => s.sessionId === cleanPreferred && s.messageCount > 0);
+        if (hit) return hit.sessionId;
+    }
+    const latestOther = list.find(s => s.sessionId !== currentSessionId && s.messageCount > 0);
+    return latestOther ? latestOther.sessionId : '';
+}
+
+/**
+ * Plans bounded retention cleanup for old sessions WITHOUT deleting anything automatically!
+ * Actual deletion requires explicit user confirmation (Stage F4).
+ */
+export function planSessionRetentionCleanup(sessions = [], {
+    currentSessionId = '',
+    previousSessionId = '',
+    maxCount = 20,
+    maxAgeDays = 30,
+    nowMs = Date.now(),
+} = {}) {
+    const safeMaxCount = Math.max(2, Number(maxCount) || 20);
+    const safeMaxAgeDays = Math.max(1, Number(maxAgeDays) || 30);
+    const cutoffMs = nowMs - safeMaxAgeDays * 24 * 60 * 60 * 1000;
+    const protectedSet = new Set([currentSessionId, previousSessionId].filter(Boolean));
+
+    const sorted = [...(Array.isArray(sessions) ? sessions : [])]
+        .sort((a, b) => (b.updatedAt - a.updatedAt) || b.sessionId.localeCompare(a.sessionId));
+
+    const keep = [];
+    const candidatesToDelete = [];
+    const unprotected = [];
+
+    for (const s of sorted) {
+        if (!s?.sessionId) continue;
+        if (protectedSet.has(s.sessionId)) {
+            keep.push(s);
+        } else {
+            unprotected.push(s);
+        }
+    }
+
+    const remainingSlots = Math.max(0, safeMaxCount - keep.length);
+    let unprotectedKept = 0;
+
+    for (const s of unprotected) {
+        const expiredByAge = s.updatedAt > 0 && s.updatedAt < cutoffMs;
+        const expiredByCount = unprotectedKept >= remainingSlots;
+        if (expiredByAge || expiredByCount) {
+            candidatesToDelete.push({
+                ...s,
+                reason: expiredByAge ? `超过 ${safeMaxAgeDays} 天` : `超出保留上限 ${safeMaxCount} 个`,
+            });
+        } else {
+            keep.push(s);
+            unprotectedKept++;
+        }
+    }
+
+    keep.sort((a, b) => (b.updatedAt - a.updatedAt) || b.sessionId.localeCompare(a.sessionId));
+
+    return {
+        keep,
+        candidatesToDelete,
+        policySummary: `最多保留最近 ${safeMaxCount} 个会话、${safeMaxAgeDays} 天内记录`,
+    };
+}
+
+/**
+ * Safely deletes a single validated session directory inside `sessionsRootDir` (Stage F4).
+ */
+export async function deleteSessionDirectoryWithIo(sessionsRootDir, sessionId, io, {
+    protectedIds = [],
+} = {}) {
+    let paths;
+    try {
+        paths = resolveSafeSessionPaths(sessionsRootDir, sessionId);
+    } catch (err) {
+        return {ok: false, error: err.message};
+    }
+    if (Array.isArray(protectedIds) && protectedIds.includes(paths.sessionId)) {
+        return {ok: false, error: '不能在保护模式下删除当前正在运行的会话'};
+    }
+
+    const coordKey = `${paths.rootDir}::${paths.sessionId}`;
+    const pending = sharedSessionWriteChains.get(coordKey);
+    if (pending) {
+        try { await pending; } catch (_) {}
+    }
+
+    const knownFiles = [
+        paths.jsonlPath,
+        `${paths.jsonlPath}.corrupt-backup`,
+        paths.metaPath,
+        paths.archivePath,
+        paths.corruptPath,
+        paths.legacyPath,
+    ];
+    for (const fp of knownFiles) {
+        await io.unlink?.(fp);
+    }
+    await io.rmdir?.(paths.dir);
+    return {ok: true, sessionId: paths.sessionId};
 }
 
 export async function importLegacyPiSessionWithIo({

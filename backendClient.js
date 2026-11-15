@@ -360,6 +360,7 @@ export class BackendClient {
                 sessionUnsavedWarning: this._store?.lastWriteError
                     ? `历史未保存：${this._store.lastWriteError.message}`
                     : '',
+                committedRevision: this._store?.revision || 0,
             };
         }
         if (type === 'get_models') {
@@ -377,6 +378,35 @@ export class BackendClient {
                 flushed: true,
                 hasUnsavedChanges: Boolean(this._store?.hasUnsavedChanges),
             };
+        }
+        if (type === 'rewind_from_user_turn') {
+            if (!this._store) {
+                return {ok: false, error: '当前会话尚未初始化'};
+            }
+            const rewound = this._store.rewindFromUserMessage(fields.userMessageId || '');
+            if (rewound.ok) {
+                // Rewinding conversation history revokes session-scoped approvals for safety
+                this.revokeApprovedScopes();
+                await rewound.writePromise;
+            }
+            return {
+                ok: rewound.ok,
+                error: rewound.error || '',
+                targetUserMessage: rewound.targetUserMessage,
+                removedCount: rewound.removedMessages?.length || 0,
+                remoteSessionReset: Boolean(rewound.remoteSessionReset),
+            };
+        }
+        if (type === 'export_session') {
+            const {exportSessionToPrivateFileAsync} = await import('./core/sessionStore.js');
+            return exportSessionToPrivateFileAsync(
+                this._store ? [...this._store.messages] : [],
+                this._store?.meta || {},
+                {
+                    sessionId: this._sessionId,
+                    format: fields.format === 'json' ? 'json' : 'markdown',
+                }
+            );
         }
         if (type === 'revoke_scopes') {
             this.revokeApprovedScopes();
@@ -396,6 +426,9 @@ export class BackendClient {
                 turnId: fields.turnId || '',
                 messageId: fields.messageId || '',
                 userMessageId: fields.userMessageId || `user_${GLib.uuid_string_random()}`,
+                ...(fields.displayUserText ? {displayUserText: String(fields.displayUserText)} : {}),
+                ...(fields.userCreatedAt ? {userCreatedAt: String(fields.userCreatedAt)} : {}),
+                ...(fields.userTs ? {userTs: Number(fields.userTs)} : {}),
                 clientGeneration: fields.clientGeneration ?? this._clientGeneration,
                 lifecycleGeneration: fields.lifecycleGeneration ?? 0,
             };

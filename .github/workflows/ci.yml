@@ -56,10 +56,22 @@ jobs:
           gjs -m -c "
             import {BackendRegistry, MemorySettingsStore} from './core/backendRegistry.js';
             import {detectBackendSelection} from './core/backendDetect.js';
+            import {matchSlashCommands} from './core/quickActions.js';
+            import {AttachmentManager} from './core/attachmentManager.js';
+            import {BackgroundNotificationGate} from './core/notificationPolicy.js';
+            import {recommendRouteLocally} from './core/modelRouter.js';
+            import {formatRedactedDiagnosticsText} from './core/diagnosticsReport.js';
             const s = new MemorySettingsStore({backend: 'openai', 'openai-base-url': 'https://api.example.com/v1'});
             const reg = new BackendRegistry(s);
             const sel = detectBackendSelection({configuredBackend: reg.getConfiguredBackend(), openaiBaseUrl: 'https://api.example.com/v1'});
             if (sel.effectiveBackend !== 'openai') throw new Error('Unexpected backend in GJS smoke check');
+            if (!matchSlashCommands('/explain').active) throw new Error('Slash command smoke check failed');
+            const att = new AttachmentManager();
+            if (!att.addTextSnippet('hello').ok) throw new Error('Attachment smoke check failed');
+            const gate = new BackgroundNotificationGate();
+            if (gate.evaluate({kind: 'turn_completed', isLocked: true}).shouldNotify) throw new Error('Lock gate failed');
+            if (!formatRedactedDiagnosticsText({effectiveBackend: 'openai'}).includes('openai')) throw new Error('Diagnostics failed');
+            void recommendRouteLocally;
           "
 
       - name: Run automated unit, security, streaming & lifecycle tests

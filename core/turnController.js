@@ -313,6 +313,7 @@ export class TurnController {
         const {
             status: explicitStatus = '',
             errorText = '',
+            finishReason = turn.finishReason || '',
             aborted = turn.aborted,
             timedOut = turn.timedOut,
             interrupted = turn.interrupted,
@@ -321,6 +322,10 @@ export class TurnController {
             onCleanupTempFiles = null,
         } = options;
 
+        const cleanFinishReason = typeof finishReason === 'string' ? finishReason.trim() : '';
+        if (cleanFinishReason) {
+            turn.finishReason = cleanFinishReason;
+        }
         turn.aborted = Boolean(aborted || explicitStatus === 'cancelled');
         turn.timedOut = Boolean(timedOut || explicitStatus === 'timed_out');
         turn.interrupted = Boolean(interrupted || explicitStatus === 'interrupted');
@@ -396,6 +401,7 @@ export class TurnController {
                 content: contentParts,
                 status: turn.state,
                 ...(isPartial ? {partial: true} : {}),
+                ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
                 ...(turn.error && !turn.aborted ? {errorMessage: turn.error} : {}),
             };
             try { onPersistAssistant?.(persistedMsg); } catch (_) {}
@@ -409,12 +415,14 @@ export class TurnController {
                     type: 'message_end',
                     status: turn.state,
                     partial: isPartial,
+                    ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
                     message: {
                         id: turn.messageId,
                         role: 'assistant',
                         content: contentParts,
                         status: turn.state,
                         ...(isPartial ? {partial: true} : {}),
+                        ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
                         ...(turn.error && !turn.aborted ? {errorMessage: turn.error} : {}),
                     },
                 });
@@ -449,6 +457,7 @@ export class TurnController {
             aborted: turn.state === 'cancelled',
             timedOut: turn.state === 'timed_out',
             interrupted: turn.state === 'interrupted',
+            ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
             errorMessage: turn.error || '',
         });
         return true;

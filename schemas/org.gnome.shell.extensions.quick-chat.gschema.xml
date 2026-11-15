@@ -168,5 +168,39 @@
       <default>'auto'</default>
       <summary>DateMenu integration mode (auto, datemenu, panel-button)</summary>
     </key>
+    <key name="quick-prompts-json" type="s">
+      <default>''</default>
+      <summary>User-customized quick prompt templates JSON array (empty uses defaults)</summary>
+    </key>
+    <key name="notify-on-approval" type="b">
+      <default>true</default>
+      <summary>Send desktop notification when background task awaits tool approval or answer</summary>
+    </key>
+    <key name="notify-on-error" type="b">
+      <default>true</default>
+      <summary>Send desktop notification when background task fails or times out</summary>
+    </key>
+    <key name="enable-model-routing" type="b">
+      <default>false</default>
+      <summary>Enable optional local rule-based backend and model recommendation</summary>
+    </key>
+    <key name="previous-session-id" type="s">
+      <default>''</default>
+      <summary>Most recent previous non-empty session ID for lightweight recovery</summary>
+    </key>
+    <key name="session-retention-max-count" type="i">
+      <range min="5" max="100"/>
+      <default>20</default>
+      <summary>Maximum historical sessions retained before prompting user cleanup</summary>
+    </key>
+    <key name="session-retention-max-days" type="i">
+      <range min="1" max="365"/>
+      <default>30</default>
+      <summary>Maximum age in days for historical sessions before prompting user cleanup</summary>
+    </key>
+    <key name="last-diagnostic-json" type="s">
+      <default>''</default>
+      <summary>Redacted runtime diagnostic snapshot without prompts or secrets</summary>
+    </key>
   </schema>
 </schemalist>

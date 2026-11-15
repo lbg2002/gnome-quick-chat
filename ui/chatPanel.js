@@ -3,6 +3,12 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {getBackendCapabilities} from '../protocol.js';
 import {
+    DEFAULT_QUICK_PROMPTS,
+    applyQuickActionToDraft,
+    matchSlashCommands,
+    parseQuickPromptsConfig,
+} from '../core/quickActions.js';
+import {
     DEFAULT_HISTORY_PAGE_SIZE,
     DEFAULT_INITIAL_HISTORY_COUNT,
     DEFAULT_MAX_MOUNTED_ACTORS,
@@ -10,15 +16,12 @@ import {
 } from '../core/renderScheduler.js';
 import {H, V, createStButton, createWrapLabel} from './tracePanel.js';
 
-export const DEFAULT_QUICK_PROMPTS = [
-    {label: '💡 解释命令或报错', prompt: '请帮我解释下面这段 Linux 命令或终端报错的含义，并给出解决建议：\n'},
-    {label: '⚡ Ubuntu 效率技巧', prompt: '请告诉我几个在 Ubuntu 26 / GNOME 50 下非常实用的高频快捷键或终端技巧。'},
-    {label: '📝 润色或翻译文本', prompt: '请帮我润色或翻译下面这段内容，使其表达更加自然准确：\n'},
-];
+export {DEFAULT_QUICK_PROMPTS};
 
 /**
  * Encapsulates Quick Chat's GNOME Shell St widget hierarchy, tab switching, status header,
- * windowed `HistoryWindowController` DOM recycling, and single-idle scroll coalescing (Stage E).
+ * lightweight session recovery menu, context attachment chips, `/` slash command bar,
+ * windowed `HistoryWindowController` DOM recycling, and single-idle scroll coalescing (Stages E & F).
  */
 export class ChatPanelView {
     constructor({
@@ -40,10 +43,24 @@ export class ChatPanelView {
         onReconnectNow,
         onOpenPreferences,
         onClipboardAsk,
+        onAttachFileButton,
+        onAttachPathSubmit,
+        onRemoveAttachment,
+        onToggleAttachmentPreview,
+        onToggleAttachmentFileMode,
         onNewSession,
+        onRefreshSessionMenuState,
+        onRestorePreviousSession,
+        onExportSession,
+        onDeleteCurrentSession,
+        onApproveRetentionCleanup,
+        onCancelEditQuestion,
+        onApplyRouteSuggestion,
+        onDismissRouteSuggestion,
         onSend,
         onAbort,
         onEntryKeyPress,
+        onEntryTextChanged,
         onDismissMigrationNotice,
     }) {
         this._cardFactory = cardFactory;
@@ -65,10 +82,24 @@ export class ChatPanelView {
         this._onReconnectNow = onReconnectNow;
         this._onOpenPreferences = onOpenPreferences;
         this._onClipboardAsk = onClipboardAsk;
+        this._onAttachFileButton = onAttachFileButton;
+        this._onAttachPathSubmit = onAttachPathSubmit;
+        this._onRemoveAttachment = onRemoveAttachment;
+        this._onToggleAttachmentPreview = onToggleAttachmentPreview;
+        this._onToggleAttachmentFileMode = onToggleAttachmentFileMode;
         this._onNewSession = onNewSession;
+        this._onRefreshSessionMenuState = onRefreshSessionMenuState;
+        this._onRestorePreviousSession = onRestorePreviousSession;
+        this._onExportSession = onExportSession;
+        this._onDeleteCurrentSession = onDeleteCurrentSession;
+        this._onApproveRetentionCleanup = onApproveRetentionCleanup;
+        this._onCancelEditQuestion = onCancelEditQuestion;
+        this._onApplyRouteSuggestion = onApplyRouteSuggestion;
+        this._onDismissRouteSuggestion = onDismissRouteSuggestion;
         this._onSend = onSend;
         this._onAbort = onAbort;
         this._onEntryKeyPress = onEntryKeyPress;
+        this._onEntryTextChanged = onEntryTextChanged;
         this._onDismissMigrationNotice = onDismissMigrationNotice;
 
         this.historyWindow = new HistoryWindowController({
@@ -92,13 +123,30 @@ export class ChatPanelView {
         this._sendButton = null;
         this._stopButton = null;
         this._newButton = null;
+        this._sessionMenuBtn = null;
+        this._sessionMenuBox = null;
+        this._sessionDeleteConfirming = false;
         this._jumpBottomBtn = null;
         this._loadMoreBtn = null;
         this._loadNewerBtn = null;
         this._empty = null;
 
+        this._editBanner = null;
+        this._editBannerLabel = null;
+        this._routeBanner = null;
+        this._routeBannerLabel = null;
+        this._currentRouteSuggestion = null;
+        this._fileAttachBar = null;
+        this._filePathEntry = null;
+        this._attachmentBar = null;
+        this._slashMenuBox = null;
+        this._slashMatches = [];
+        this._slashSelectedIndex = 0;
+        this._suppressEntryChange = false;
+
         this._vadjValueSig = 0;
         this._vadjUpperSig = 0;
+        this._entryTextChangedSig = 0;
         this._scrollIdleId = 0;
         this._scrollPendingAnimate = false;
         this._programmaticScroll = false;
@@ -112,6 +160,14 @@ export class ChatPanelView {
 
     get mountedCards() {
         return this.historyWindow?.mountedCards || [];
+    }
+
+    get isSessionMenuOpen() {
+        return Boolean(this._sessionMenuBox?.visible);
+    }
+
+    get isSlashMenuOpen() {
+        return Boolean(this._slashMenuBox?.visible && this._slashMatches.length > 0);
     }
 
     build({showNotificationTab = true} = {}) {
@@ -243,18 +299,37 @@ export class ChatPanelView {
         });
         statusBox.add_child(chevron);
         statusBtn.set_child(statusBox);
-        statusBtn.connect('clicked', () => this._modelPicker.toggle());
+        statusBtn.connect('clicked', () => {
+            if (this.isSessionMenuOpen) this.toggleSessionMenu(false);
+            this._modelPicker.toggle();
+        });
         header.add_child(statusBtn);
+
+        header.add_child(createStButton(
+            '📎',
+            () => this._onAttachFileButton?.(),
+            'qc-button-subtle',
+            '附加选中文件或本地路径引用'
+        ));
 
         header.add_child(createStButton(
             '📋',
             () => this._onClipboardAsk(false),
             'qc-button-subtle',
-            '读取剪贴板内容并提问'
+            '将剪贴板或选中日志作为独立附件引用（不覆盖草稿）'
         ));
 
         this._newButton = createStButton('＋ 新对话', () => this._onNewSession(), 'qc-button-subtle', '开启新对话');
         header.add_child(this._newButton);
+
+        this._sessionMenuBtn = createStButton(
+            '▾',
+            () => this.toggleSessionMenu(),
+            'qc-button-subtle',
+            '当前会话恢复、导出与清理菜单'
+        );
+        header.add_child(this._sessionMenuBtn);
+
         this.chatBox.add_child(header);
 
         const pickerBox = new St.BoxLayout({
@@ -265,6 +340,14 @@ export class ChatPanelView {
         });
         this.chatBox.add_child(pickerBox);
         this._modelPicker.attachActors(pickerBox, chevron);
+
+        this._sessionMenuBox = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-session-menu',
+            x_expand: true,
+            visible: false,
+        });
+        this.chatBox.add_child(this._sessionMenuBox);
 
         const scrollStack = new St.Widget({
             style_class: 'qc-scroll-stack',
@@ -324,6 +407,7 @@ export class ChatPanelView {
         }
 
         this.buildEmptyState();
+        this._buildContextAndSlashBars();
 
         const inputRow = new St.BoxLayout({
             orientation: H,
@@ -331,14 +415,26 @@ export class ChatPanelView {
             y_align: Clutter.ActorAlign.CENTER,
         });
         this.entry = new St.Entry({
-            hint_text: '输入问题（Enter 发送，↑↓ 历史，Esc 停止）…',
+            hint_text: '输入问题（/ 快捷命令，Enter 发送，↑↓ 历史，Esc 停止）…',
             can_focus: true,
             x_expand: true,
             style_class: 'qc-entry',
             track_hover: true,
         });
-        this.entry.clutter_text.connect('activate', () => this._onSend());
+        this.entry.clutter_text.connect('activate', () => {
+            if (this.isSlashMenuOpen) {
+                this.acceptSlashSelection();
+                return;
+            }
+            this._onSend();
+        });
         this.entry.clutter_text.connect('key-press-event', (_, event) => this._onEntryKeyPress(event));
+        this._entryTextChangedSig = this.entry.clutter_text.connect('text-changed', () => {
+            if (this._suppressEntryChange) return;
+            const current = this.entry?.get_text() || '';
+            this.refreshSlashMenuForText(current);
+            this._onEntryTextChanged?.(current);
+        });
         inputRow.add_child(this.entry);
 
         this._sendButton = createStButton('发送', () => this._onSend(), 'qc-send-btn', '发送问题');
@@ -347,6 +443,483 @@ export class ChatPanelView {
         inputRow.add_child(this._sendButton);
         inputRow.add_child(this._stopButton);
         this.chatBox.add_child(inputRow);
+    }
+
+    _buildContextAndSlashBars() {
+        // 1. Historical question edit banner (Stage F3)
+        this._editBanner = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-inline-banner',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        this._editBannerLabel = createWrapLabel(
+            '✎ 正在编辑历史问题（发送后将从该位置重新生成）',
+            'qc-mini-label'
+        );
+        this._editBanner.add_child(this._editBannerLabel);
+        this._editBanner.add_child(createStButton(
+            '取消',
+            () => this._onCancelEditQuestion?.(),
+            'qc-copy-btn',
+            '取消编辑历史问题'
+        ));
+        this.chatBox.add_child(this._editBanner);
+
+        // 2. Optional local smart model routing suggestion banner (Stage F6)
+        this._routeBanner = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-inline-banner',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        this._routeBannerLabel = createWrapLabel('', 'qc-mini-label');
+        this._routeBanner.add_child(this._routeBannerLabel);
+        this._routeBanner.add_child(createStButton(
+            '采用',
+            () => {
+                if (this._currentRouteSuggestion) {
+                    this._onApplyRouteSuggestion?.(this._currentRouteSuggestion);
+                }
+            },
+            'qc-copy-btn',
+            '采用本地推荐的后端与模型'
+        ));
+        this._routeBanner.add_child(createStButton(
+            '忽略',
+            () => {
+                if (this._currentRouteSuggestion) {
+                    this._onDismissRouteSuggestion?.(this._currentRouteSuggestion);
+                }
+            },
+            'qc-copy-btn',
+            '忽略本次推荐'
+        ));
+        this.chatBox.add_child(this._routeBanner);
+
+        // 3. Inline file path attachment bar (Stage F2)
+        this._fileAttachBar = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-inline-banner',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        this._filePathEntry = new St.Entry({
+            hint_text: '输入或粘贴本地文件路径（如 ~/notes.md）…',
+            can_focus: true,
+            x_expand: true,
+            style_class: 'qc-picker-search',
+        });
+        this._filePathEntry.clutter_text.connect('activate', () => {
+            const p = this._filePathEntry.get_text().trim();
+            if (p) this._onAttachPathSubmit?.(p, {preferPathOnly: false});
+        });
+        this._fileAttachBar.add_child(this._filePathEntry);
+        this._fileAttachBar.add_child(createStButton(
+            '引正文',
+            () => {
+                const p = this._filePathEntry?.get_text().trim() || '';
+                if (p) this._onAttachPathSubmit?.(p, {preferPathOnly: false});
+            },
+            'qc-copy-btn',
+            '读取 UTF-8 文本文件正文作为引用（≤128 KB）'
+        ));
+        this._fileAttachBar.add_child(createStButton(
+            '仅路径',
+            () => {
+                const p = this._filePathEntry?.get_text().trim() || '';
+                if (p) this._onAttachPathSubmit?.(p, {preferPathOnly: true});
+            },
+            'qc-copy-btn',
+            '仅附带文件路径标识，不上传文件内容'
+        ));
+        this._fileAttachBar.add_child(createStButton(
+            '✕',
+            () => this.toggleFileAttachBar(false),
+            'qc-copy-btn',
+            '关闭文件附加栏'
+        ));
+        this.chatBox.add_child(this._fileAttachBar);
+
+        // 4. Context attachments list & outbound scope notice (Stage F2)
+        this._attachmentBar = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-attachment-bar',
+            x_expand: true,
+            visible: false,
+        });
+        this.chatBox.add_child(this._attachmentBar);
+
+        // 5. Compact `/` slash command completion bar (Stage F1)
+        this._slashMenuBox = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-slash-menu',
+            x_expand: true,
+            visible: false,
+        });
+        this.chatBox.add_child(this._slashMenuBox);
+    }
+
+    setEntryTextProgrammatically(text, {focus = false, cursorAtEnd = true} = {}) {
+        if (!this.entry) return;
+        this._suppressEntryChange = true;
+        this.entry.set_text(String(text ?? ''));
+        this._suppressEntryChange = false;
+        this.closeSlashMenu();
+        if (focus) {
+            this.entry.grab_key_focus();
+        }
+        if (cursorAtEnd) {
+            this.entry.clutter_text.set_cursor_position(-1);
+        }
+        this._onEntryTextChanged?.(this.entry.get_text());
+    }
+
+    /**
+     * Fills `entry` with a quick prompt or `/` command WITHOUT auto-sending (Stage F1 invariant).
+     */
+    applyQuickPromptItem(item) {
+        if (!this.entry || !item) return;
+        const applied = applyQuickActionToDraft(item, this.entry.get_text());
+        this.setEntryTextProgrammatically(applied.text, {focus: true, cursorAtEnd: true});
+    }
+
+    refreshSlashMenuForText(rawText, {forceOpen = false} = {}) {
+        if (!this._slashMenuBox) return;
+        const customPrompts = parseQuickPromptsConfig(this._getSettingString('quick-prompts-json', ''));
+        const matched = matchSlashCommands(rawText, customPrompts, {forceOpen});
+        if (!matched.active || matched.matches.length === 0) {
+            this.closeSlashMenu();
+            return;
+        }
+        this._slashMatches = matched.matches;
+        if (this._slashSelectedIndex >= this._slashMatches.length) {
+            this._slashSelectedIndex = 0;
+        }
+        this._renderSlashMenuItems();
+    }
+
+    _renderSlashMenuItems() {
+        if (!this._slashMenuBox) return;
+        this._slashMenuBox.destroy_all_children();
+        if (!this._slashMatches.length) {
+            this._slashMenuBox.visible = false;
+            return;
+        }
+
+        const hint = createWrapLabel(
+            '快捷命令（↑↓ 选择，Tab / Enter 仅填入输入框，Esc 关闭）',
+            'qc-mini-label'
+        );
+        this._slashMenuBox.add_child(hint);
+
+        this._slashMatches.forEach((cmd, idx) => {
+            const cls = idx === this._slashSelectedIndex
+                ? 'qc-slash-item qc-slash-item-active'
+                : 'qc-slash-item';
+            const btn = createStButton(
+                `${cmd.label} — ${cmd.description}`,
+                () => {
+                    this._slashSelectedIndex = idx;
+                    this.acceptSlashSelection();
+                },
+                cls,
+                cmd.label
+            );
+            btn.x_align = Clutter.ActorAlign.FILL;
+            btn.x_expand = true;
+            this._slashMenuBox.add_child(btn);
+        });
+        this._slashMenuBox.visible = true;
+    }
+
+    moveSlashSelection(delta) {
+        if (!this.isSlashMenuOpen) return false;
+        const len = this._slashMatches.length;
+        this._slashSelectedIndex = (this._slashSelectedIndex + delta + len) % len;
+        this._renderSlashMenuItems();
+        return true;
+    }
+
+    acceptSlashSelection() {
+        if (!this.isSlashMenuOpen) return false;
+        const chosen = this._slashMatches[this._slashSelectedIndex] || this._slashMatches[0];
+        this.closeSlashMenu();
+        if (chosen) {
+            this.applyQuickPromptItem(chosen);
+            return true;
+        }
+        return false;
+    }
+
+    closeSlashMenu() {
+        this._slashMatches = [];
+        this._slashSelectedIndex = 0;
+        if (this._slashMenuBox) {
+            this._slashMenuBox.visible = false;
+            this._slashMenuBox.destroy_all_children();
+        }
+    }
+
+    toggleFileAttachBar(forceState = null) {
+        if (!this._fileAttachBar) return;
+        const next = forceState !== null ? Boolean(forceState) : !this._fileAttachBar.visible;
+        this._fileAttachBar.visible = next;
+        if (next) {
+            this._filePathEntry?.set_text('');
+            this._filePathEntry?.grab_key_focus();
+        } else {
+            this.entry?.grab_key_focus();
+        }
+    }
+
+    setEditQuestionBanner(active, previewQuestion = '') {
+        if (!this._editBanner || !this._editBannerLabel) return;
+        if (!active) {
+            this._editBanner.visible = false;
+            return;
+        }
+        const shortQ = String(previewQuestion || '').replace(/\s+/g, ' ').trim().slice(0, 26);
+        this._editBannerLabel.text = shortQ
+            ? `✎ 编辑历史问题「${shortQ}${previewQuestion.length > 26 ? '…' : ''}」（发送后从此处重新生成）`
+            : '✎ 正在编辑历史问题（发送后将从该位置重新生成）';
+        this._editBanner.visible = true;
+    }
+
+    setRouteSuggestion(suggestion = null) {
+        this._currentRouteSuggestion = suggestion;
+        if (!this._routeBanner || !this._routeBannerLabel) return;
+        if (!suggestion) {
+            this._routeBanner.visible = false;
+            return;
+        }
+        this._routeBannerLabel.text = `💡 ${suggestion.reasonLabel}（推荐：${suggestion.summaryLabel}）`;
+        this._routeBanner.visible = true;
+    }
+
+    renderAttachments(items = [], scopeNotice = '') {
+        if (!this._attachmentBar) return;
+        this._attachmentBar.destroy_all_children();
+
+        if (!Array.isArray(items) || items.length === 0) {
+            this._attachmentBar.visible = false;
+            if (this.entry) {
+                this.entry.hint_text = '输入问题（/ 快捷命令，Enter 发送，↑↓ 历史，Esc 停止）…';
+            }
+            return;
+        }
+
+        for (const item of items) {
+            const itemBox = new St.BoxLayout({
+                orientation: V,
+                x_expand: true,
+            });
+            const row = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-attachment-row',
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: true,
+            });
+            const titleLabel = createWrapLabel(
+                `📎 ${item.sourceLabel} · ${item.title} (${item.sizeLabel})`,
+                'qc-attachment-title'
+            );
+            row.add_child(titleLabel);
+
+            if (item.canToggleContent) {
+                const modeLabel = item.kind === 'file_content' ? '改为仅路径' : '附带正文';
+                row.add_child(createStButton(
+                    modeLabel,
+                    () => this._onToggleAttachmentFileMode?.(item.id),
+                    'qc-copy-btn',
+                    '切换发送文件正文或仅发送路径'
+                ));
+            }
+
+            row.add_child(createStButton(
+                item.previewExpanded ? '收起' : '预览',
+                () => this._onToggleAttachmentPreview?.(item.id),
+                'qc-copy-btn',
+                '预览将随本次提问发送的引用内容'
+            ));
+
+            row.add_child(createStButton(
+                '✕',
+                () => this._onRemoveAttachment?.(item.id),
+                'qc-copy-btn',
+                '移除此附件引用'
+            ));
+            itemBox.add_child(row);
+
+            if (item.previewExpanded) {
+                itemBox.add_child(createWrapLabel(item.previewText || '', 'qc-attachment-preview'));
+            }
+            this._attachmentBar.add_child(itemBox);
+        }
+
+        if (scopeNotice) {
+            this._attachmentBar.add_child(createWrapLabel(scopeNotice, 'qc-scope-notice'));
+        }
+        this._attachmentBar.visible = true;
+        if (this.entry) {
+            this.entry.hint_text = `已附带 ${items.length} 个上下文引用，输入问题后按 Enter 发送…`;
+        }
+    }
+
+    toggleSessionMenu(forceState = null) {
+        if (!this._sessionMenuBox) return;
+        const next = forceState !== null ? Boolean(forceState) : !this._sessionMenuBox.visible;
+        this._sessionDeleteConfirming = false;
+        if (next) {
+            if (this._modelPicker?.isOpen) {
+                this._modelPicker.toggle(false);
+            }
+            this._sessionMenuBox.visible = true;
+            this._onRefreshSessionMenuState?.();
+        } else {
+            this._sessionMenuBox.visible = false;
+            this._sessionMenuBox.destroy_all_children();
+        }
+    }
+
+    /**
+     * Renders the compact 5-action session recovery bar (Stage F4):
+     * Current Session Info / New / Restore Previous / Export / Delete (+ explicit consent retention cleanup).
+     */
+    renderSessionMenuState({
+        currentSessionId = '',
+        messageCount = 0,
+        previousSessionId = '',
+        previousPreview = '',
+        cleanupPlan = null,
+        saveWarning = '',
+    } = {}) {
+        if (!this._sessionMenuBox || !this._sessionMenuBox.visible) return;
+        this._sessionMenuBox.destroy_all_children();
+
+        const shortCur = String(currentSessionId || '').slice(0, 8) || '未分配';
+        const saveTag = saveWarning ? ` · ⚠️ ${saveWarning}` : ' · 已本地保存';
+        this._sessionMenuBox.add_child(createWrapLabel(
+            `当前会话：${shortCur}（${messageCount} 条消息${saveTag}）`,
+            'qc-mini-label'
+        ));
+
+        const actionsRow = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-session-actions',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+
+        actionsRow.add_child(createStButton(
+            '＋ 新建',
+            () => {
+                this.toggleSessionMenu(false);
+                this._onNewSession?.();
+            },
+            'qc-copy-btn',
+            '新建空白会话'
+        ));
+
+        const prevBtn = createStButton(
+            previousSessionId
+                ? `↺ 恢复上一会话${previousPreview ? ` (${previousPreview.slice(0, 8)})` : ''}`
+                : '↺ 暂无上一会话',
+            () => {
+                if (!previousSessionId) return;
+                this.toggleSessionMenu(false);
+                this._onRestorePreviousSession?.(previousSessionId);
+            },
+            'qc-copy-btn',
+            '恢复最近一个非空会话'
+        );
+        prevBtn.reactive = Boolean(previousSessionId && !this._isBusy?.());
+        actionsRow.add_child(prevBtn);
+
+        const exportBtn = createStButton(
+            '⇩ 导出对话',
+            () => {
+                this.toggleSessionMenu(false);
+                this._onExportSession?.();
+            },
+            'qc-copy-btn',
+            '导出当前对话为 Markdown 并复制到剪贴板'
+        );
+        exportBtn.reactive = messageCount > 0;
+        actionsRow.add_child(exportBtn);
+
+        if (!this._sessionDeleteConfirming) {
+            const delBtn = createStButton(
+                '🗑 删除',
+                () => {
+                    this._sessionDeleteConfirming = true;
+                    this.renderSessionMenuState({
+                        currentSessionId,
+                        messageCount,
+                        previousSessionId,
+                        previousPreview,
+                        cleanupPlan,
+                        saveWarning,
+                    });
+                },
+                'qc-copy-btn',
+                '删除当前会话本地历史文件'
+            );
+            delBtn.reactive = !this._isBusy?.();
+            actionsRow.add_child(delBtn);
+        } else {
+            actionsRow.add_child(createStButton(
+                '确认删除当前会话？',
+                () => {
+                    this._sessionDeleteConfirming = false;
+                    this.toggleSessionMenu(false);
+                    this._onDeleteCurrentSession?.();
+                },
+                'qc-copy-btn qc-danger-btn',
+                '确认永久删除当前会话磁盘记录'
+            ));
+            actionsRow.add_child(createStButton(
+                '取消',
+                () => {
+                    this._sessionDeleteConfirming = false;
+                    this.renderSessionMenuState({
+                        currentSessionId,
+                        messageCount,
+                        previousSessionId,
+                        previousPreview,
+                        cleanupPlan,
+                        saveWarning,
+                    });
+                },
+                'qc-copy-btn',
+                '取消删除'
+            ));
+        }
+
+        this._sessionMenuBox.add_child(actionsRow);
+
+        const expiredCount = cleanupPlan?.candidatesToDelete?.length || 0;
+        if (expiredCount > 0) {
+            const cleanupRow = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-session-actions',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            cleanupRow.add_child(createWrapLabel(
+                `发现 ${expiredCount} 个超出保留策略（${cleanupPlan.policySummary}）的旧会话`,
+                'qc-mini-label'
+            ));
+            cleanupRow.add_child(createStButton(
+                `同意清理 (${expiredCount})`,
+                () => {
+                    const ids = cleanupPlan.candidatesToDelete.map(c => c.sessionId);
+                    this.toggleSessionMenu(false);
+                    this._onApproveRetentionCleanup?.(ids);
+                },
+                'qc-copy-btn qc-danger-btn',
+                '经您明确同意后清理超出保留范围的旧会话'
+            ));
+            this._sessionMenuBox.add_child(cleanupRow);
+        }
     }
 
     setNotificationTabAvailable(available) {
@@ -426,16 +999,12 @@ export class ChatPanelView {
             setupChip.x_align = Clutter.ActorAlign.START;
             chips.add_child(setupChip);
         }
-        for (const item of DEFAULT_QUICK_PROMPTS) {
+
+        const quickPrompts = parseQuickPromptsConfig(this._getSettingString('quick-prompts-json', ''));
+        for (const item of quickPrompts) {
             const chip = createStButton(item.label, () => {
-                if (item.prompt.endsWith('\n')) {
-                    this.entry.set_text(item.prompt);
-                    this.entry.grab_key_focus();
-                    this.entry.clutter_text.set_cursor_position(-1);
-                } else {
-                    this.entry.set_text(item.prompt);
-                    this._onSend();
-                }
+                // Stage F1 hard rule: quick actions fill input draft ONLY and NEVER auto-send!
+                this.applyQuickPromptItem(item);
             }, 'qc-chip', item.label);
             chip.x_align = Clutter.ActorAlign.START;
             chips.add_child(chip);
@@ -525,6 +1094,10 @@ export class ChatPanelView {
         if (this._sendButton) this._sendButton.visible = !busy;
         if (this._stopButton) this._stopButton.visible = busy;
         if (this._newButton) this._newButton.reactive = !busy;
+        if (this._sessionMenuBtn) this._sessionMenuBtn.reactive = !busy;
+        if (busy && this.isSessionMenuOpen) {
+            this.toggleSessionMenu(false);
+        }
     }
 
     setStatusIndicator(state, text) {
@@ -652,6 +1225,7 @@ export class ChatPanelView {
             insertIndex = -1,
             scrollOnAdd = true,
             trackInHistoryWindow = true,
+            rawPromptText = '',
         } = options;
         this._empty?.hide();
 
@@ -672,13 +1246,16 @@ export class ChatPanelView {
                 turnId: card.turnId,
                 replyTo: card.replyTo,
                 role,
-                text: card.text,
+                text: rawPromptText || card.text,
+                ...(rawPromptText && rawPromptText !== card.text ? {displayText: card.text} : {}),
                 thinking: card.thinking,
                 createdAt: card.createdAt,
                 ts: card.effectiveTs,
                 backend: card.backend,
                 modelId: card.modelId,
-                status: 'completed',
+                status: card.status || 'completed',
+                ...(card.partial ? {partial: true} : {}),
+                ...(card.finishReason ? {finishReason: card.finishReason} : {}),
             };
             const {evictedTopCards} = this.historyWindow.appendRuntimeCard(storedRecord, card, {
                 allowRecycleTop: !this.userScrolledUp,
@@ -709,6 +1286,31 @@ export class ChatPanelView {
         return card;
     }
 
+    /**
+     * Truncates mounted cards and `HistoryWindowController` in place for Regenerate (`keepUserCard: true`)
+     * or Edit Question (`keepUserCard: false`), never appending duplicate user cards!
+     */
+    truncateMessagesFromId(startMessageId, {keepStartMessage = false} = {}) {
+        if (!this.historyWindow) return false;
+        const {removedCards, truncated, needsRemountWindow} = this.historyWindow.truncateFromMessageId(
+            startMessageId,
+            {keepStartMessage}
+        );
+        if (!truncated) return false;
+        for (const c of removedCards) {
+            this._cardFactory.destroyCardActor(c);
+        }
+        if (needsRemountWindow) {
+            this.restoreLatestHistoryWindow();
+        } else {
+            this.syncHistoryWindowButtons();
+            if (this.historyWindow.allMessages.length === 0) {
+                this.buildEmptyState();
+            }
+        }
+        return true;
+    }
+
     renderInitialHistory(allDetailed, onUserPromptSeen) {
         this.clearMessages();
         const normalized = Array.isArray(allDetailed) ? allDetailed : [];
@@ -720,7 +1322,8 @@ export class ChatPanelView {
         const {initialSlice} = this.historyWindow.reset(normalized);
         if (!initialSlice.length) return;
 
-        const mounted = initialSlice.map(msg => this.addMessage(msg.role, msg.text, {
+        const mounted = initialSlice.map(msg => this.addMessage(msg.role, msg.displayText || msg.text, {
+            rawPromptText: msg.text,
             animate: false,
             thinking: msg.thinking || '',
             scrollOnAdd: false,
@@ -732,6 +1335,9 @@ export class ChatPanelView {
             ts: msg.ts || 0,
             modelId: msg.modelId || '',
             backend: msg.backend || '',
+            status: msg.status || 'completed',
+            partial: Boolean(msg.partial),
+            finishReason: msg.finishReason || '',
             errorMessage: msg.errorMessage || '',
         }));
         this.historyWindow.registerMountedInitialCards(mounted);
@@ -804,7 +1410,8 @@ export class ChatPanelView {
         if (!slice.length) return;
 
         const baseInsertIdx = this._loadMoreBtn ? 1 : 0;
-        const prependedCards = slice.map((msg, offset) => this.addMessage(msg.role, msg.text, {
+        const prependedCards = slice.map((msg, offset) => this.addMessage(msg.role, msg.displayText || msg.text, {
+            rawPromptText: msg.text,
             animate: false,
             thinking: msg.thinking || '',
             insertIndex: baseInsertIdx + offset,
@@ -817,6 +1424,9 @@ export class ChatPanelView {
             ts: msg.ts || 0,
             modelId: msg.modelId || '',
             backend: msg.backend || '',
+            status: msg.status || 'completed',
+            partial: Boolean(msg.partial),
+            finishReason: msg.finishReason || '',
             errorMessage: msg.errorMessage || '',
         }));
 
@@ -874,7 +1484,8 @@ export class ChatPanelView {
 
         if (!liveCard) {
             const {initialSlice} = this.historyWindow.reset(all);
-            const mounted = initialSlice.map(msg => this.addMessage(msg.role, msg.text, {
+            const mounted = initialSlice.map(msg => this.addMessage(msg.role, msg.displayText || msg.text, {
+                rawPromptText: msg.text,
                 animate: false,
                 thinking: msg.thinking || '',
                 scrollOnAdd: false,
@@ -886,6 +1497,9 @@ export class ChatPanelView {
                 ts: msg.ts || 0,
                 modelId: msg.modelId || '',
                 backend: msg.backend || '',
+                status: msg.status || 'completed',
+                partial: Boolean(msg.partial),
+                finishReason: msg.finishReason || '',
                 errorMessage: msg.errorMessage || '',
             }));
             this.historyWindow.registerMountedInitialCards(mounted);
@@ -895,7 +1509,8 @@ export class ChatPanelView {
                 : -1;
             const beforeLive = liveMsgIdx >= 0 ? all.slice(0, liveMsgIdx) : all;
             const startIdx = Math.max(0, beforeLive.length - (DEFAULT_INITIAL_HISTORY_COUNT - 1));
-            const mountedBefore = beforeLive.slice(startIdx).map(msg => this.addMessage(msg.role, msg.text, {
+            const mountedBefore = beforeLive.slice(startIdx).map(msg => this.addMessage(msg.role, msg.displayText || msg.text, {
+                rawPromptText: msg.text,
                 animate: false,
                 thinking: msg.thinking || '',
                 scrollOnAdd: false,
@@ -907,6 +1522,9 @@ export class ChatPanelView {
                 ts: msg.ts || 0,
                 modelId: msg.modelId || '',
                 backend: msg.backend || '',
+                status: msg.status || 'completed',
+                partial: Boolean(msg.partial),
+                finishReason: msg.finishReason || '',
                 errorMessage: msg.errorMessage || '',
             }));
             if (liveBox) this.messagesBox.add_child(liveBox);
@@ -946,6 +1564,10 @@ export class ChatPanelView {
             this._clearTimer(this._scrollIdleId);
             this._scrollIdleId = 0;
         }
+        if (this._entryTextChangedSig && this.entry?.clutter_text) {
+            try { this.entry.clutter_text.disconnect(this._entryTextChangedSig); } catch (_) {}
+            this._entryTextChangedSig = 0;
+        }
         const vadj = this.scroll?.vadjustment;
         if (vadj) {
             if (this._vadjValueSig) {
@@ -970,7 +1592,10 @@ export class ChatPanelView {
         this.wrapper = this.chatBox = this.entry = this.scroll = this.messagesBox = null;
         this._aiTab = this._notificationTab = this._aiBadge = this._notifBadge = null;
         this._reconnectButton = this._status = this._statusDot = null;
-        this._sendButton = this._stopButton = this._newButton = this._jumpBottomBtn = null;
-        this._loadMoreBtn = this._loadNewerBtn = this._empty = null;
+        this._sendButton = this._stopButton = this._newButton = this._sessionMenuBtn = null;
+        this._sessionMenuBox = this._editBanner = this._editBannerLabel = null;
+        this._routeBanner = this._routeBannerLabel = this._currentRouteSuggestion = null;
+        this._fileAttachBar = this._filePathEntry = this._attachmentBar = this._slashMenuBox = null;
+        this._jumpBottomBtn = this._loadMoreBtn = this._loadNewerBtn = this._empty = null;
     }
 }

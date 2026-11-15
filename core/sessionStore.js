@@ -1,6 +1,6 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {getSessionsDir} from './paths.js';
+import {getDataDir, getSessionsDir} from './paths.js';
 import {
     buildBudgetedContextMessages,
     buildCrossBackendPromptWithContext,
@@ -10,16 +10,26 @@ import {buildModelSignature} from '../protocol.js';
 import {
     DEFAULT_HOT_MESSAGE_LIMIT,
     SessionStoreEngine,
+    buildContinuationPrompt,
+    deleteSessionDirectoryWithIo,
+    exportSessionFormatted,
     importLegacyPiSessionWithIo,
+    inspectSessionsWithIo,
+    planSessionRetentionCleanup,
+    resolvePreviousSessionId,
     resolveSafeSessionPaths,
     validateSessionId,
 } from './sessionEngine.js';
 
 export {
     buildBudgetedContextMessages,
+    buildContinuationPrompt,
     buildCrossBackendPromptWithContext,
     buildModelSignature,
     buildRuntimeContextSignature,
+    exportSessionFormatted,
+    planSessionRetentionCleanup,
+    resolvePreviousSessionId,
     resolveSafeSessionPaths,
     validateSessionId,
 };
@@ -151,6 +161,55 @@ function appendLineAsync(filePath, lineStr) {
     });
 }
 
+function listDirectoryAsync(dirPath) {
+    if (!dirPath || !GLib.file_test(dirPath, GLib.FileTest.IS_DIR)) {
+        return Promise.resolve([]);
+    }
+    const gdir = Gio.File.new_for_path(dirPath);
+    return new Promise(resolve => {
+        gdir.enumerate_children_async(
+            'standard::name,standard::type,standard::is-symlink',
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+            GLib.PRIORITY_DEFAULT,
+            null,
+            (src, res) => {
+                let enumerator = null;
+                try {
+                    enumerator = src.enumerate_children_finish(res);
+                } catch (_) {
+                    resolve([]);
+                    return;
+                }
+                const entries = [];
+                const nextBatch = () => {
+                    enumerator.next_files_async(32, GLib.PRIORITY_DEFAULT, null, (en, nRes) => {
+                        let infos = [];
+                        try {
+                            infos = en.next_files_finish(nRes) || [];
+                        } catch (_) {
+                            infos = [];
+                        }
+                        if (!infos.length) {
+                            try { en.close_async(GLib.PRIORITY_DEFAULT, null, () => {}); } catch (_) {}
+                            resolve(entries);
+                            return;
+                        }
+                        for (const info of infos) {
+                            entries.push({
+                                name: info.get_name(),
+                                isDir: info.get_file_type() === Gio.FileType.DIRECTORY,
+                                isSymlink: Boolean(info.get_is_symlink?.()),
+                            });
+                        }
+                        nextBatch();
+                    });
+                };
+                nextBatch();
+            }
+        );
+    });
+}
+
 function createGioSessionIo() {
     return {
         exists(filePath) {
@@ -165,14 +224,94 @@ function createGioSessionIo() {
         appendLine(filePath, lineStr) {
             return appendLineAsync(filePath, lineStr);
         },
+        listDir(dirPath) {
+            return listDirectoryAsync(dirPath);
+        },
+        statMtimeMs(filePath) {
+            return new Promise(resolve => {
+                if (!filePath) {
+                    resolve(0);
+                    return;
+                }
+                Gio.File.new_for_path(filePath).query_info_async(
+                    'time::modified',
+                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                    GLib.PRIORITY_DEFAULT,
+                    null,
+                    (f, res) => {
+                        try {
+                            const info = f.query_info_finish(res);
+                            const dt = info?.get_modification_date_time?.();
+                            resolve(dt ? dt.to_unix() * 1000 : 0);
+                        } catch (_) {
+                            resolve(0);
+                        }
+                    }
+                );
+            });
+        },
         unlink(filePath) {
             try {
-                if (filePath && GLib.file_test(filePath, GLib.FileTest.EXISTS)) {
+                if (filePath && GLib.file_test(filePath, GLib.FileTest.EXISTS) && !GLib.file_test(filePath, GLib.FileTest.IS_DIR)) {
                     GLib.unlink(filePath);
                 }
             } catch (_) {}
             return Promise.resolve();
         },
+        rmdir(dirPath) {
+            try {
+                if (dirPath && GLib.file_test(dirPath, GLib.FileTest.IS_DIR) && !GLib.file_test(dirPath, GLib.FileTest.IS_SYMLINK)) {
+                    GLib.rmdir(dirPath);
+                }
+            } catch (_) {}
+            return Promise.resolve();
+        },
+    };
+}
+
+export async function listStoredSessionsAsync(sessionsRootDir = '') {
+    return inspectSessionsWithIo(sessionsRootDir || getSessionsDir(), createGioSessionIo());
+}
+
+export async function deleteStoredSessionAsync(sessionId, {sessionsRootDir = '', protectedIds = []} = {}) {
+    return deleteSessionDirectoryWithIo(
+        sessionsRootDir || getSessionsDir(),
+        sessionId,
+        createGioSessionIo(),
+        {protectedIds}
+    );
+}
+
+export async function executeApprovedSessionCleanupAsync(candidateSessionIds = [], {
+    sessionsRootDir = '',
+    protectedIds = [],
+} = {}) {
+    const io = createGioSessionIo();
+    const root = sessionsRootDir || getSessionsDir();
+    let deletedCount = 0;
+    const errors = [];
+    for (const sid of Array.isArray(candidateSessionIds) ? candidateSessionIds : []) {
+        const res = await deleteSessionDirectoryWithIo(root, sid, io, {protectedIds});
+        if (res.ok) deletedCount++;
+        else if (res.error) errors.push(res.error);
+    }
+    return {deletedCount, errors};
+}
+
+export async function exportSessionToPrivateFileAsync(messages, meta = {}, {
+    sessionId = '',
+    format = 'markdown',
+} = {}) {
+    const formatted = exportSessionFormatted(messages, meta, {sessionId, format});
+    const exportsDir = GLib.build_filenamev([getDataDir(), 'exports']);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const shortId = String(sessionId || 'session').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 8) || 'session';
+    const ext = format === 'json' ? 'json' : 'md';
+    const filePath = GLib.build_filenamev([exportsDir, `quick-chat-${stamp}-${shortId}.${ext}`]);
+    await replaceFileAsync(filePath, formatted);
+    return {
+        filePath,
+        content: formatted,
     };
 }
 
@@ -208,7 +347,7 @@ export async function importLegacyPiSessionFileReadOnly(sourceFilePath, targetSe
 }
 
 /**
- * Gio-backed SessionStore wrapping pure-JS `SessionStoreEngine` (Stage C1/C2).
+ * Gio-backed SessionStore wrapping pure-JS `SessionStoreEngine` (Stage C1/C2/F3/F4).
  */
 export class SessionStore extends SessionStoreEngine {
     constructor(sessionId, options = {}) {

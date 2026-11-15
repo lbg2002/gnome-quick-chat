@@ -200,6 +200,9 @@ export class OpenAIAdapter extends BaseBackendAdapter {
                 turnId: turn.id,
                 role: 'user',
                 content: budgetCheck.promptText,
+                ...(turnMeta.displayUserText ? {displayText: turnMeta.displayUserText} : {}),
+                ...(turnMeta.userCreatedAt ? {createdAt: turnMeta.userCreatedAt} : {}),
+                ...(turnMeta.userTs ? {ts: turnMeta.userTs} : {}),
             },
             'openai',
             ctxCfg
@@ -305,7 +308,7 @@ export class OpenAIAdapter extends BaseBackendAdapter {
             apiKey: this._runtime.apiKey,
         });
 
-        const settleOpenAI = ({status = '', interrupted = false, errorText = ''} = {}) => {
+        const settleOpenAI = ({status = '', interrupted = false, errorText = '', finishReason = ''} = {}) => {
             closeOpenAIStream();
             if (!this._turns.isCurrent(turn)) return;
 
@@ -334,6 +337,7 @@ export class OpenAIAdapter extends BaseBackendAdapter {
             this._turns.finalizeTurn(turn, {
                 status: finalStatus,
                 interrupted: finalInterrupted,
+                finishReason: finishReason || sseParser.finishReason || turn.finishReason || '',
                 errorText: cleanError,
                 onPersistAssistant: m => this._store?.appendMessage(m, 'openai', persistCfg),
             });
@@ -348,11 +352,13 @@ export class OpenAIAdapter extends BaseBackendAdapter {
                 }
                 if (evt.type === 'done') {
                     turn.sawDoneMarker = true;
-                    settleOpenAI({status: 'completed'});
+                    if (evt.finishReason) turn.finishReason = evt.finishReason;
+                    settleOpenAI({status: 'completed', finishReason: evt.finishReason || sseParser.finishReason || ''});
                     return false;
                 }
                 if (evt.type === 'delta') {
                     if (evt.model && !turn.modelId) turn.modelId = evt.model;
+                    if (evt.finishReason) turn.finishReason = evt.finishReason;
                     if (evt.thinkingDelta) this._turns.appendThinking(turn, evt.thinkingDelta);
                     if (evt.textDelta) this._turns.appendText(turn, evt.textDelta);
                 }

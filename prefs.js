@@ -1,4 +1,5 @@
 import Adw from 'gi://Adw';
+import Gdk from 'gi://Gdk';
 import Gtk from 'gi://Gtk';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -28,9 +29,27 @@ import {
     storeOpenAIApiKey,
 } from './core/secretStore.js';
 import {
+    executeApprovedSessionCleanupAsync,
     importLegacyPiSessionFileReadOnly,
     listLegacyPiSessionFiles,
+    listStoredSessionsAsync,
 } from './core/sessionStore.js';
+import {
+    planSessionRetentionCleanup,
+    resolvePreviousSessionId,
+} from './core/sessionEngine.js';
+import {
+    DEFAULT_QUICK_PROMPTS,
+    MAX_CUSTOM_QUICK_PROMPTS,
+    parseQuickPromptsConfig,
+    serializeQuickPromptsConfig,
+} from './core/quickActions.js';
+import {
+    formatCapabilitiesLine,
+    formatRedactedDiagnosticsText,
+    parseStoredDiagnosticSnapshot,
+    sanitizeDiagnosticSnapshot,
+} from './core/diagnosticsReport.js';
 import {
     parseModelsResponse,
     redactSensitiveText,
@@ -312,8 +331,19 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             });
         });
 
+        const prefsSignalIds = [];
+        let diagCopyResetTimer = 0;
+
         window.connect('close-request', () => {
             try { activeModelsCancellable?.cancel?.(); } catch (_) {}
+            if (diagCopyResetTimer) {
+                try { GLib.source_remove(diagCopyResetTimer); } catch (_) {}
+                diagCopyResetTimer = 0;
+            }
+            while (prefsSignalIds.length > 0) {
+                const sid = prefsSignalIds.pop();
+                try { s.disconnect(sid); } catch (_) {}
+            }
             if (closingAfterFlush) {
                 return false;
             }
@@ -479,12 +509,161 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         }));
         shortcutGroup.add(clipShortcutRow);
 
+        const notifyApprovalRow = new Adw.SwitchRow({
+            title: '等待审批或提问时弹出桌面通知',
+            subtitle: '后台 Agent 需要安全审批或补充信息时提醒处理，点击直接返回任务（锁屏不暴露正文）',
+        });
+        if (hasKey('notify-on-approval')) {
+            s.bind('notify-on-approval', notifyApprovalRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+            shortcutGroup.add(notifyApprovalRow);
+        }
+
+        const notifyErrorRow = new Adw.SwitchRow({
+            title: '后台任务失败或超时弹出桌面通知',
+            subtitle: '收起面板期间若任务失败、中断或超时，发送脱敏状态提醒',
+        });
+        if (hasKey('notify-on-error')) {
+            s.bind('notify-on-error', notifyErrorRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+            shortcutGroup.add(notifyErrorRow);
+        }
+
         const notifyCompleteRow = new Adw.SwitchRow({
             title: '后台生成完成时弹出桌面通知',
             subtitle: '当收起顶部通知栏等待长回答时，生成结束后发送轻量提醒（不抢占焦点）',
         });
         s.bind('notify-on-complete', notifyCompleteRow, 'active', Gio.SettingsBindFlags.DEFAULT);
         shortcutGroup.add(notifyCompleteRow);
+
+        // --- Group 1.5: 快捷动作模板与 / 命令 (Stage F1) ---
+        const quickPromptsGroup = new Adw.PreferencesGroup({
+            title: '快捷动作模板与 / 命令',
+            description: '输入框键入 /（或按 Ctrl+/）可唤出内置命令：/explain、/translate、/polish、/summarize、/review、/error、/academic。所有快捷动作默认仅填入输入框，绝不自动发送。',
+        });
+        uiPage.add(quickPromptsGroup);
+
+        const quickHeaderBox = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            valign: Gtk.Align.CENTER,
+        });
+        const addQuickPromptBtn = new Gtk.Button({
+            icon_name: 'list-add-symbolic',
+            tooltip_text: '新增自定义快捷动作模板',
+            css_classes: ['flat'],
+        });
+        const resetQuickPromptsBtn = new Gtk.Button({
+            icon_name: 'edit-undo-symbolic',
+            tooltip_text: '恢复默认快捷动作模板',
+            css_classes: ['flat'],
+        });
+        quickHeaderBox.append(addQuickPromptBtn);
+        quickHeaderBox.append(resetQuickPromptsBtn);
+        quickPromptsGroup.set_header_suffix(quickHeaderBox);
+
+        let quickPromptItems = parseQuickPromptsConfig(getStr('quick-prompts-json', ''));
+        let mountedQuickRows = [];
+
+        const saveQuickPromptItems = () => {
+            if (!hasKey('quick-prompts-json')) return;
+            setStr('quick-prompts-json', serializeQuickPromptsConfig(quickPromptItems));
+        };
+
+        const formatQuickRowSubtitle = item => {
+            const slashPart = item.slash ? `${item.slash} · ` : '';
+            const preview = String(item.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 52);
+            return `${slashPart}${preview || '（空模板）'}`;
+        };
+
+        const rebuildQuickPromptRows = () => {
+            for (const row of mountedQuickRows) {
+                try { quickPromptsGroup.remove(row); } catch (_) {}
+            }
+            mountedQuickRows = [];
+            addQuickPromptBtn.sensitive = quickPromptItems.length < MAX_CUSTOM_QUICK_PROMPTS;
+
+            quickPromptItems.forEach((item, idx) => {
+                const expRow = new Adw.ExpanderRow({
+                    title: item.label || `快捷动作 ${idx + 1}`,
+                    subtitle: formatQuickRowSubtitle(item),
+                });
+
+                const deleteBtn = new Gtk.Button({
+                    icon_name: 'user-trash-symbolic',
+                    tooltip_text: '删除此快捷动作',
+                    valign: Gtk.Align.CENTER,
+                    css_classes: ['flat', 'circular'],
+                });
+                deleteBtn.connect('clicked', () => {
+                    if (quickPromptItems.length <= 1) {
+                        quickPromptItems = DEFAULT_QUICK_PROMPTS.map(d => ({...d}));
+                        if (hasKey('quick-prompts-json')) setStr('quick-prompts-json', '');
+                    } else {
+                        quickPromptItems.splice(idx, 1);
+                        saveQuickPromptItems();
+                    }
+                    rebuildQuickPromptRows();
+                });
+                expRow.add_suffix(deleteBtn);
+
+                const labelEntry = new Adw.EntryRow({
+                    title: '按钮名称 (Label)',
+                    text: item.label || '',
+                });
+                const slashEntry = new Adw.EntryRow({
+                    title: '绑定 / 命令 (可选，如 /sql 或覆盖 /polish)',
+                    text: item.slash || '',
+                });
+                const promptEntry = new Adw.EntryRow({
+                    title: '提示词模板 (结尾保留换行可接后续输入)',
+                    text: item.prompt || '',
+                });
+
+                const syncSingleItemEdit = () => {
+                    item.label = labelEntry.text.trim() || `快捷动作 ${idx + 1}`;
+                    const rawSlash = slashEntry.text.trim();
+                    item.slash = rawSlash
+                        ? (rawSlash.startsWith('/') ? rawSlash : `/${rawSlash}`).replace(/\s+/g, '').toLowerCase()
+                        : '';
+                    item.prompt = promptEntry.text || item.prompt;
+                    expRow.title = item.label;
+                    expRow.subtitle = formatQuickRowSubtitle(item);
+                    saveQuickPromptItems();
+                };
+
+                labelEntry.connect('notify::text', syncSingleItemEdit);
+                slashEntry.connect('notify::text', syncSingleItemEdit);
+                promptEntry.connect('notify::text', syncSingleItemEdit);
+
+                expRow.add_row(labelEntry);
+                expRow.add_row(slashEntry);
+                expRow.add_row(promptEntry);
+                quickPromptsGroup.add(expRow);
+                mountedQuickRows.push(expRow);
+            });
+        };
+
+        addQuickPromptBtn.connect('clicked', () => {
+            if (quickPromptItems.length >= MAX_CUSTOM_QUICK_PROMPTS) return;
+            const n = quickPromptItems.length + 1;
+            quickPromptItems.push({
+                id: `custom_${Date.now()}_${n}`,
+                label: `⚡ 自定义模板 ${n}`,
+                slash: `/c${n}`,
+                prompt: '请帮我分析以下内容：\n',
+            });
+            saveQuickPromptItems();
+            rebuildQuickPromptRows();
+        });
+
+        resetQuickPromptsBtn.connect('clicked', () => {
+            quickPromptItems = DEFAULT_QUICK_PROMPTS.map(d => ({...d}));
+            if (hasKey('quick-prompts-json')) {
+                setStr('quick-prompts-json', '');
+            }
+            rebuildQuickPromptRows();
+        });
+
+        rebuildQuickPromptRows();
 
         // --- Group 2: 通知栏面板与排版 ---
         const uiGroup = new Adw.PreferencesGroup({
@@ -667,6 +846,15 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         agentGroup.add(modeRow);
 
+        const modelRoutingRow = new Adw.SwitchRow({
+            title: '本地规则智能模型推荐 (可选)',
+            subtitle: '按简单问答/读文件/复杂代码/深度推理本地推荐已配置后端与模型；零额外模型请求，绝不自动开启全自动高权限',
+        });
+        if (hasKey('enable-model-routing')) {
+            s.bind('enable-model-routing', modelRoutingRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+            agentGroup.add(modelRoutingRow);
+        }
+
         const zcodePathRow = new Adw.EntryRow({
             title: 'ZCode CLI 路径 (留空自动探测)',
         });
@@ -732,11 +920,183 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             css_classes: ['flat'],
         });
         resetSessionBtn.connect('clicked', () => {
+            const curSid = getStr('session-id', '').trim();
+            if (curSid && hasKey('previous-session-id')) {
+                setStr('previous-session-id', curSid);
+            }
             setStr('session-id', GLib.uuid_string_random());
-            resetSessionRow.subtitle = '✓ 已切换至全新空白会话';
+            resetSessionRow.subtitle = '✓ 已切换至全新空白会话（可通过下方「恢复上一个会话」切回）';
         });
         resetSessionRow.add_suffix(resetSessionBtn);
         privacyGroup.add(resetSessionRow);
+
+        const restorePrevRow = new Adw.ActionRow({
+            title: '恢复上一个会话',
+            subtitle: '轻量切回最近使用的上一条历史对话，无需展开复杂多会话侧栏',
+        });
+        const restorePrevBtn = new Gtk.Button({
+            label: '恢复上一会话',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        restorePrevBtn.connect('clicked', async () => {
+            restorePrevBtn.sensitive = false;
+            try {
+                const sessions = await listStoredSessionsAsync();
+                const currentSid = getStr('session-id', '').trim();
+                const preferredPrev = getStr('previous-session-id', '').trim();
+                const targetSid = resolvePreviousSessionId(sessions, {
+                    currentSessionId: currentSid,
+                    preferredPreviousId: preferredPrev,
+                });
+                if (!targetSid) {
+                    restorePrevRow.subtitle = '⚠️ 本地暂无其他可恢复的历史会话';
+                    return;
+                }
+                if (currentSid && hasKey('previous-session-id')) {
+                    setStr('previous-session-id', currentSid);
+                }
+                setStr('session-id', targetSid);
+                const hit = sessions.find(item => item.sessionId === targetSid);
+                restorePrevRow.subtitle = `✓ 已恢复历史会话：${hit?.previewTitle || targetSid.slice(0, 8)}`;
+            } finally {
+                restorePrevBtn.sensitive = true;
+            }
+        });
+        restorePrevRow.add_suffix(restorePrevBtn);
+        privacyGroup.add(restorePrevRow);
+
+        if (hasKey('session-retention-max-count')) {
+            const retentionCountRow = new Adw.SpinRow({
+                title: '旧会话保留数量上限',
+                subtitle: '超出上限的旧会话仅在点击下方扫描并确认后清理，不会静默删除历史',
+                adjustment: new Gtk.Adjustment({
+                    lower: 5,
+                    upper: 100,
+                    step_increment: 5,
+                    page_increment: 10,
+                }),
+            });
+            retentionCountRow.value = s.get_int('session-retention-max-count');
+            retentionCountRow.connect('notify::value', () => {
+                s.set_int('session-retention-max-count', Math.round(retentionCountRow.value));
+            });
+            privacyGroup.add(retentionCountRow);
+        }
+
+        if (hasKey('session-retention-max-days')) {
+            const retentionDaysRow = new Adw.SpinRow({
+                title: '旧会话保留天数上限 (天)',
+                subtitle: '自动保护当前会话与上一个会话不被误删',
+                adjustment: new Gtk.Adjustment({
+                    lower: 1,
+                    upper: 365,
+                    step_increment: 5,
+                    page_increment: 30,
+                }),
+            });
+            retentionDaysRow.value = s.get_int('session-retention-max-days');
+            retentionDaysRow.connect('notify::value', () => {
+                s.set_int('session-retention-max-days', Math.round(retentionDaysRow.value));
+            });
+            privacyGroup.add(retentionDaysRow);
+        }
+
+        const confirmSessionCleanupDialog = (plan, onDecision) => {
+            const sampleLines = plan.candidatesToDelete
+                .slice(0, 5)
+                .map(c => `• ${c.previewTitle} (${c.messageCount} 条 · ${c.reason})`)
+                .join('\n');
+            const moreHint = plan.candidatesToDelete.length > 5
+                ? `\n…等共 ${plan.candidatesToDelete.length} 个旧会话`
+                : '';
+            const heading = `确认清理 ${plan.candidatesToDelete.length} 个超期旧会话？`;
+            const body =
+                `保留策略：${plan.policySummary}（当前会话与上一个会话受保护保留）。\n\n` +
+                `待清理项预览：\n${sampleLines}${moreHint}`;
+
+            if (typeof Adw.AlertDialog === 'function') {
+                const dlg = new Adw.AlertDialog({heading, body});
+                dlg.add_response('cancel', '暂不清理');
+                dlg.add_response('confirm', '确认永久清理');
+                dlg.set_response_appearance('confirm', Adw.ResponseAppearance.DESTRUCTIVE);
+                dlg.set_default_response('cancel');
+                dlg.set_close_response('cancel');
+                dlg.connect('response', (_, resp) => onDecision(resp === 'confirm'));
+                dlg.present(window);
+                return;
+            }
+            const dlg = new Adw.MessageDialog({
+                transient_for: window,
+                modal: true,
+                heading,
+                body,
+            });
+            dlg.add_response('cancel', '暂不清理');
+            dlg.add_response('confirm', '确认永久清理');
+            dlg.set_response_appearance('confirm', Adw.ResponseAppearance.DESTRUCTIVE);
+            dlg.set_default_response('cancel');
+            dlg.set_close_response('cancel');
+            dlg.connect('response', (_, resp) => {
+                onDecision(resp === 'confirm');
+                try { dlg.destroy(); } catch (_) {}
+            });
+            dlg.present();
+        };
+
+        const cleanupSessionsRow = new Adw.ActionRow({
+            title: '扫描并清理超期旧会话',
+            subtitle: '按上述数量与天数上限扫描本地会话目录，列出超期项并经您确认后删除',
+        });
+        const cleanupSessionsBtn = new Gtk.Button({
+            label: '扫描清理',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        cleanupSessionsBtn.connect('clicked', async () => {
+            cleanupSessionsBtn.sensitive = false;
+            try {
+                const sessions = await listStoredSessionsAsync();
+                const currentSid = getStr('session-id', '').trim();
+                const prevSid = resolvePreviousSessionId(sessions, {
+                    currentSessionId: currentSid,
+                    preferredPreviousId: getStr('previous-session-id', '').trim(),
+                });
+                const maxCount = hasKey('session-retention-max-count')
+                    ? s.get_int('session-retention-max-count')
+                    : 20;
+                const maxAgeDays = hasKey('session-retention-max-days')
+                    ? s.get_int('session-retention-max-days')
+                    : 30;
+                const plan = planSessionRetentionCleanup(sessions, {
+                    currentSessionId: currentSid,
+                    previousSessionId: prevSid,
+                    maxCount,
+                    maxAgeDays,
+                });
+                if (plan.candidatesToDelete.length === 0) {
+                    cleanupSessionsRow.subtitle = `✓ 共扫描 ${sessions.length} 个本地会话，无超期需清理项（${plan.policySummary}）`;
+                    return;
+                }
+                confirmSessionCleanupDialog(plan, async approved => {
+                    if (!approved) {
+                        cleanupSessionsRow.subtitle = `已取消清理（共保留 ${sessions.length} 个会话）`;
+                        return;
+                    }
+                    const candidateIds = plan.candidatesToDelete.map(c => c.sessionId);
+                    const res = await executeApprovedSessionCleanupAsync(candidateIds, {
+                        protectedIds: [currentSid, prevSid].filter(Boolean),
+                    });
+                    cleanupSessionsRow.subtitle = res.errors.length
+                        ? `⚠️ 已清理 ${res.deletedCount} 个旧会话（${res.errors[0]}）`
+                        : `✓ 已安全清理 ${res.deletedCount} 个超期旧会话`;
+                });
+            } finally {
+                cleanupSessionsBtn.sensitive = true;
+            }
+        });
+        cleanupSessionsRow.add_suffix(cleanupSessionsBtn);
+        privacyGroup.add(cleanupSessionsRow);
 
         // --- Optional Group 4: 旧版 Pi 本地历史只读导入 ---
         const legacyPiFiles = listLegacyPiSessionFiles();
@@ -774,6 +1134,128 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 row.add_suffix(importBtn);
                 legacyImportGroup.add(row);
             }
+        }
+
+        // =====================================================================
+        // Page 3: 紧凑诊断页 (Stage F7 · Redacted Runtime Diagnostics)
+        // =====================================================================
+        const diagPage = new Adw.PreferencesPage({
+            title: '诊断',
+            icon_name: 'utilities-terminal-symbolic',
+        });
+        window.add(diagPage);
+
+        const diagGroup = new Adw.PreferencesGroup({
+            title: '运行状态与能力诊断',
+            description: '汇总后端引擎版本、实际生效模型、权限边界、桥接握手与会话保存状态。复制报告时自动脱敏（绝不包含对话正文、API Key 或主目录用户名）。',
+        });
+        diagPage.add(diagGroup);
+
+        const copyDiagBtn = new Gtk.Button({
+            valign: Gtk.Align.CENTER,
+            css_classes: ['suggested-action'],
+        });
+        const copyDiagContent = new Adw.ButtonContent({
+            icon_name: 'edit-copy-symbolic',
+            label: '复制脱敏诊断',
+        });
+        copyDiagBtn.set_child(copyDiagContent);
+        diagGroup.set_header_suffix(copyDiagBtn);
+
+        const diagBackendRow = new Adw.ActionRow({title: '后端引擎与版本', subtitle: '读取中…'});
+        const diagModelRow = new Adw.ActionRow({title: '实际生效模型与 Provider', subtitle: '读取中…'});
+        const diagCapsRow = new Adw.ActionRow({title: '权限模式与能力边界', subtitle: '读取中…'});
+        const diagBridgeRow = new Adw.ActionRow({title: 'ZCode 桥接握手状态', subtitle: '读取中…'});
+        const diagConnRow = new Adw.ActionRow({title: '面板挂载与连接状态', subtitle: '读取中…'});
+        const diagSessionRow = new Adw.ActionRow({title: '会话存储与最近同步', subtitle: '读取中…'});
+
+        diagGroup.add(diagBackendRow);
+        diagGroup.add(diagModelRow);
+        diagGroup.add(diagCapsRow);
+        diagGroup.add(diagBridgeRow);
+        diagGroup.add(diagConnRow);
+        diagGroup.add(diagSessionRow);
+
+        const buildCurrentDiagnosticSnapshot = () => {
+            const homeDir = GLib.get_home_dir() || '';
+            const stored = hasKey('last-diagnostic-json')
+                ? parseStoredDiagnosticSnapshot(getStr('last-diagnostic-json', ''), {homeDir})
+                : null;
+            const configured = getStr('backend', 'auto') || 'auto';
+            const sel = getSelection();
+            const eff = sel.effectiveBackend;
+            const profile = registry.getBackendProfile(eff);
+            const modeInfo = normalizeEffectiveAgentMode(eff, profile.mode || 'readonly');
+            const caps = getBackendCapabilities(eff, modeInfo.effectiveMode);
+            const sec = eff === 'openai' ? inspectEndpointSecurity(getStr('openai-base-url', '')) : {warning: ''};
+            const storedMatchesBackend = Boolean(stored && stored.effectiveBackend === eff);
+
+            return sanitizeDiagnosticSnapshot({
+                updatedAt: stored?.updatedAt || new Date().toISOString(),
+                configuredBackend: configured,
+                effectiveBackend: eff,
+                cliVersion: storedMatchesBackend
+                    ? stored.cliVersion
+                    : (eff === 'openai' ? 'HTTP/SSE (Soup 3.0)' : (sel.binaryPath ? `${eff} (${sel.binaryPath})` : '待运行探测')),
+                activeProvider: profile.provider || (storedMatchesBackend ? stored.activeProvider : '') || (eff === 'openai' ? '自定义端点' : '默认'),
+                activeModel: profile.model || (storedMatchesBackend ? stored.activeModel : '') || '默认（由后端自动决定）',
+                effectiveMode: modeInfo.effectiveMode,
+                capabilitySummary: formatCapabilitiesLine(caps, modeInfo.effectiveMode),
+                bridgeHandshake: eff === 'zcode'
+                    ? (storedMatchesBackend ? stored.bridgeHandshake : '待任务启动时验证握手')
+                    : '不适用（当前非 ZCode 后端）',
+                mountMode: stored?.mountMode || getStr('panel-fallback-mode', 'auto'),
+                lastConnectionError: !sel.available
+                    ? sel.reason
+                    : (storedMatchesBackend ? stored.lastConnectionError : '无'),
+                sessionSaveStatus: stored?.sessionSaveStatus || '正常',
+                endpointSecurityNote: sec.warning || '',
+            }, {
+                homeDir,
+                apiKey: latestApiKeyDraft,
+            });
+        };
+
+        const syncDiagnosticsUi = () => {
+            const snap = buildCurrentDiagnosticSnapshot();
+            diagBackendRow.subtitle = `配置: ${snap.configuredBackend} → 实际: ${snap.effectiveBackend} · 版本: ${snap.cliVersion}`;
+            diagModelRow.subtitle = `模型: ${snap.activeModel} · Provider: ${snap.activeProvider}`;
+            diagCapsRow.subtitle = snap.capabilitySummary;
+            diagBridgeRow.subtitle = snap.bridgeHandshake;
+            diagConnRow.subtitle = `挂载: ${snap.mountMode} · 连接错误: ${snap.lastConnectionError}`
+                + (snap.endpointSecurityNote ? ` · ⚠️ ${snap.endpointSecurityNote}` : '');
+            diagSessionRow.subtitle = `${snap.sessionSaveStatus}（更新于 ${snap.updatedAt}）`;
+        };
+
+        copyDiagBtn.connect('clicked', () => {
+            const snap = buildCurrentDiagnosticSnapshot();
+            const extVersion = String(this.metadata?.['version-name'] || this.metadata?.version || '').trim();
+            const reportText = formatRedactedDiagnosticsText(snap, {
+                extensionVersion: extVersion,
+                homeDir: GLib.get_home_dir() || '',
+                apiKey: latestApiKeyDraft,
+            });
+            try {
+                const clip = window.get_clipboard?.() || Gdk.Display.get_default()?.get_clipboard?.();
+                clip?.set?.(reportText);
+                copyDiagContent.label = '✓ 已复制脱敏诊断';
+                if (diagCopyResetTimer) {
+                    try { GLib.source_remove(diagCopyResetTimer); } catch (_) {}
+                }
+                diagCopyResetTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1800, () => {
+                    diagCopyResetTimer = 0;
+                    copyDiagContent.label = '复制脱敏诊断';
+                    return GLib.SOURCE_REMOVE;
+                });
+            } catch (_) {
+                copyDiagContent.label = '复制失败';
+            }
+        });
+
+        if (hasKey('last-diagnostic-json')) {
+            prefsSignalIds.push(
+                s.connect('changed::last-diagnostic-json', () => syncDiagnosticsUi())
+            );
         }
 
         // =====================================================================
@@ -821,6 +1303,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             } else {
                 modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 使用 CLI 沙箱策略控制权限，不支持会话内交互弹窗审批`;
             }
+            syncDiagnosticsUi();
         };
 
         const autoRepairSwappedProviderAndModel = (eff, providers) => {
@@ -889,6 +1372,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             }
             effortRow.selected = Math.max(0, efforts.indexOf(getActiveEffort(eff)));
             syncingUi = false;
+            syncDiagnosticsUi();
         };
 
         const rebuildProviderAndModelUi = (statusNote = '', skipAsyncRefresh = false) => {

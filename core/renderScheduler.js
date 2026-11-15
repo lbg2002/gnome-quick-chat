@@ -428,4 +428,106 @@ export class HistoryWindowController {
 
         return '';
     }
+
+    /**
+     * Resolves the exact user message record `{userMessageId, promptText, displayText, createdAt, ts, userIndex}`
+     * paired with an assistant card (or user card) so in-place Regenerate / Edit Question can rewind
+     * without appending a duplicate user message!
+     */
+    findRetryTurnInfoForCard(card) {
+        if (!card) return null;
+
+        if (card.role === 'user') {
+            const exactIdx = card.messageId
+                ? this.allMessages.findIndex(m => m && m.id === card.messageId && m.role === 'user')
+                : -1;
+            const stored = exactIdx >= 0 ? this.allMessages[exactIdx] : null;
+            return {
+                userMessageId: String(stored?.id || card.messageId || ''),
+                promptText: String(stored?.text || card.rawPromptText || card.text || '').trim(),
+                displayText: String(stored?.displayText || card.text || '').trim(),
+                createdAt: stored?.createdAt || card.createdAt || '',
+                ts: stored?.ts || card.effectiveTs || 0,
+                userIndex: exactIdx,
+            };
+        }
+
+        const replyToId = String(card.replyTo || '').trim();
+        if (replyToId) {
+            const exactIdx = this.allMessages.findIndex(m => m && m.id === replyToId && m.role === 'user');
+            if (exactIdx >= 0) {
+                const stored = this.allMessages[exactIdx];
+                return {
+                    userMessageId: stored.id,
+                    promptText: String(stored.text || '').trim(),
+                    displayText: String(stored.displayText || stored.text || '').trim(),
+                    createdAt: stored.createdAt || '',
+                    ts: stored.ts || 0,
+                    userIndex: exactIdx,
+                };
+            }
+        }
+
+        const asstIdx = card.messageId
+            ? this.allMessages.findIndex(m => m && m.id === card.messageId)
+            : -1;
+        const searchStart = asstIdx > 0
+            ? asstIdx - 1
+            : (this.mountedCards.indexOf(card) >= 0 ? this.windowStart + this.mountedCards.indexOf(card) - 1 : -1);
+
+        for (let i = searchStart; i >= 0; i--) {
+            const m = this.allMessages[i];
+            if (m?.role === 'user' && m.text?.trim()) {
+                return {
+                    userMessageId: String(m.id || ''),
+                    promptText: m.text.trim(),
+                    displayText: String(m.displayText || m.text || '').trim(),
+                    createdAt: m.createdAt || '',
+                    ts: m.ts || 0,
+                    userIndex: i,
+                };
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Truncates `allMessages` and `mountedCards` starting from `startMessageId`
+     * (inclusive when `keepStartMessage === false`, or strictly AFTER `startMessageId` when `keepStartMessage === true`).
+     * Returns `{removedCards}` so the UI can destroy only the removed St Actors cleanly!
+     */
+    truncateFromMessageId(startMessageId, {keepStartMessage = false} = {}) {
+        const cleanId = String(startMessageId || '').trim();
+        if (!cleanId) return {removedCards: [], truncated: false};
+
+        const msgIdx = this.allMessages.findIndex(m => m && m.id === cleanId);
+        if (msgIdx < 0) {
+            return {removedCards: [], truncated: false};
+        }
+
+        const cutAllIdx = keepStartMessage ? msgIdx + 1 : msgIdx;
+        if (cutAllIdx >= this.allMessages.length) {
+            return {removedCards: [], truncated: false};
+        }
+
+        this.allMessages = this.allMessages.slice(0, cutAllIdx);
+        const removedCards = [];
+
+        if (cutAllIdx <= this.windowStart) {
+            // Cut point is earlier than the currently mounted window: clear all mounted cards and reset window to tail!
+            removedCards.push(...this.mountedCards);
+            this.mountedCards = [];
+            this.windowStart = Math.max(0, this.allMessages.length - this._initialPageSize);
+            this.windowEnd = this.allMessages.length;
+            return {removedCards, truncated: true, needsRemountWindow: true};
+        }
+
+        const mountedCutOffset = cutAllIdx - this.windowStart;
+        if (mountedCutOffset < this.mountedCards.length) {
+            const tailRemoved = this.mountedCards.splice(mountedCutOffset);
+            removedCards.push(...tailRemoved);
+        }
+        this.windowEnd = Math.min(this.allMessages.length, this.windowStart + this.mountedCards.length);
+        return {removedCards, truncated: true, needsRemountWindow: false};
+    }
 }

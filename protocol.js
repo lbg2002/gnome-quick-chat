@@ -82,6 +82,7 @@ export function detailedMessages(messages) {
             ...(m.replyTo ? {replyTo: m.replyTo} : {}),
             role: m.role,
             text: messageText(m),
+            ...(typeof m.displayText === 'string' && m.displayText ? {displayText: m.displayText} : {}),
             thinking: m.role === 'assistant' ? messageThinking(m) : '',
             createdAt: m.createdAt || '',
             ...(typeof m.ts === 'number' && m.ts > 0 ? {ts: m.ts} : {}),
@@ -89,6 +90,7 @@ export function detailedMessages(messages) {
             modelId: m.modelId || '',
             status: m.status || 'completed',
             ...(m.partial ? {partial: true} : {}),
+            ...(typeof m.finishReason === 'string' && m.finishReason ? {finishReason: m.finishReason} : {}),
             ...(m.errorMessage ? {errorMessage: m.errorMessage} : {}),
         }))
         .filter(m => m.text.length > 0 || m.thinking.length > 0 || Boolean(m.errorMessage));

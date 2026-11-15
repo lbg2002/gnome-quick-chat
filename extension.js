@@ -5,27 +5,58 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {BackendClient} from './backendClient.js';
 import {
     buildAskUserModifiedInput,
     detailedMessages,
+    expandHomePath,
     formatAskUserAnswerSummary,
     getBackendCapabilities,
     messageText,
     messageThinking,
 } from './protocol.js';
+import {
+    AttachmentManager,
+    MAX_ATTACHMENT_FILE_BYTES,
+    extractCopiedFilePaths,
+} from './core/attachmentManager.js';
 import {BackendRegistry} from './core/backendRegistry.js';
 import {ChatController} from './core/chatController.js';
 import {
+    detectBackendSelectionAsync,
     detectEffectiveBackend,
     invalidateBackendDetectionCaches,
     migrateGSettingsIfNeeded,
 } from './core/backendDetect.js';
-import {getSessionsDir, resolveWorkspacePath} from './core/paths.js';
+import {sanitizeDiagnosticSnapshot} from './core/diagnosticsReport.js';
+import {
+    clampSafeRecommendedMode,
+    recommendRouteLocally,
+} from './core/modelRouter.js';
+import {
+    BackgroundNotificationGate,
+    resolveNotificationClickTarget,
+} from './core/notificationPolicy.js';
+import {
+    getSessionsDir,
+    readFileBytesBoundedAsync,
+    resolveWorkspacePath,
+} from './core/paths.js';
 import {appendBoundedInMemoryText} from './core/renderScheduler.js';
 import {loadOpenAIApiKey} from './core/secretStore.js';
-import {validateSessionId} from './core/sessionStore.js';
+import {
+    buildContinuationPrompt,
+    planSessionRetentionCleanup,
+    resolvePreviousSessionId,
+} from './core/sessionEngine.js';
+import {
+    deleteStoredSessionAsync,
+    executeApprovedSessionCleanupAsync,
+    listStoredSessionsAsync,
+    validateSessionId,
+} from './core/sessionStore.js';
 import {ChatPanelView} from './ui/chatPanel.js';
 import {DateMenuIntegration} from './ui/dateMenuIntegration.js';
 import {MessageCardFactory} from './ui/messageCard.js';
@@ -58,6 +89,18 @@ export default class QuickChat extends Extension {
         this._idleStatus = '随问';
         this._tab = 'ai';
 
+        this._attachments = new AttachmentManager();
+        this._notifGate = new BackgroundNotificationGate();
+        this._dismissedRouteKeys = new Set();
+        this._editingTurnInfo = null;
+        this._cachedAvailableBackends = new Set();
+        this._diagState = {
+            bridgeHandshake: '',
+            lastConnectionError: '无',
+            sessionSaveStatus: '正常',
+            sessionSaveWarning: '',
+        };
+
         try {
             this._settings = this.getSettings();
             migrateGSettingsIfNeeded(this._settings);
@@ -74,7 +117,9 @@ export default class QuickChat extends Extension {
                 onConnectionError: err => {
                     this._live = null;
                     this._setBusy(false);
-                    this._panel?.setStatusIndicator('error', `连接失败：${err?.message || err}`);
+                    const errMsg = err?.message || String(err || '未知错误');
+                    this._panel?.setStatusIndicator('error', `连接失败：${errMsg}`);
+                    this._syncDiagnosticsSnapshot({lastConnectionError: errMsg});
                 },
                 scheduleDelay: (ms, cb) => {
                     const id = this._scheduleTimeout(ms, cb);
@@ -110,6 +155,8 @@ export default class QuickChat extends Extension {
                 },
                 onScrollBottom: (force, animate) => this._panel?.scrollBottom(force, animate),
                 onRetryAssistantCard: card => this._retryForAssistantCard(card),
+                onContinueAssistantCard: card => this._continueForAssistantCard(card),
+                onEditUserCard: card => this._beginEditUserCard(card),
             });
 
             this._modelPicker = new ModelPickerController({
@@ -141,10 +188,24 @@ export default class QuickChat extends Extension {
                 onReconnectNow: () => this._reconnectNow(),
                 onOpenPreferences: () => this._openExtensionPreferences(),
                 onClipboardAsk: openFirst => this._triggerClipboardAsk(openFirst),
+                onAttachFileButton: () => this._panel?.toggleFileAttachBar(),
+                onAttachPathSubmit: (rawPath, opts) => this._attachLocalFilePath(rawPath, opts),
+                onRemoveAttachment: id => this._removeAttachment(id),
+                onToggleAttachmentPreview: id => this._toggleAttachmentPreview(id),
+                onToggleAttachmentFileMode: id => this._toggleAttachmentFileMode(id),
                 onNewSession: () => this._newSession(),
+                onRefreshSessionMenuState: () => this._refreshSessionMenuState(),
+                onRestorePreviousSession: sid => this._restoreSessionById(sid),
+                onExportSession: () => this._exportCurrentSession(),
+                onDeleteCurrentSession: () => this._deleteCurrentSession(),
+                onApproveRetentionCleanup: ids => this._approveRetentionCleanup(ids),
+                onCancelEditQuestion: () => this._cancelEditQuestion(),
+                onApplyRouteSuggestion: suggestion => this._applyRouteSuggestion(suggestion),
+                onDismissRouteSuggestion: suggestion => this._dismissRouteSuggestion(suggestion),
                 onSend: () => this._send(),
                 onAbort: () => this._abort(),
                 onEntryKeyPress: event => this._onEntryKeyPress(event),
+                onEntryTextChanged: text => this._onEntryTextChanged(text),
                 onDismissMigrationNotice: () => this._modelPicker?.dismissMigrationNotice(),
             });
 
@@ -161,12 +222,19 @@ export default class QuickChat extends Extension {
             );
 
             if (!mounted) {
+                const mountErr = this._dateIntegration.lastMountError || 'unknown';
+                this._syncDiagnosticsSnapshot({
+                    mountMode: `failed (${fallbackMode})`,
+                    lastConnectionError: `面板挂载回退失败：${mountErr}`,
+                });
                 console.warn(
-                    `[Quick Chat] Panel mount unavailable (mode=${fallbackMode}): ${this._dateIntegration.lastMountError || 'unknown'}; preserving native DateMenu.`
+                    `[Quick Chat] Panel mount unavailable (mode=${fallbackMode}): ${mountErr}; preserving native DateMenu.`
                 );
                 this.disable();
                 return;
             }
+
+            this._syncDiagnosticsSnapshot({mountMode: this._dateIntegration.mountMode || 'datemenu'});
 
             const hasNativeNotifications = this._dateIntegration.mountMode === 'datemenu';
             this._panel.setNotificationTabAvailable(hasNativeNotifications);
@@ -206,17 +274,30 @@ export default class QuickChat extends Extension {
                         } else {
                             this._updateAiTabBadge();
                         }
-                    } else if (this._modelPicker?.isOpen) {
-                        this._modelPicker.toggle(false);
+                    } else {
+                        if (this._modelPicker?.isOpen) {
+                            this._modelPicker.toggle(false);
+                        }
+                        if (this._panel?.isSessionMenuOpen) {
+                            this._panel.toggleSessionMenu(false);
+                        }
+                        this._panel?.closeSlashMenu();
                     }
                 });
             }
 
             this._sessionSignal = Main.sessionMode.connect('updated', () => {
                 if (!this._enabled || this._lifecycleGeneration !== lifeGen) return;
-                // Never expose transcript or retain approved session scopes across lock screen / greeter.
+                // Never expose transcript, pending attachments, or approved session scopes across lock screen / greeter.
                 if (Main.sessionMode.isLocked || Main.sessionMode.isGreeter) {
                     if (this._modelPicker?.isOpen) this._modelPicker.toggle(false);
+                    this._panel?.toggleSessionMenu(false);
+                    this._panel?.toggleFileAttachBar(false);
+                    this._panel?.closeSlashMenu();
+                    this._panel?.setRouteSuggestion(null);
+                    this._cancelEditQuestion({keepEntry: true});
+                    this._attachments?.clear();
+                    this._panel?.renderAttachments([], '');
                     this._panel?.wrapper?.hide();
                     this._live = null;
                     this._chatController?.stopClient();
@@ -232,6 +313,7 @@ export default class QuickChat extends Extension {
             this._registerGlobalKeybindings();
             this._panel.syncThemeStyle(this._interfaceSettings);
             this._panel.applyDimensions(() => this._dateIntegration?.nudgeLayout());
+            this._refreshAvailableBackendsAsync();
         } catch (err) {
             console.error('[Quick Chat] enable() failed, rolling back cleanly:', err);
             this.disable();
@@ -411,6 +493,114 @@ export default class QuickChat extends Extension {
         });
     }
 
+    _refreshAttachmentBarUi() {
+        if (!this._panel || !this._attachments) return;
+        const eff = this._getEffectiveBackend();
+        const endpointUrl = this._getSettingString('openai-base-url', '').trim();
+        const notice = this._attachments.buildOutboundScopeNotice(eff, {endpointUrl});
+        this._panel.renderAttachments(this._attachments.items, notice);
+        this._updateLocalRouteSuggestion(this._panel.entry?.get_text() || '');
+    }
+
+    _removeAttachment(id) {
+        if (!this._attachments) return;
+        this._attachments.remove(id);
+        this._refreshAttachmentBarUi();
+    }
+
+    _toggleAttachmentPreview(id) {
+        if (!this._attachments) return;
+        this._attachments.togglePreview(id);
+        this._refreshAttachmentBarUi();
+    }
+
+    _toggleAttachmentFileMode(id) {
+        if (!this._attachments) return;
+        const res = this._attachments.toggleFileMode(id);
+        if (!res.ok && res.error) {
+            this._panel?.setStatusIndicator('error', `⚠️ ${res.error}`);
+        }
+        this._refreshAttachmentBarUi();
+    }
+
+    async _attachLocalFilePath(rawPath, {preferPathOnly = false, sourceOrigin = '手动附加文件'} = {}) {
+        if (!this._isSessionUnlockedAndAlive() || !this._attachments) return false;
+        const lifeGen = this._lifecycleGeneration;
+        const home = GLib.get_home_dir() || '';
+        const expanded = expandHomePath(String(rawPath || '').trim(), home);
+        if (!expanded || !expanded.startsWith('/')) {
+            this._panel?.setStatusIndicator('error', '⚠️ 请输入有效的本地绝对路径（支持 ~/ 开头）');
+            return false;
+        }
+        if (!GLib.file_test(expanded, GLib.FileTest.EXISTS)) {
+            this._panel?.setStatusIndicator('error', `⚠️ 文件或目录不存在：${expanded}`);
+            return false;
+        }
+
+        if (GLib.file_test(expanded, GLib.FileTest.IS_DIR)) {
+            const dirRes = this._attachments.addFileCandidate({
+                filePath: expanded,
+                exists: true,
+                isDirectory: true,
+                sourceOrigin,
+            });
+            if (!dirRes.ok) {
+                this._panel?.setStatusIndicator('error', `⚠️ ${dirRes.error}`);
+                return false;
+            }
+            this._panel?.toggleFileAttachBar(false);
+            this._refreshAttachmentBarUi();
+            return true;
+        }
+
+        let fileSize = 0;
+        try {
+            const info = await new Promise(resolve => {
+                Gio.File.new_for_path(expanded).query_info_async(
+                    'standard::size',
+                    Gio.FileQueryInfoFlags.NONE,
+                    GLib.PRIORITY_DEFAULT,
+                    null,
+                    (f, r) => {
+                        try { resolve(f.query_info_finish(r)); } catch (_) { resolve(null); }
+                    }
+                );
+            });
+            fileSize = Number(info?.get_size?.() || 0);
+        } catch (_) {}
+
+        if (!this._isSessionUnlockedAndAlive(lifeGen)) return false;
+
+        let readRes = {exists: true, tooLarge: fileSize > MAX_ATTACHMENT_FILE_BYTES, bytes: null};
+        if (!preferPathOnly && !readRes.tooLarge) {
+            readRes = await readFileBytesBoundedAsync(expanded, MAX_ATTACHMENT_FILE_BYTES);
+            if (!this._isSessionUnlockedAndAlive(lifeGen)) return false;
+        }
+
+        const added = this._attachments.addFileCandidate({
+            filePath: expanded,
+            fileSize,
+            exists: readRes.exists,
+            isDirectory: false,
+            tooLarge: readRes.tooLarge,
+            bytes: readRes.bytes,
+            preferPathOnly,
+            sourceOrigin,
+        });
+
+        if (!added.ok) {
+            this._panel?.setStatusIndicator('error', `⚠️ ${added.error}`);
+            return false;
+        }
+
+        this._panel?.toggleFileAttachBar(false);
+        this._refreshAttachmentBarUi();
+        if (added.item?.warning && !this._chatController?.busy) {
+            this._panel?.setStatusIndicator('ready', `ℹ️ ${added.item.warning}`);
+        }
+        return true;
+    }
+
     _triggerClipboardAsk(openPanelFirst = true) {
         if (!this._isSessionUnlockedAndAlive()) return;
         const lifeGen = this._lifecycleGeneration;
@@ -424,31 +614,135 @@ export default class QuickChat extends Extension {
 
         const clip = St.Clipboard.get_default();
         const isAlive = () => Boolean(this._isSessionUnlockedAndAlive(lifeGen) && this._panel?.entry);
-        const applyClipText = raw => {
+
+        const attachClipboardContent = async (raw, {fromPrimarySelection = false} = {}) => {
             const trimmed = String(raw || '').trim();
             if (!trimmed || !isAlive()) return;
-            const clipped = trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}…` : trimmed;
-            const prompt = `请帮我分析、解释或处理以下内容：\n${clipped}`;
-            this._panel.entry.set_text(prompt);
-            this._panel.entry.grab_key_focus();
-            this._panel.entry.clutter_text.set_cursor_position(-1);
+
+            // Check if user copied files in Nautilus (`file://` URIs or explicit path lines)
+            const copiedPaths = extractCopiedFilePaths(trimmed).filter(p => GLib.file_test(p, GLib.FileTest.EXISTS));
+            if (copiedPaths.length > 0) {
+                for (const fp of copiedPaths) {
+                    if (!isAlive()) return;
+                    await this._attachLocalFilePath(fp, {
+                        preferPathOnly: false,
+                        sourceOrigin: 'Nautilus 选中文件',
+                    });
+                }
+                this._panel?.entry?.grab_key_focus();
+                return;
+            }
+
+            // Attach text / terminal log snippet independently WITHOUT overwriting entry draft or truncating at 4000 chars!
+            const res = this._attachments.addTextSnippet(trimmed, {fromPrimarySelection});
+            if (!res.ok) {
+                this._panel?.setStatusIndicator('error', `⚠️ ${res.error}`);
+            } else {
+                this._refreshAttachmentBarUi();
+            }
+            this._panel?.entry?.grab_key_focus();
         };
 
         clip.get_text(St.ClipboardType.CLIPBOARD, (_, text) => {
             if (!isAlive()) return;
             if (text && text.trim()) {
-                applyClipText(text);
+                attachClipboardContent(text, {fromPrimarySelection: false});
                 return;
             }
             clip.get_text(St.ClipboardType.PRIMARY, (__, primaryText) => {
                 if (!isAlive()) return;
                 if (primaryText && primaryText.trim()) {
-                    applyClipText(primaryText);
+                    attachClipboardContent(primaryText, {fromPrimarySelection: true});
                 } else {
                     this._panel?.entry?.grab_key_focus();
                 }
             });
         });
+    }
+
+    async _refreshAvailableBackendsAsync() {
+        const lifeGen = this._lifecycleGeneration;
+        if (!this._enabled) return;
+        const zcodePath = this._getSettingString('zcode-path', '');
+        const codexPath = this._getSettingString('codex-path', '');
+        const openaiBaseUrl = this._getSettingString('openai-base-url', '').trim();
+        try {
+            const [zSel, cSel] = await Promise.all([
+                detectBackendSelectionAsync({configuredBackend: 'zcode', zcodePath, codexPath, openaiBaseUrl}),
+                detectBackendSelectionAsync({configuredBackend: 'codex', zcodePath, codexPath, openaiBaseUrl}),
+            ]);
+            if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
+            const nextSet = new Set();
+            if (zSel?.available) nextSet.add('zcode');
+            if (cSel?.available) nextSet.add('codex');
+            if (openaiBaseUrl) nextSet.add('openai');
+            this._cachedAvailableBackends = nextSet;
+            this._updateLocalRouteSuggestion(this._panel?.entry?.get_text() || '');
+        } catch (_) {}
+    }
+
+    _onEntryTextChanged(text) {
+        this._updateLocalRouteSuggestion(text);
+    }
+
+    _updateLocalRouteSuggestion(draftText = '') {
+        if (!this._panel || !this._registry) return;
+        if (!this._getSettingBool('enable-model-routing', false) || this._chatController?.busy) {
+            this._panel.setRouteSuggestion(null);
+            return;
+        }
+        const avail = new Set(this._cachedAvailableBackends || []);
+        if (this._getSettingString('openai-base-url', '').trim()) avail.add('openai');
+        else avail.delete('openai');
+
+        const eff = this._getEffectiveBackend();
+        if (eff !== 'unconfigured') avail.add(eff);
+        const curProfile = this._registry.getBackendProfile(eff);
+
+        const suggestion = recommendRouteLocally({
+            promptText: draftText,
+            attachments: this._attachments?.items || [],
+            currentBackend: eff,
+            currentModel: curProfile.model || '',
+            currentMode: curProfile.mode || 'readonly',
+            currentEffort: curProfile.reasoningEffort || 'default',
+            availableBackends: Array.from(avail),
+            profiles: {
+                zcode: this._registry.getBackendProfile('zcode'),
+                codex: this._registry.getBackendProfile('codex'),
+                openai: this._registry.getBackendProfile('openai'),
+            },
+            dismissedKeys: this._dismissedRouteKeys,
+        });
+        this._panel.setRouteSuggestion(suggestion);
+    }
+
+    _applyRouteSuggestion(suggestion) {
+        if (!suggestion || !this._registry || this._chatController?.busy) return;
+        const targetBackend = suggestion.targetBackend;
+        if (!['zcode', 'codex', 'openai'].includes(targetBackend)) return;
+
+        // Hard security rule (Stage F6): NEVER auto-enable `full` or expand file/command scopes!
+        const safeMode = clampSafeRecommendedMode(targetBackend, suggestion.targetMode);
+        const curMode = this._registry.getBackendProfile(targetBackend).mode || 'readonly';
+        const effectiveAppliedMode = curMode === 'chat' && targetBackend === 'zcode'
+            ? safeMode
+            : clampSafeRecommendedMode(targetBackend, safeMode);
+
+        this._registry.updateBackendProfile(targetBackend, {
+            mode: effectiveAppliedMode,
+            reasoningEffort: suggestion.targetEffort || 'default',
+            ...(suggestion.targetModel ? {model: suggestion.targetModel} : {}),
+        });
+        this._registry.selectBackend(targetBackend);
+        this._panel?.setRouteSuggestion(null);
+    }
+
+    _dismissRouteSuggestion(suggestion) {
+        if (suggestion?.signature) {
+            this._dismissedRouteKeys?.add(suggestion.signature);
+        }
+        this._panel?.setRouteSuggestion(null);
     }
 
     _connectSettingsSignals() {
@@ -467,6 +761,20 @@ export default class QuickChat extends Extension {
         watch('migration-notice', () => {
             if (this._enabled && !this._panel?.mountedCards?.length) {
                 this._panel?.buildEmptyState();
+            }
+        });
+        watch('quick-prompts-json', () => {
+            if (!this._enabled) return;
+            if (!this._panel?.mountedCards?.length) {
+                this._panel?.buildEmptyState();
+            }
+            if (this._panel?.isSlashMenuOpen) {
+                this._panel.refreshSlashMenuForText(this._panel.entry?.get_text() || '');
+            }
+        });
+        watch('enable-model-routing', () => {
+            if (this._enabled) {
+                this._updateLocalRouteSuggestion(this._panel?.entry?.get_text() || '');
             }
         });
 
@@ -492,10 +800,12 @@ export default class QuickChat extends Extension {
             this._registry?.bumpGeneration();
             if (cacheInvalidateKeys.has(keyName)) {
                 invalidateBackendDetectionCaches();
+                this._refreshAvailableBackendsAsync();
             }
             if (!this._panel?.mountedCards?.length) {
                 this._panel?.buildEmptyState();
             }
+            this._refreshAttachmentBarUi();
             this._chatController?.scheduleConfigReconnect({
                 debounceMs: 60,
                 revokeScopes: scopeBoundaryKeys.has(keyName),
@@ -684,11 +994,27 @@ export default class QuickChat extends Extension {
             detailedMessages(messages),
             userText => this._recordPromptHistory(userText)
         );
+        this._refreshAttachmentBarUi();
 
         if (state.unconfigured || state.backend === 'unconfigured') {
             this._modelLabel = '未配置后端';
             this._idleStatus = '未配置后端';
-            this._panel?.setStatusIndicator('error', state.reason || '未检测到可用后端，请在设置（⚙）中配置');
+            const reason = state.reason || '未检测到可用后端，请在设置（⚙）中配置';
+            this._panel?.setStatusIndicator('error', reason);
+            this._syncDiagnosticsSnapshot({
+                configuredBackend: this._getSettingString('backend', 'auto'),
+                effectiveBackend: 'unconfigured',
+                cliVersion: '未检测到可用引擎',
+                activeProvider: '无',
+                activeModel: '未配置',
+                effectiveMode: 'chat',
+                capabilities: state.capabilities || getBackendCapabilities('unconfigured', 'chat'),
+                bridgeHandshake: '不适用',
+                lastConnectionError: reason,
+                sessionSaveStatus: '正常',
+                sessionSaveWarning: '',
+                endpointSecurityNote: '',
+            });
             this._setBusy(false);
             this._panel?.scrollBottom(true);
             return;
@@ -706,6 +1032,26 @@ export default class QuickChat extends Extension {
         const badge = caps.modeBadges?.[effectiveMode] || caps.modeBadges?.[config.mode] || '';
         const httpWarnSuffix = state.endpointSecurity?.isRemotePlaintextHttp ? ' · ⚠️明文HTTP' : '';
         this._idleStatus = (badge ? `${this._modelLabel} · ${badge}` : this._modelLabel) + httpWarnSuffix;
+
+        const defaultBridgeDiag = state.backend === 'zcode'
+            ? (this._diagState?.bridgeHandshake ||
+                (state.bridgeAvailable ? '桥接脚本就绪（待首次任务启动验证握手）' : '⚠️ 未找到桥接脚本'))
+            : '不适用（当前非 ZCode 后端）';
+        this._syncDiagnosticsSnapshot({
+            configuredBackend: this._getSettingString('backend', 'auto'),
+            effectiveBackend: state.backend,
+            cliVersion: state.cliVersion || (state.backend === 'openai' ? 'HTTP/SSE (Soup 3.0)' : '已探测 CLI'),
+            activeProvider: state.model?.provider || config?.provider || (state.backend === 'openai' ? '自定义端点' : '默认'),
+            activeModel: state.model?.modelId || this._modelLabel,
+            effectiveMode,
+            capabilities: caps,
+            bridgeHandshake: defaultBridgeDiag,
+            mountMode: this._dateIntegration?.mountMode || 'datemenu',
+            lastConnectionError: '无',
+            sessionSaveStatus: state.sessionUnsavedWarning || '正常',
+            sessionSaveWarning: state.sessionUnsavedWarning || '',
+            endpointSecurityNote: state.endpointSecurity?.warning || '',
+        });
 
         if (state.sessionUnsavedWarning) {
             this._panel?.setStatusIndicator('error', `⚠️ ${state.sessionUnsavedWarning}`);
@@ -728,10 +1074,48 @@ export default class QuickChat extends Extension {
 
     _retryForAssistantCard(assistantCard) {
         if (this._chatController?.busy || !this._panel?.historyWindow) return;
-        const promptText = this._panel.historyWindow.findRetryPromptForCard(assistantCard);
-        if (promptText && this._panel.entry) {
-            this._panel.entry.set_text(promptText);
-            this._send();
+        const retryInfo = this._panel.historyWindow.findRetryTurnInfoForCard(assistantCard);
+        if (!retryInfo?.promptText) return;
+        this._executePromptTurn({
+            promptText: retryInfo.promptText,
+            displayUserText: retryInfo.displayText || retryInfo.promptText,
+            rewindUserMessageId: retryInfo.userMessageId || '',
+            reuseExistingUserCard: Boolean(retryInfo.userMessageId),
+            userMessageId: retryInfo.userMessageId || '',
+            userCreatedAt: retryInfo.createdAt || '',
+            userTs: retryInfo.ts || 0,
+            clearEntry: false,
+            recordHistoryText: '',
+        });
+    }
+
+    _continueForAssistantCard(assistantCard) {
+        if (this._chatController?.busy || !assistantCard?.text?.trim()) return;
+        const contPrompt = buildContinuationPrompt(assistantCard.text);
+        if (!contPrompt) return;
+        this._executePromptTurn({
+            promptText: contPrompt,
+            displayUserText: '⤵ 继续生成上一段未完成的回答',
+            clearEntry: false,
+            recordHistoryText: '',
+        });
+    }
+
+    _beginEditUserCard(userCard) {
+        if (this._chatController?.busy || !this._panel?.historyWindow || !userCard) return;
+        const info = this._panel.historyWindow.findRetryTurnInfoForCard(userCard);
+        if (!info?.promptText) return;
+        this._editingTurnInfo = info;
+        this._panel.setEditQuestionBanner(true, info.displayText || info.promptText);
+        this._panel.setEntryTextProgrammatically(info.promptText, {focus: true, cursorAtEnd: true});
+    }
+
+    _cancelEditQuestion({keepEntry = false} = {}) {
+        const hadEdit = Boolean(this._editingTurnInfo);
+        this._editingTurnInfo = null;
+        this._panel?.setEditQuestionBanner(false);
+        if (hadEdit && !keepEntry && this._panel?.entry) {
+            this._panel.setEntryTextProgrammatically('', {focus: true, cursorAtEnd: true});
         }
     }
 
@@ -741,8 +1125,41 @@ export default class QuickChat extends Extension {
         const shift = (state & Clutter.ModifierType.SHIFT_MASK) !== 0;
         const ctrl = (state & Clutter.ModifierType.CONTROL_MASK) !== 0;
 
+        if (ctrl && (symbol === Clutter.KEY_slash || symbol === Clutter.KEY_question)) {
+            this._panel?.refreshSlashMenuForText(this._panel.entry?.get_text() || '', {forceOpen: true});
+            return Clutter.EVENT_STOP;
+        }
+
+        if (this._panel?.isSlashMenuOpen) {
+            if (symbol === Clutter.KEY_Up) {
+                this._panel.moveSlashSelection(-1);
+                return Clutter.EVENT_STOP;
+            }
+            if (symbol === Clutter.KEY_Down) {
+                this._panel.moveSlashSelection(1);
+                return Clutter.EVENT_STOP;
+            }
+            if (
+                symbol === Clutter.KEY_Tab ||
+                symbol === Clutter.KEY_ISO_Left_Tab ||
+                ((symbol === Clutter.KEY_Return || symbol === Clutter.KEY_KP_Enter) && !shift)
+            ) {
+                // Stage F1: Tab / Enter on slash completion ONLY fills the input draft, never auto-sends!
+                this._panel.acceptSlashSelection();
+                return Clutter.EVENT_STOP;
+            }
+            if (symbol === Clutter.KEY_Escape) {
+                this._panel.closeSlashMenu();
+                return Clutter.EVENT_STOP;
+            }
+        }
+
         if (symbol === Clutter.KEY_Escape && this._chatController?.busy) {
             this._abort();
+            return Clutter.EVENT_STOP;
+        }
+        if (symbol === Clutter.KEY_Escape && this._editingTurnInfo && !this._chatController?.busy) {
+            this._cancelEditQuestion();
             return Clutter.EVENT_STOP;
         }
         if (ctrl && (symbol === Clutter.KEY_n || symbol === Clutter.KEY_l) && !this._chatController?.busy) {
@@ -767,19 +1184,26 @@ export default class QuickChat extends Extension {
             } else if (this._historyIndex > 0) {
                 this._historyIndex--;
             }
-            entry.set_text(this._promptHistory[this._historyIndex] || '');
-            entry.clutter_text.set_cursor_position(-1);
+            this._panel.setEntryTextProgrammatically(this._promptHistory[this._historyIndex] || '', {
+                focus: false,
+                cursorAtEnd: true,
+            });
             return Clutter.EVENT_STOP;
         }
         if (symbol === Clutter.KEY_Down && this._historyIndex !== -1 && !shift && !ctrl) {
             if (this._historyIndex < this._promptHistory.length - 1) {
                 this._historyIndex++;
-                entry.set_text(this._promptHistory[this._historyIndex] || '');
+                this._panel.setEntryTextProgrammatically(this._promptHistory[this._historyIndex] || '', {
+                    focus: false,
+                    cursorAtEnd: true,
+                });
             } else {
                 this._historyIndex = -1;
-                entry.set_text(this._draftInput || '');
+                this._panel.setEntryTextProgrammatically(this._draftInput || '', {
+                    focus: false,
+                    cursorAtEnd: true,
+                });
             }
-            entry.clutter_text.set_cursor_position(-1);
             return Clutter.EVENT_STOP;
         }
         return Clutter.EVENT_PROPAGATE;
@@ -787,31 +1211,93 @@ export default class QuickChat extends Extension {
 
     async _send() {
         const entry = this._panel?.entry;
-        if (!entry || !this._chatController) return;
-        const text = entry.get_text().trim();
-        if (!text || this._chatController.busy) return;
+        if (!entry || !this._chatController || this._chatController.busy) return;
+        const rawDraft = entry.get_text().trim();
+        const hasAttachments = Boolean(this._attachments?.count > 0);
+        if (!rawDraft && !hasAttachments) return;
+
+        const payload = this._attachments
+            ? this._attachments.composeTurnPayload(rawDraft)
+            : {hasAttachments: false, promptForModel: rawDraft, displayUserText: rawDraft};
+        const editTarget = this._editingTurnInfo;
+
+        await this._executePromptTurn({
+            promptText: payload.promptForModel,
+            displayUserText: payload.displayUserText,
+            rewindUserMessageId: editTarget?.userMessageId || '',
+            reuseExistingUserCard: false,
+            clearEntry: true,
+            clearAttachments: hasAttachments,
+            clearEditState: Boolean(editTarget),
+            recordHistoryText: rawDraft,
+            restoreDraftOnEarlyError: rawDraft,
+        });
+    }
+
+    async _executePromptTurn({
+        promptText,
+        displayUserText = '',
+        rewindUserMessageId = '',
+        reuseExistingUserCard = false,
+        userMessageId = '',
+        userCreatedAt = '',
+        userTs = 0,
+        clearEntry = true,
+        clearAttachments = false,
+        clearEditState = false,
+        recordHistoryText = '',
+        restoreDraftOnEarlyError = '',
+    } = {}) {
+        if (!promptText || !this._panel || !this._chatController || this._chatController.busy) return;
         if (this._modelPicker?.isOpen) {
             this._modelPicker.toggle(false);
         }
+        if (this._panel.isSessionMenuOpen) {
+            this._panel.toggleSessionMenu(false);
+        }
+        this._panel.closeSlashMenu();
+        this._panel.setRouteSuggestion(null);
+
         if (!this._chatController.ready) {
             await this._ensureClient();
             if (!this._chatController?.ready) return;
         }
         if (!this._isSessionUnlockedAndAlive() || this._chatController.busy) return;
 
+        const lifeGen = this._lifecycleGeneration;
+        const generation = this._chatController.clientGeneration;
+
+        if (rewindUserMessageId) {
+            try {
+                const rw = await this._chatController.client.request('rewind_from_user_turn', {
+                    userMessageId: rewindUserMessageId,
+                });
+                if (!this._isSessionUnlockedAndAlive(lifeGen) || generation !== this._chatController?.clientGeneration) {
+                    return;
+                }
+                if (rw?.ok) {
+                    this._panel.truncateMessagesFromId(rewindUserMessageId, {
+                        keepStartMessage: Boolean(reuseExistingUserCard),
+                    });
+                }
+            } catch (rwErr) {
+                this._panel?.setStatusIndicator('error', `回退历史失败：${rwErr?.message || rwErr}`);
+                return;
+            }
+        }
+
         if (this._panel.historyWindow?.hasNewer) {
             this._panel.restoreLatestHistoryWindow();
         }
 
-        const lifeGen = this._lifecycleGeneration;
-        const generation = this._chatController.clientGeneration;
         const turnId = `turn_${GLib.uuid_string_random()}`;
-        const userMessageId = `user_${GLib.uuid_string_random()}`;
+        const effectiveUserMessageId = userMessageId || `user_${GLib.uuid_string_random()}`;
         const messageId = `msg_${GLib.uuid_string_random()}`;
+        const shownUserText = displayUserText || promptText;
 
         this._chatController.activeTurnState = {
             turnId,
-            userMessageId,
+            userMessageId: effectiveUserMessageId,
             messageId,
             sessionId: this._chatController.currentSessionId || '',
             clientGeneration: generation,
@@ -819,22 +1305,45 @@ export default class QuickChat extends Extension {
             state: 'starting',
         };
 
-        this._recordPromptHistory(text);
-        entry.set_text('');
-        this._panel.addMessage('user', text, {
-            animate: true,
-            turnId,
-            messageId: userMessageId,
-        });
+        if (recordHistoryText) {
+            this._recordPromptHistory(recordHistoryText);
+        }
+        if (clearEditState) {
+            this._cancelEditQuestion({keepEntry: true});
+        }
+        if (clearEntry && this._panel.entry) {
+            this._panel.setEntryTextProgrammatically('', {focus: false, cursorAtEnd: true});
+        }
+        if (clearAttachments && this._attachments) {
+            this._attachments.clear();
+            this._refreshAttachmentBarUi();
+        }
+
+        if (!reuseExistingUserCard) {
+            this._panel.addMessage('user', shownUserText, {
+                rawPromptText: promptText,
+                animate: true,
+                turnId,
+                messageId: effectiveUserMessageId,
+                ...(userCreatedAt ? {createdAt: userCreatedAt} : {}),
+                ...(userTs ? {ts: userTs} : {}),
+            });
+        } else {
+            this._panel.scrollBottom(true, true);
+        }
+
         this._live = null;
         this._setBusy(true);
         this._panel.setStatusIndicator('busy', '思考与生成中…');
 
         try {
             const result = await this._chatController.client.request('prompt', {
-                message: text,
+                message: promptText,
+                ...(shownUserText !== promptText ? {displayUserText: shownUserText} : {}),
                 turnId,
-                userMessageId,
+                userMessageId: effectiveUserMessageId,
+                ...(userCreatedAt ? {userCreatedAt} : {}),
+                ...(userTs ? {userTs} : {}),
                 messageId,
                 clientGeneration: generation,
                 lifecycleGeneration: lifeGen,
@@ -861,8 +1370,11 @@ export default class QuickChat extends Extension {
             }
             this._chatController.activeTurnState = null;
             this._panel?.setStatusIndicator('error', `发送失败：${error.message}`);
+            this._syncDiagnosticsSnapshot({lastConnectionError: error.message || String(error)});
             this._setBusy(false);
-            if (!entry.get_text()) entry.set_text(text);
+            if (restoreDraftOnEarlyError && this._panel?.entry && !this._panel.entry.get_text()) {
+                this._panel.setEntryTextProgrammatically(restoreDraftOnEarlyError, {focus: true, cursorAtEnd: true});
+            }
             if (String(error.message || '').includes('超时')) {
                 this._chatController.stopClient();
             }
@@ -1116,11 +1628,28 @@ export default class QuickChat extends Extension {
         }
 
         if (event.type === 'session_save_error') {
-            this._panel.setStatusIndicator('error', `⚠️ ${event.message || '历史未保存'}`);
+            const msg = event.message || '历史未保存';
+            this._panel.setStatusIndicator('error', `⚠️ ${msg}`);
+            this._syncDiagnosticsSnapshot({
+                sessionSaveStatus: `⚠️ ${msg}`,
+                sessionSaveWarning: msg,
+            });
+            return;
+        }
+
+        if (event.type === 'bridge_ready') {
+            const ver = event.protocolVersion ? `v${event.protocolVersion}` : 'v1';
+            const statusText = event.patched
+                ? `已通过握手验证 (${ver} · 权限拦截生效)`
+                : `⚠️ 握手未命中补丁 (${event.error || '未知原因'})`;
+            this._syncDiagnosticsSnapshot({bridgeHandshake: statusText});
             return;
         }
 
         if ((event.type === 'bridge_warning' || event.type === 'mode_notice') && event.message) {
+            if (event.type === 'bridge_warning') {
+                this._syncDiagnosticsSnapshot({bridgeHandshake: `⚠️ ${event.message}`});
+            }
             if (!this._tracePanel.hasPendingApprovalNodes(this._live)) {
                 this._panel.setStatusIndicator('busy', `ℹ️ ${event.message}`);
             }
@@ -1134,6 +1663,7 @@ export default class QuickChat extends Extension {
                     : '';
                 this._modelLabel = event.modelId;
                 this._idleStatus = `${event.modelId}${suffix}`;
+                this._syncDiagnosticsSnapshot({activeModel: event.modelId});
                 if (this._live) {
                     this._live.modelId = event.modelId;
                     if (this._live.roleLabel) {
@@ -1286,6 +1816,13 @@ export default class QuickChat extends Extension {
             this._updateAiTabBadge();
             card.scheduleRender();
             this._panel.scrollBottom(true, true);
+
+            this._dispatchBackgroundNotification('approval_needed', {
+                sessionId: activeTurn?.sessionId || this._chatController?.currentSessionId || '',
+                turnId: event.turnId || activeTurn?.turnId || '',
+                requestId: event.requestId || '',
+                isQuestion: Boolean(node?.isQuestion || event.isQuestion),
+            });
         }
 
         if (event.type === 'permission_resolved') {
@@ -1385,6 +1922,8 @@ export default class QuickChat extends Extension {
         if ((event.type === 'message_end' || event.type === 'message_final') && event.message?.role === 'assistant') {
             const text = messageText(event.message);
             const thinking = messageThinking(event.message);
+            const finishReason = String(event.finishReason || event.message?.finishReason || '');
+            const isPartial = Boolean(event.partial || event.message?.partial);
             if (text || thinking || event.message.errorMessage) {
                 const card = this._ensureLiveCard(event);
                 if (text && card.text !== text) {
@@ -1402,11 +1941,15 @@ export default class QuickChat extends Extension {
                     card.dirty.text = true;
                     card.box?.add_style_class_name('qc-message-error');
                 }
+                if (finishReason) card.finishReason = finishReason;
+                if (isPartial) card.partial = true;
                 card.activeTool = false;
                 this._panel.historyWindow?.updateStoredMessageById(card.messageId, {
                     text: card.text,
                     thinking: card.thinking,
                     modelId: card.modelId || this._modelLabel || '',
+                    ...(finishReason ? {finishReason} : {}),
+                    ...(isPartial ? {partial: true} : {}),
                     ...(event.message.errorMessage ? {errorMessage: event.message.errorMessage} : {}),
                 });
                 card.flushRender();
@@ -1423,47 +1966,69 @@ export default class QuickChat extends Extension {
             (event.type === 'agent_end' && event.willRetry === undefined)
         ) {
             const terminalStatus = event.status || (event.aborted ? 'cancelled' : 'completed');
+            const finishReason = String(event.finishReason || this._live?.finishReason || '');
+            const isPartial = Boolean(
+                event.partial ||
+                this._live?.partial ||
+                finishReason === 'length' ||
+                (terminalStatus !== 'completed' && Boolean(this._live?.text?.trim()))
+            );
             const finishedText = this._live?.text || '';
-            if (this._live) {
-                if (this._live.toolNodes) {
-                    for (const node of this._live.toolNodes) {
+            const settledCard = this._live;
+            const settledTurnId = event.turnId || activeTurn?.turnId || settledCard?.turnId || '';
+            const settledSessionId = activeTurn?.sessionId || this._chatController?.currentSessionId || '';
+
+            if (settledCard) {
+                if (settledCard.toolNodes) {
+                    for (const node of settledCard.toolNodes) {
                         if (node.status === 'pending_approval' || node.status === 'sending_approval') {
                             node.status = 'denied';
                             node.approvalState = 'denied';
-                            this._live.dirtyToolNodeIds?.add(node.id);
-                            if (this._live.selectedNodeId === node.id) {
-                                this._live.selectedNodeId = null;
+                            settledCard.dirtyToolNodeIds?.add(node.id);
+                            if (settledCard.selectedNodeId === node.id) {
+                                settledCard.selectedNodeId = null;
                             }
                         } else if (node.status === 'running') {
                             node.status = 'interrupted';
-                            this._live.dirtyToolNodeIds?.add(node.id);
+                            settledCard.dirtyToolNodeIds?.add(node.id);
                         }
                     }
                 }
-                this._live.activeTool = false;
-                this._live.dirty.tools = true;
-                this._live.dirty.toolsUrgent = true;
-                this._live.dirty.text = true;
-                this._panel.historyWindow?.updateStoredMessageById(this._live.messageId, {
-                    text: this._live.text,
-                    thinking: this._live.thinking,
-                    modelId: this._live.modelId || this._modelLabel || '',
+                settledCard.status = terminalStatus;
+                settledCard.partial = isPartial;
+                if (finishReason) settledCard.finishReason = finishReason;
+                settledCard.activeTool = false;
+                settledCard.dirty.tools = true;
+                settledCard.dirty.toolsUrgent = true;
+                settledCard.dirty.text = true;
+                this._panel.historyWindow?.updateStoredMessageById(settledCard.messageId, {
+                    text: settledCard.text,
+                    thinking: settledCard.thinking,
+                    modelId: settledCard.modelId || this._modelLabel || '',
                     status: terminalStatus,
+                    partial: isPartial,
+                    ...(settledCard.finishReason ? {finishReason: settledCard.finishReason} : {}),
                 });
-                this._live.flushRender();
+                settledCard.flushRender();
             }
 
-            if (!this._isChatVisible() && terminalStatus === 'completed' && finishedText) {
-                this._panel.hasUnreadBackgroundReply = true;
-                if (
-                    !this._dateIntegration?.menu?.isOpen &&
-                    !Main.sessionMode.isLocked &&
-                    !Main.sessionMode.isGreeter &&
-                    this._getSettingBool('notify-on-complete', false)
+            if (!this._isChatVisible()) {
+                if (terminalStatus === 'completed' && finishedText) {
+                    this._panel.hasUnreadBackgroundReply = true;
+                    this._dispatchBackgroundNotification('turn_completed', {
+                        sessionId: settledSessionId,
+                        turnId: settledTurnId,
+                    });
+                } else if (
+                    terminalStatus === 'failed' ||
+                    terminalStatus === 'timed_out' ||
+                    terminalStatus === 'interrupted'
                 ) {
-                    try {
-                        Main.notify('随问 · 回答已完成', '点击顶部时间栏查看完整回答');
-                    } catch (_) {}
+                    this._panel.hasUnreadBackgroundReply = true;
+                    this._dispatchBackgroundNotification('turn_failed', {
+                        sessionId: settledSessionId,
+                        turnId: settledTurnId,
+                    });
                 }
             }
 
@@ -1472,14 +2037,23 @@ export default class QuickChat extends Extension {
             }
 
             this._setBusy(false);
+            this._live = null;
+            settledCard?.syncContinueVisibility?.();
+
             if (terminalStatus === 'cancelled') {
                 this._panel.setStatusIndicator('ready', '已停止生成');
             } else if (terminalStatus === 'timed_out') {
-                this._panel.setStatusIndicator('error', event.errorMessage || '请求超时');
+                const msg = event.errorMessage || '请求超时';
+                this._panel.setStatusIndicator('error', msg);
+                this._syncDiagnosticsSnapshot({lastConnectionError: msg});
             } else if (terminalStatus === 'interrupted') {
-                this._panel.setStatusIndicator('error', event.errorMessage || '输出中断（回答可能不完整）');
+                const msg = event.errorMessage || '输出中断（回答可能不完整）';
+                this._panel.setStatusIndicator('error', msg);
+                this._syncDiagnosticsSnapshot({lastConnectionError: msg});
             } else if (terminalStatus === 'failed') {
-                this._panel.setStatusIndicator('error', event.errorMessage ? `错误：${event.errorMessage}` : '执行失败');
+                const msg = event.errorMessage || '执行失败';
+                this._panel.setStatusIndicator('error', `错误：${msg}`);
+                this._syncDiagnosticsSnapshot({lastConnectionError: msg});
             } else if (
                 !this._panel.lastStatusText.startsWith('错误：') &&
                 !this._panel.lastStatusText.startsWith('⚠️ 历史未保存')
@@ -1487,7 +2061,6 @@ export default class QuickChat extends Extension {
                 this._panel.setStatusIndicator('ready', this._idleStatus || '随问');
             }
 
-            this._live = null;
             this._updateAiTabBadge();
             if (this._chatController.needsReconnect) {
                 this._chatController.needsReconnect = false;
@@ -1532,11 +2105,307 @@ export default class QuickChat extends Extension {
         }
     }
 
+    _syncDiagnosticsSnapshot(patch = {}) {
+        if (!this._enabled || !this._settings) return;
+        this._diagState = {
+            ...(this._diagState || {}),
+            ...patch,
+        };
+        if (!this._hasKey('last-diagnostic-json')) return;
+        try {
+            const snap = sanitizeDiagnosticSnapshot(this._diagState, {
+                homeDir: GLib.get_home_dir() || '',
+            });
+            const serialized = JSON.stringify(snap);
+            if (this._settings.get_string('last-diagnostic-json') !== serialized) {
+                this._settings.set_string('last-diagnostic-json', serialized);
+            }
+        } catch (_) {}
+    }
+
+    _dispatchBackgroundNotification(kind, {
+        sessionId = '',
+        turnId = '',
+        requestId = '',
+        isQuestion = false,
+    } = {}) {
+        if (!this._notifGate || !this._enabled) return;
+        const lifeGen = this._lifecycleGeneration;
+        const decision = this._notifGate.evaluate({
+            kind,
+            sessionId,
+            turnId,
+            requestId,
+            isQuestion,
+            isChatVisible: this._isChatVisible(),
+            isLocked: Boolean(Main.sessionMode.isLocked),
+            isGreeter: Boolean(Main.sessionMode.isGreeter),
+            enabledSettings: {
+                notifyOnApproval: this._getSettingBool('notify-on-approval', true),
+                notifyOnError: this._getSettingBool('notify-on-error', true),
+                notifyOnComplete: this._getSettingBool('notify-on-complete', false),
+            },
+        });
+        if (!decision.shouldNotify) return;
+
+        try {
+            const sysSource = typeof MessageTray.getSystemSource === 'function'
+                ? MessageTray.getSystemSource()
+                : null;
+            if (sysSource && typeof MessageTray.Notification === 'function') {
+                const notification = new MessageTray.Notification({
+                    source: sysSource,
+                    title: decision.title,
+                    body: decision.body,
+                });
+                notification.connect('activated', () => {
+                    if (this._isSessionUnlockedAndAlive(lifeGen)) {
+                        this._handleNotificationClicked(decision.target);
+                    }
+                });
+                if (typeof sysSource.addNotification === 'function') {
+                    sysSource.addNotification(notification);
+                    return;
+                }
+            }
+        } catch (_) {
+            // Fall through to standard Main.notify if MessageTray signature differs
+        }
+
+        try {
+            Main.notify(decision.title, decision.body);
+        } catch (_) {}
+    }
+
+    async _handleNotificationClicked(target) {
+        if (!this._isSessionUnlockedAndAlive() || !target) return;
+        const lifeGen = this._lifecycleGeneration;
+        const currentSessionId = this._getSettingString('session-id', '');
+        const mountedTurnIds = (this._panel?.mountedCards || []).map(c => c.turnId).filter(Boolean);
+        const storedTurnIds = (this._panel?.historyWindow?.allMessages || []).map(m => m.turnId).filter(Boolean);
+
+        let existingSessionIds = [];
+        if (target.sessionId && target.sessionId !== currentSessionId) {
+            try {
+                const list = await listStoredSessionsAsync();
+                existingSessionIds = list.map(s => s.sessionId);
+            } catch (_) {}
+        }
+        if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
+
+        const resolved = resolveNotificationClickTarget(target, {
+            isLocked: Boolean(Main.sessionMode.isLocked),
+            isGreeter: Boolean(Main.sessionMode.isGreeter),
+            isBusy: Boolean(this._chatController?.busy),
+            currentSessionId,
+            activeTurnId: this._chatController?.activeTurnState?.turnId || '',
+            mountedTurnIds,
+            storedTurnIds,
+            existingSessionIds,
+        });
+        if (resolved.action === 'ignore') return;
+
+        const menu = this._dateIntegration?.menu;
+        if (menu && !menu.isOpen) {
+            menu.open(true);
+        }
+        this._setTab('ai', true, true);
+
+        if (resolved.action === 'switch_session_and_focus' && resolved.sessionId) {
+            await this._restoreSessionById(resolved.sessionId);
+            return;
+        }
+
+        if (resolved.statusHint && !this._chatController?.busy) {
+            this._panel?.setStatusIndicator('ready', `ℹ️ ${resolved.statusHint}`);
+            return;
+        }
+
+        if (resolved.action === 'focus_current_turn') {
+            if (this._panel?.historyWindow?.hasNewer) {
+                this._panel.restoreLatestHistoryWindow();
+            }
+            if (resolved.requestId && this._live?.toolNodes) {
+                const pendingNode = this._live.toolNodes.find(
+                    n => n.requestId === resolved.requestId && n.status === 'pending_approval'
+                );
+                if (pendingNode) {
+                    this._live.selectedNodeId = pendingNode.id;
+                    this._live.dirty.tools = true;
+                    this._live.dirty.toolsUrgent = true;
+                    this._live.flushRender?.(true);
+                }
+            }
+            this._panel?.scrollBottom(true, true);
+            this._scheduleTimeout(40, () => {
+                if (this._isSessionUnlockedAndAlive(lifeGen)) {
+                    this._panel?.entry?.grab_key_focus();
+                }
+            });
+        }
+    }
+
+    _rememberPreviousNonEmptySessionId(sessionId) {
+        if (!this._hasKey('previous-session-id')) return;
+        const cleanId = String(sessionId || '').trim();
+        const hasMessages = Boolean((this._panel?.historyWindow?.allMessages?.length || 0) > 0);
+        if (cleanId && hasMessages) {
+            this._settings.set_string('previous-session-id', cleanId);
+        }
+    }
+
+    async _refreshSessionMenuState() {
+        if (!this._isSessionUnlockedAndAlive() || !this._panel) return;
+        const lifeGen = this._lifecycleGeneration;
+        const currentSessionId = this._getSettingString('session-id', '');
+        const explicitPrev = this._getSettingString('previous-session-id', '');
+        try {
+            const sessions = await listStoredSessionsAsync();
+            if (!this._isSessionUnlockedAndAlive(lifeGen) || !this._panel?.isSessionMenuOpen) return;
+            const previousSessionId = resolvePreviousSessionId(sessions, currentSessionId, explicitPrev);
+            const prevObj = sessions.find(s => s.sessionId === previousSessionId);
+            const cleanupPlan = planSessionRetentionCleanup(sessions, {
+                currentSessionId,
+                previousSessionId,
+                maxSessions: this._getSettingInt('session-retention-max-count', 20),
+                maxAgeDays: this._getSettingInt('session-retention-max-days', 30),
+            });
+            this._panel.renderSessionMenuState({
+                currentSessionId,
+                messageCount: this._panel.historyWindow?.allMessages?.length || 0,
+                previousSessionId,
+                previousPreview: prevObj?.preview || '',
+                cleanupPlan,
+                saveWarning: this._diagState?.sessionSaveWarning || '',
+            });
+        } catch (_) {}
+    }
+
+    async _restoreSessionById(targetSessionId) {
+        if (!this._chatController || this._chatController.busy) return;
+        let validTarget = '';
+        try {
+            validTarget = validateSessionId(targetSessionId);
+        } catch (_) {
+            return;
+        }
+        const currentId = this._getSettingString('session-id', '');
+        if (validTarget === currentId) return;
+
+        const lifeGen = this._lifecycleGeneration;
+        const prevClient = this._chatController.client;
+        prevClient?.revokeApprovedScopes?.();
+        if (prevClient) {
+            try { await prevClient.request('flush_session'); } catch (_) {}
+        }
+        if (!this._isSessionUnlockedAndAlive(lifeGen) || this._chatController.busy) return;
+
+        this._rememberPreviousNonEmptySessionId(currentId);
+        this._resetTransientComposerState();
+        this._chatController.stopClient();
+        this._settings.set_string('session-id', validTarget);
+        this._ensureClient();
+        this._panel?.entry?.grab_key_focus();
+    }
+
+    async _exportCurrentSession() {
+        if (!this._isSessionUnlockedAndAlive() || !this._chatController) return;
+        const lifeGen = this._lifecycleGeneration;
+        if (!this._chatController.ready) {
+            await this._ensureClient();
+        }
+        if (!this._isSessionUnlockedAndAlive(lifeGen) || !this._chatController?.client) return;
+        try {
+            const res = await this._chatController.client.request('export_session', {format: 'markdown'});
+            if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
+            if (res?.content) {
+                St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, res.content);
+            }
+            this._panel?.setStatusIndicator('ready', '✓ 已导出对话至 exports 目录并复制 Markdown');
+            this._scheduleTimeout(3200, () => {
+                if (this._isSessionUnlockedAndAlive(lifeGen) && !this._chatController?.busy) {
+                    this._panel?.setStatusIndicator('ready', this._idleStatus || '随问');
+                }
+            });
+        } catch (err) {
+            this._panel?.setStatusIndicator('error', `⚠️ 导出失败：${err?.message || err}`);
+        }
+    }
+
+    async _deleteCurrentSession() {
+        if (!this._chatController || this._chatController.busy) return;
+        const lifeGen = this._lifecycleGeneration;
+        const victimId = this._getSettingString('session-id', '');
+
+        this._chatController.client?.revokeApprovedScopes?.();
+        this._chatController.stopClient();
+        if (this._hasKey('previous-session-id') && this._getSettingString('previous-session-id', '') === victimId) {
+            this._settings.set_string('previous-session-id', '');
+        }
+
+        try {
+            await deleteStoredSessionAsync(victimId);
+        } catch (_) {}
+        if (!this._isSessionUnlockedAndAlive(lifeGen) || this._chatController.busy) return;
+
+        this._resetTransientComposerState();
+        this._settings.set_string('session-id', GLib.uuid_string_random());
+        this._panel?.clearMessages();
+        this._ensureClient();
+        this._panel?.entry?.grab_key_focus();
+    }
+
+    async _approveRetentionCleanup(candidateIds = []) {
+        if (!this._isSessionUnlockedAndAlive() || !Array.isArray(candidateIds) || candidateIds.length === 0) {
+            return;
+        }
+        const lifeGen = this._lifecycleGeneration;
+        const protectedIds = [
+            this._getSettingString('session-id', ''),
+            this._getSettingString('previous-session-id', ''),
+        ].filter(Boolean);
+        try {
+            const res = await executeApprovedSessionCleanupAsync(candidateIds, {protectedIds});
+            if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
+            this._panel?.setStatusIndicator('ready', `✓ 已清理 ${res.deletedCount} 个超出保留策略的旧会话`);
+            this._scheduleTimeout(3000, () => {
+                if (this._isSessionUnlockedAndAlive(lifeGen) && !this._chatController?.busy) {
+                    this._panel?.setStatusIndicator('ready', this._idleStatus || '随问');
+                }
+            });
+        } catch (err) {
+            this._panel?.setStatusIndicator('error', `⚠️ 清理旧会话失败：${err?.message || err}`);
+        }
+    }
+
+    _resetTransientComposerState() {
+        this._live = null;
+        this._draftInput = '';
+        this._promptHistory = [];
+        this._historyIndex = -1;
+        this._editingTurnInfo = null;
+        this._dismissedRouteKeys?.clear();
+        this._attachments?.clear();
+        this._modelPicker?.resetSessionState();
+        if (this._panel) {
+            this._panel.setEditQuestionBanner(false);
+            this._panel.setRouteSuggestion(null);
+            this._panel.toggleFileAttachBar(false);
+            this._panel.toggleSessionMenu(false);
+            this._panel.closeSlashMenu();
+            this._panel.renderAttachments([], '');
+            this._panel.setEntryTextProgrammatically('', {focus: false, cursorAtEnd: true});
+            this._panel.userScrolledUp = false;
+            this._panel.updateJumpBottomVisibility();
+        }
+    }
+
     async _newSession() {
         if (!this._chatController || this._chatController.busy) return;
         if (this._modelPicker?.isOpen) {
             this._modelPicker.toggle(false);
         }
+        const currentId = this._getSettingString('session-id', '');
         const prevClient = this._chatController.client;
         prevClient?.revokeApprovedScopes?.();
         if (prevClient) {
@@ -1544,19 +2413,11 @@ export default class QuickChat extends Extension {
         }
         if (!this._isSessionUnlockedAndAlive() || this._chatController.busy) return;
 
+        this._rememberPreviousNonEmptySessionId(currentId);
         this._chatController.stopClient();
-        this._live = null;
-        this._draftInput = '';
-        this._promptHistory = [];
-        this._historyIndex = -1;
-        this._modelPicker?.resetSessionState();
+        this._resetTransientComposerState();
         this._settings.set_string('session-id', GLib.uuid_string_random());
         this._panel?.clearMessages();
-        this._panel?.entry?.set_text('');
-        if (this._panel) {
-            this._panel.userScrolledUp = false;
-            this._panel.updateJumpBottomVisibility();
-        }
         this._ensureClient();
         this._panel?.entry?.grab_key_focus();
     }
@@ -1606,6 +2467,17 @@ export default class QuickChat extends Extension {
         this._sourceSignals?.clear();
 
         this._live = null;
+        this._editingTurnInfo = null;
+        this._attachments?.clear();
+        this._attachments = null;
+        this._notifGate?.reset();
+        this._notifGate = null;
+        this._dismissedRouteKeys?.clear();
+        this._dismissedRouteKeys = null;
+        this._cachedAvailableBackends?.clear();
+        this._cachedAvailableBackends = null;
+        this._diagState = null;
+
         this._chatController?.dispose();
         this._chatController = null;
 

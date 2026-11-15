@@ -28,6 +28,8 @@ export class MessageCardFactory {
         onMarkBackgroundDirty,
         onScrollBottom,
         onRetryAssistantCard,
+        onContinueAssistantCard = null,
+        onEditUserCard = null,
     }) {
         this._tracePanel = tracePanel;
         this._isChatVisible = isChatVisible;
@@ -41,6 +43,8 @@ export class MessageCardFactory {
         this._onMarkBackgroundDirty = onMarkBackgroundDirty;
         this._onScrollBottom = onScrollBottom;
         this._onRetryAssistantCard = onRetryAssistantCard;
+        this._onContinueAssistantCard = onContinueAssistantCard;
+        this._onEditUserCard = onEditUserCard;
     }
 
     copyWithFeedback(btn, getTextFn, defaultLabel = '复制') {
@@ -119,6 +123,7 @@ export class MessageCardFactory {
 
     createCard(role, text, options = {}) {
         const {
+            rawPromptText = '',
             thinking = '',
             turnId = '',
             messageId = '',
@@ -127,6 +132,9 @@ export class MessageCardFactory {
             ts = 0,
             modelId = '',
             backend = '',
+            status = 'completed',
+            partial = false,
+            finishReason = '',
             errorMessage = '',
         } = options;
 
@@ -178,6 +186,10 @@ export class MessageCardFactory {
             backend: String(backend || ''),
             effectiveTs,
             createdAt: createdAt || new Date(effectiveTs).toISOString(),
+            status: String(status || 'completed'),
+            partial: Boolean(partial),
+            finishReason: String(finishReason || ''),
+            rawPromptText: String(rawPromptText || text || ''),
             roleLabel: name,
             box,
             text: initialText,
@@ -198,6 +210,7 @@ export class MessageCardFactory {
             traceBox: null,
             detailDrawer: null,
             copyBtn: null,
+            continueBtn: null,
             renderTimer: 0,
             renderState: null,
             hasRenderedFirstToken: Boolean(initialText && initialText.trim()),
@@ -210,8 +223,43 @@ export class MessageCardFactory {
             },
         };
 
+        card.syncContinueVisibility = () => {
+            if (!card.continueBtn) return;
+            const canContinue = Boolean(
+                role === 'assistant' &&
+                !this._isCardStreaming(card) &&
+                card.text &&
+                card.text.trim() &&
+                !card.text.startsWith('⚠️ ') &&
+                (
+                    card.partial ||
+                    card.finishReason === 'length' ||
+                    card.status === 'interrupted' ||
+                    card.status === 'cancelled' ||
+                    card.status === 'timed_out'
+                )
+            );
+            card.continueBtn.visible = canContinue;
+        };
+
+        if (role === 'user' && this._onEditUserCard) {
+            const editBtn = createStButton('✎', () => this._onEditUserCard(card), 'qc-copy-btn', '编辑此问题并从此处重新生成');
+            top.add_child(editBtn);
+        }
+
         if (role === 'assistant') {
-            const retryBtn = createStButton('↻', () => this._onRetryAssistantCard(card), 'qc-copy-btn', '重新生成该回答');
+            if (this._onContinueAssistantCard) {
+                const continueBtn = createStButton(
+                    '⤵ 继续',
+                    () => this._onContinueAssistantCard(card),
+                    'qc-copy-btn',
+                    '继续生成未完成或截断的回答'
+                );
+                card.continueBtn = continueBtn;
+                card.syncContinueVisibility();
+                top.add_child(continueBtn);
+            }
+            const retryBtn = createStButton('↻', () => this._onRetryAssistantCard(card), 'qc-copy-btn', '使用原问题在当前历史位置重新生成');
             top.add_child(retryBtn);
         }
 
