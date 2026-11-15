@@ -11,6 +11,7 @@ import {parseUrlPortable, evaluatePermissionPolicy} from '../core/permissionPoli
 import {inspectEndpointSecurity, normalizeEndpointKeyIdentity, shouldStripAuthOnRedirect} from '../core/secretPolicy.js';
 import {buildRuntimeContextSignature, buildBudgetedContextMessages} from '../core/contextManager.js';
 import {SessionStore} from '../core/sessionStore.js';
+import {writePrivateFileAsync, removeFileQuietly} from '../core/paths.js';
 import {StreamingMarkdownParser} from '../core/markdownStreamParser.js';
 import {HistoryWindowController, computeAdaptiveRenderDelayMs} from '../core/renderScheduler.js';
 import {matchSlashCommands, applyQuickActionToDraft} from '../core/quickActions.js';
@@ -110,6 +111,7 @@ let asyncError = null;
         await store.appendMessage({id: 'u1', role: 'user', content: 'GJS 异步持久化测试'}, 'openai', {openaiModel: 'gpt-4o'});
         await store.appendMessage({id: 'a1', role: 'assistant', content: '持久化正常', replyTo: 'u1'}, 'openai', {openaiModel: 'gpt-4o'});
         await store.flush();
+        assert(!store.lastWriteError, `SessionStore write error: ${store.lastWriteError}`);
 
         const reloaded = new SessionStore('gjs_smoke_sess', {sessionsRootDir: tmpRoot});
         await reloaded.load('openai', {openaiModel: 'gpt-4o'});
@@ -119,8 +121,18 @@ let asyncError = null;
         hw.reset(reloaded.messages);
         assert(hw.allMessages.length === 2, 'HistoryWindowController reset');
 
-        // Cleanup isolated temp directory
+        // Verify Gio private 0600/0700 Unix mode enforcement (replaces non-GIR GLib.chmod)
+        const privFile = GLib.build_filenamev([tmpRoot, 'priv_secret_test.json']);
+        await writePrivateFileAsync(privFile, new TextEncoder().encode('{"ok":true}\n'));
+        const privInfo = Gio.File.new_for_path(privFile).query_info('unix::mode', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+        assert((privInfo.get_attribute_uint32('unix::mode') & 0o777) === 0o600, 'Private file mode 0600');
+        removeFileQuietly(privFile);
+
         const sessDir = Gio.File.new_for_path(GLib.build_filenamev([tmpRoot, 'gjs_smoke_sess']));
+        const dirInfo = sessDir.query_info('unix::mode', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+        assert((dirInfo.get_attribute_uint32('unix::mode') & 0o777) === 0o700, 'Session directory mode 0700');
+
+        // Cleanup isolated temp directory
         for (const fname of ['messages.jsonl', 'meta.json']) {
             const f = sessDir.get_child(fname);
             if (f.query_exists(null)) f.delete(null);

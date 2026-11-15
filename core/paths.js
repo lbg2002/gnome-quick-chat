@@ -80,6 +80,28 @@ export function createGioFsEnv() {
 }
 
 /**
+ * Enforces POSIX file/directory mode (`0o700` / `0o600`) via `Gio.File.set_attribute_uint32('unix::mode', ...)`
+ * with `NOFOLLOW_SYMLINKS`. (`g_chmod` is in `<glib/gstdio.h>` and is NOT introspected in `GLib-2.0.gir`.)
+ */
+export function setPrivateUnixMode(targetPath, mode) {
+    if (!targetPath) {
+        throw new Error('缺少目标路径，无法设置权限');
+    }
+    if (GLib.file_test(targetPath, GLib.FileTest.IS_SYMLINK)) {
+        throw new Error(`拒绝修改符号链接权限：${targetPath}`);
+    }
+    const ok = Gio.File.new_for_path(targetPath).set_attribute_uint32(
+        'unix::mode',
+        mode,
+        Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+        null
+    );
+    if (ok === false) {
+        throw new Error(`无法将路径权限设为 0o${mode.toString(8)}：${targetPath}`);
+    }
+}
+
+/**
  * Returns a strictly user-private runtime directory (0700).
  * Refuses symlinked directories and never falls back to shared world-writable /tmp paths.
  */
@@ -105,9 +127,7 @@ export function getPrivateRuntimeDir() {
         throw new Error(`运行时目录状态异常：${dir}`);
     }
 
-    if (GLib.chmod(dir, 0o700) !== 0) {
-        throw new Error(`无法将运行时目录权限设为 0700：${dir}`);
-    }
+    setPrivateUnixMode(dir, 0o700);
     return dir;
 }
 
@@ -124,7 +144,7 @@ export function writePrivateFileSync(filePath, bytes) {
         throw new Error(`拒绝在符号链接目录中写入敏感文件：${parent}`);
     }
     GLib.mkdir_with_parents(parent, 0o700);
-    GLib.chmod(parent, 0o700);
+    setPrivateUnixMode(parent, 0o700);
 
     if (GLib.file_test(filePath, GLib.FileTest.IS_SYMLINK) || GLib.file_test(filePath, GLib.FileTest.EXISTS)) {
         throw new Error(`目标临时文件已存在或为符号链接，已拒绝覆盖：${filePath}`);
@@ -150,9 +170,11 @@ export function writePrivateFileSync(filePath, bytes) {
         removeFileQuietly(filePath);
         throw new Error(`检测到符号链接替换，已中止敏感临时文件创建：${filePath}`);
     }
-    if (GLib.chmod(filePath, 0o600) !== 0) {
+    try {
+        setPrivateUnixMode(filePath, 0o600);
+    } catch (modeErr) {
         removeFileQuietly(filePath);
-        throw new Error(`无法将敏感临时文件设为 0600 权限：${filePath}`);
+        throw modeErr;
     }
 }
 
@@ -168,8 +190,12 @@ export function writePrivateFileAsync(filePath, bytes, cancellable = null) {
     if (GLib.file_test(parent, GLib.FileTest.IS_SYMLINK)) {
         return Promise.reject(new Error(`拒绝在符号链接目录中写入敏感文件：${parent}`));
     }
-    GLib.mkdir_with_parents(parent, 0o700);
-    GLib.chmod(parent, 0o700);
+    try {
+        GLib.mkdir_with_parents(parent, 0o700);
+        setPrivateUnixMode(parent, 0o700);
+    } catch (dirErr) {
+        return Promise.reject(dirErr);
+    }
 
     if (GLib.file_test(filePath, GLib.FileTest.IS_SYMLINK) || GLib.file_test(filePath, GLib.FileTest.EXISTS)) {
         return Promise.reject(new Error(`目标临时文件已存在或为符号链接，已拒绝覆盖：${filePath}`));
@@ -205,8 +231,10 @@ export function writePrivateFileAsync(filePath, bytes, cancellable = null) {
                         failAndCleanup(new Error(`检测到符号链接替换，已中止敏感临时文件创建：${filePath}`));
                         return;
                     }
-                    if (GLib.chmod(filePath, 0o600) !== 0) {
-                        failAndCleanup(new Error(`无法将敏感临时文件设为 0600 权限：${filePath}`));
+                    try {
+                        setPrivateUnixMode(filePath, 0o600);
+                    } catch (modeErr) {
+                        failAndCleanup(modeErr);
                         return;
                     }
                     resolve(filePath);

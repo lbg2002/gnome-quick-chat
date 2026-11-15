@@ -1,6 +1,6 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {getDataDir, getSessionsDir} from './paths.js';
+import {getDataDir, getSessionsDir, setPrivateUnixMode} from './paths.js';
 import {
     buildBudgetedContextMessages,
     buildCrossBackendPromptWithContext,
@@ -45,7 +45,7 @@ function ensurePrivateParentDir(filePath) {
     if (GLib.mkdir_with_parents(parent, 0o700) !== 0) {
         throw new Error(`无法创建会话目录：${parent}`);
     }
-    GLib.chmod(parent, 0o700);
+    setPrivateUnixMode(parent, 0o700);
     if (GLib.file_test(filePath, GLib.FileTest.IS_SYMLINK)) {
         throw new Error(`拒绝写入符号链接会话文件：${filePath}`);
     }
@@ -92,7 +92,7 @@ function replaceFileAsync(filePath, contentStr) {
                         reject(new Error(`原子替换文件返回失败：${filePath}`));
                         return;
                     }
-                    GLib.chmod(filePath, 0o600);
+                    setPrivateUnixMode(filePath, 0o600);
                     resolve();
                 } catch (err) {
                     reject(err);
@@ -154,7 +154,12 @@ function appendLineAsync(filePath, lineStr) {
                             reject(writeError || closeError);
                             return;
                         }
-                        GLib.chmod(filePath, 0o600);
+                        try {
+                            setPrivateUnixMode(filePath, 0o600);
+                        } catch (modeErr) {
+                            reject(modeErr);
+                            return;
+                        }
                         resolve();
                     });
                 });
