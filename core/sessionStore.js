@@ -1,6 +1,6 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {getDataDir, getSessionsDir, setPrivateUnixMode} from './paths.js';
+import {getDataDir, getSessionsDir, setPrivateUnixMode, writeAllBytesAsync} from './paths.js';
 import {
     buildBudgetedContextMessages,
     buildCrossBackendPromptWithContext,
@@ -127,19 +127,8 @@ function appendLineAsync(filePath, lineStr) {
                     reject(err);
                     return;
                 }
-                outStream.write_all_async(bytes, GLib.PRIORITY_DEFAULT, null, (stream, wRes) => {
-                    let writeError = null;
-                    try {
-                        const ret = stream.write_all_finish(wRes);
-                        const ok = Array.isArray(ret) ? ret[0] : ret;
-                        if (ok === false) {
-                            writeError = new Error(`追加写入未完成：${filePath}`);
-                        }
-                    } catch (err) {
-                        writeError = err;
-                    }
-
-                    stream.close_async(GLib.PRIORITY_DEFAULT, null, (st, cRes) => {
+                const closeAndFinish = writeError => {
+                    outStream.close_async(GLib.PRIORITY_DEFAULT, null, (st, cRes) => {
                         let closeError = null;
                         try {
                             const closedOk = st.close_finish(cRes);
@@ -162,7 +151,12 @@ function appendLineAsync(filePath, lineStr) {
                         }
                         resolve();
                     });
-                });
+                };
+
+                writeAllBytesAsync(outStream, bytes, GLib.PRIORITY_DEFAULT, null).then(
+                    () => closeAndFinish(null),
+                    writeErr => closeAndFinish(writeErr)
+                );
             }
         );
     });

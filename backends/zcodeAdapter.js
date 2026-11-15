@@ -21,6 +21,7 @@ import {
     getPrivateRuntimeDir,
     readFileBytesBoundedAsync,
     removeFileQuietly,
+    writeAllBytesAsync,
     writePrivateFileAsync,
     writePrivateFileSync,
 } from '../core/paths.js';
@@ -317,25 +318,21 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         const bytes = Encoder.encode(`${JSON.stringify(msgObj)}\n`);
 
         return new Promise(resolve => {
-            try {
-                turn.stdin.write_all_async(bytes, GLib.PRIORITY_DEFAULT, turn.cancellable, (stream, res) => {
+            writeAllBytesAsync(turn.stdin, bytes, GLib.PRIORITY_DEFAULT, turn.cancellable).then(
+                () => {
                     try {
-                        stream.write_all_finish(res);
-                        stream.flush_async(GLib.PRIORITY_DEFAULT, turn.cancellable, () => {});
-                        if (this._turns.matchesIdentity(turn, {turnId: turn.id})) {
-                            if (effectiveAlwaysAllow) {
-                                this._approvedScopes.add(scopeKey);
-                            }
-                            this._turns.leaveApproval(turn, cleanReqId);
+                        turn.stdin.flush_async(GLib.PRIORITY_DEFAULT, turn.cancellable, () => {});
+                    } catch (_) {}
+                    if (this._turns.matchesIdentity(turn, {turnId: turn.id})) {
+                        if (effectiveAlwaysAllow) {
+                            this._approvedScopes.add(scopeKey);
                         }
-                        resolve({sent: true});
-                    } catch (_) {
-                        resolve({sent: false});
+                        this._turns.leaveApproval(turn, cleanReqId);
                     }
-                });
-            } catch (_) {
-                resolve({sent: false});
-            }
+                    resolve({sent: true});
+                },
+                () => resolve({sent: false})
+            );
         });
     }
 }

@@ -179,6 +179,53 @@ export function writePrivateFileSync(filePath, bytes) {
 }
 
 /**
+ * Safely writes an entire `Uint8Array` asynchronously to a `Gio.OutputStream` using ref-counted
+ * `GLib.Bytes` + `write_bytes_async` in a loop until all bytes are written.
+ *
+ * Why NOT `outStream.write_all_async(uint8array, ...)`:
+ * In GJS (`gi/arg.cpp`), `(transfer none)` byte-array arguments to `_async` C functions are marshaled
+ * into a temporary C buffer freed as soon as `write_all_async()` returns to JS, causing GLib's
+ * worker thread to write freed C heap garbage (GNOME gjs#72). `GLib.Bytes` is ref-counted by the
+ * `GTask` across threads until `write_bytes_finish()` completes.
+ */
+export function writeAllBytesAsync(outStream, rawBytes, priority = GLib.PRIORITY_DEFAULT, cancellable = null) {
+    const payload = rawBytes instanceof Uint8Array ? rawBytes : new Uint8Array(rawBytes || []);
+    if (payload.byteLength === 0) {
+        return Promise.resolve(0);
+    }
+    return new Promise((resolve, reject) => {
+        let offset = 0;
+        const total = payload.byteLength;
+
+        const step = () => {
+            const slice = offset === 0 ? payload : payload.subarray(offset);
+            const gbytes = new GLib.Bytes(slice);
+            outStream.write_bytes_async(gbytes, priority, cancellable, (stream, res) => {
+                let written = 0;
+                try {
+                    written = Number(stream.write_bytes_finish(res));
+                } catch (err) {
+                    reject(err);
+                    return;
+                }
+                if (!Number.isFinite(written) || written <= 0) {
+                    reject(new Error(`异步流写入提前中断（已写 ${offset}/${total} 字节）`));
+                    return;
+                }
+                offset += written;
+                if (offset >= total) {
+                    resolve(total);
+                    return;
+                }
+                step();
+            });
+        };
+
+        step();
+    });
+}
+
+/**
  * Asynchronous counterpart to `writePrivateFileSync` (Stage D4) so sensitive 0600 temp files
  * are created without synchronous stream writes on the GNOME Shell main thread.
  */
@@ -246,16 +293,13 @@ export function writePrivateFileAsync(filePath, bytes, cancellable = null) {
                 return;
             }
 
-            outStream.write_all_async(payload, GLib.PRIORITY_DEFAULT, cancellable, (st, writeRes) => {
-                try {
-                    st.write_all_finish(writeRes);
-                } catch (writeErr) {
-                    try { st.close_async(GLib.PRIORITY_DEFAULT, null, () => {}); } catch (_) {}
+            writeAllBytesAsync(outStream, payload, GLib.PRIORITY_DEFAULT, cancellable).then(
+                () => finalizeClose(),
+                writeErr => {
+                    try { outStream.close_async(GLib.PRIORITY_DEFAULT, null, () => {}); } catch (_) {}
                     failAndCleanup(writeErr);
-                    return;
                 }
-                finalizeClose();
-            });
+            );
         });
     });
 }

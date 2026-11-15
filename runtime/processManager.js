@@ -6,7 +6,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {findExecutableInDirs} from '../core/backendDetect.js';
-import {removeFileQuietly} from '../core/paths.js';
+import {removeFileQuietly, writeAllBytesAsync} from '../core/paths.js';
 import {
     BRIDGE_EXPECTED_PROTOCOL_VERSION,
     CliTurnMonitor,
@@ -315,21 +315,19 @@ export function spawnManagedCliTurn({
         turn.stdin = stdinPipe;
     } else if (stdinPromptText && stdinPipe) {
         const promptBytes = Encoder.encode(stdinPromptText);
-        stdinPipe.write_all_async(promptBytes, GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
-            try {
-                s.write_all_finish(r);
-            } catch (writeErr) {
+        writeAllBytesAsync(stdinPipe, promptBytes, GLib.PRIORITY_DEFAULT, turn.cancellable)
+            .catch(writeErr => {
                 if (turns.isCurrent(turn) && !turn.aborted) {
                     turn.error = `向 CLI 写入提问内容失败：${writeErr.message}`;
                 }
-            } finally {
+            })
+            .finally(() => {
                 try {
-                    s.close_async(GLib.PRIORITY_DEFAULT, null, (st, cr) => {
+                    stdinPipe.close_async(GLib.PRIORITY_DEFAULT, null, (st, cr) => {
                         try { st.close_finish(cr); } catch (_) {}
                     });
                 } catch (_) {}
-            }
-        });
+            });
     } else if (stdinPipe) {
         try { stdinPipe.close(null); } catch (_) {}
     }
