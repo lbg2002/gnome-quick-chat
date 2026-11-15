@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {
     buildArgs,
+    buildAskUserModifiedInput,
     buildBudgetedContextMessages,
     buildCodexArgs,
     buildCrossBackendPromptWithContext,
@@ -12,6 +13,7 @@ import {
     computePermissionScope,
     detailedMessages,
     escapePango,
+    formatAskUserAnswerSummary,
     getBackendCapabilities,
     inlineMarkdownToPango,
     mapReasoningEffort,
@@ -19,11 +21,13 @@ import {
     messageThinking,
     normalizeEvent,
     normalizeOpenAIEndpoint,
+    parseAskUserQuestions,
     parseCodexProviderCatalog,
     parseMarkdownBlocks,
     parseOpenAISSELine,
     parseZCodeProviderCatalog,
     stripAnsi,
+    summarizeAskUserQuestions,
     visibleMessages,
 } from '../protocol.js';
 
@@ -385,4 +389,164 @@ test('Model signature, budgeted context slicing, cross-backend handoff, and capa
     assert.equal(getBackendCapabilities('zcode').supportsApproval, true);
     assert.equal(getBackendCapabilities('codex').supportsApproval, false);
     assert.equal(getBackendCapabilities('openai').supportsTools, false);
+});
+
+test('ZCode AskUserQuestion interactive Q&A parses questions, blocks session auto-allow, and builds strict modifiedInput', () => {
+    const sampleAskInput = {
+        questions: [
+            {
+                question: '桌面上的评审报告副本要怎么处理？',
+                header: '报告归类',
+                multiSelect: false,
+                options: [
+                    {label: '放入工作/报告', description: '新建“工作/报告”文件夹并移动演示文稿进去。'},
+                    {label: '保留原位', description: '不移动报告，只为其他内容建立分类。'},
+                    {label: '先不整理', description: '跳过整个整理流程。'},
+                ],
+            },
+            {
+                question: '还需要顺便清理哪些文件类型？',
+                header: '附加清理',
+                multiSelect: true,
+                options: [
+                    {label: '截图图片', description: '归档 PNG/JPG 屏幕截图'},
+                    {label: '压缩包', description: '移动 zip/tar.gz 到归档目录'},
+                ],
+            },
+        ],
+        metadata: {source: 'desktop_organizer'},
+    };
+
+    // 1. Structured question parsing & readable summary (no raw JSON!)
+    const parsed = parseAskUserQuestions(sampleAskInput);
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0].header, '报告归类');
+    assert.equal(parsed[0].options.length, 3);
+    assert.equal(parsed[1].multiSelect, true);
+    assert.equal(
+        summarizeAskUserQuestions(sampleAskInput),
+        '[报告归类] 桌面上的评审报告副本要怎么处理？ · [附加清理] 还需要顺便清理哪些文件类型？'
+    );
+    assert.equal(
+        zcodeBridge.summarizeInput('AskUserQuestion', sampleAskInput),
+        '[报告归类] 桌面上的评审报告副本要怎么处理？ · [附加清理] 还需要顺便清理哪些文件类型？'
+    );
+
+    // 2. AskUserQuestion must NEVER allow session-wide auto-approval in either protocol.js or zcodeBridge.cjs
+    assert.equal(computePermissionScope('AskUserQuestion', sampleAskInput).allowSessionRule, false);
+    assert.equal(computePermissionScope('AskUserQuestion', sampleAskInput).scopeKey, '');
+    assert.equal(zcodeBridge.computeBridgeScope('AskUserQuestion', '报告归类').allowSessionRule, false);
+    assert.equal(zcodeBridge.isInteractiveQuestionRequest('AskUserQuestion', sampleAskInput), true);
+
+    // 3. normalizeEvent('zcode', ...) preserves structured questions & rawInput on both scheduled and permission_requested
+    const startEvt = normalizeEvent('zcode', {
+        type: 'tool.updated',
+        payload: {
+            kind: 'scheduled',
+            toolCallId: 'call_ask_1',
+            toolName: 'AskUserQuestion',
+            input: sampleAskInput,
+        },
+    });
+    assert.equal(startEvt.type, 'tool_execution_start');
+    assert.equal(startEvt.isQuestion, true);
+    assert.equal(startEvt.questions.length, 2);
+    assert.ok(!startEvt.summary.startsWith('{'));
+
+    const permEvt = normalizeEvent('zcode', {
+        type: 'quickchat.permission_requested',
+        payload: {
+            requestId: 'req_ask_1',
+            toolCallId: 'call_ask_1',
+            toolName: 'AskUserQuestion',
+            reason: 'Tool AskUserQuestion requires user interaction',
+            input: sampleAskInput,
+        },
+    });
+    assert.equal(permEvt.type, 'permission_request');
+    assert.equal(permEvt.isQuestion, true);
+    assert.equal(permEvt.allowSessionRule, false);
+    assert.equal(permEvt.scopeKey, '');
+    assert.equal(permEvt.questions[0].options[0].label, '放入工作/报告');
+
+    // 4. buildAskUserModifiedInput produces strict ZCode schema payload (option + notes, multiSelect + custom, no blank answers)
+    const modifiedAnswered = buildAskUserModifiedInput(sampleAskInput, {
+        '桌面上的评审报告副本要怎么处理？': {
+            selectedLabels: ['放入工作/报告'],
+            customText: '顺便去掉文件名里的副本后缀',
+        },
+        '还需要顺便清理哪些文件类型？': {
+            selectedLabels: ['截图图片', '压缩包'],
+            customText: '临时日志 .log',
+        },
+    });
+    assert.deepEqual(Object.keys(modifiedAnswered).sort(), ['annotations', 'answers', 'metadata', 'questions']);
+    assert.deepEqual(modifiedAnswered.answers, {
+        '桌面上的评审报告副本要怎么处理？': '放入工作/报告',
+        '还需要顺便清理哪些文件类型？': '截图图片, 压缩包, 临时日志 .log',
+    });
+    assert.deepEqual(modifiedAnswered.annotations, {
+        '桌面上的评审报告副本要怎么处理？': {notes: '顺便去掉文件名里的副本后缀'},
+    });
+    assert.deepEqual(modifiedAnswered.metadata, {source: 'desktop_organizer'});
+
+    const summaryText = formatAskUserAnswerSummary(parsed, modifiedAnswered);
+    assert.ok(summaryText.includes('✓ 报告归类：放入工作/报告（备注：顺便去掉文件名里的副本后缀）'));
+    assert.ok(summaryText.includes('✓ 附加清理：截图图片, 压缩包, 临时日志 .log'));
+
+    // Pure custom free-text answer without selecting a preset option
+    const modifiedCustomOnly = buildAskUserModifiedInput(sampleAskInput, {
+        '桌面上的评审报告副本要怎么处理？': {
+            selectedLabels: [],
+            customText: '移动到 ~/Archive/2026 目录',
+        },
+        '还需要顺便清理哪些文件类型？': {
+            selectedLabels: [],
+            customText: '   ', // Blank whitespace must be omitted, never ""!
+        },
+    });
+    assert.deepEqual(modifiedCustomOnly.answers, {
+        '桌面上的评审报告副本要怎么处理？': '移动到 ~/Archive/2026 目录',
+    });
+    assert.equal(modifiedCustomOnly.annotations, undefined);
+
+    // Skip all -> `answers: {}` (validates cleanly in ZCode and instructs AI to use best judgment)
+    const modifiedSkipped = buildAskUserModifiedInput(sampleAskInput, {}, {skipAll: true});
+    assert.deepEqual(modifiedSkipped.answers, {});
+    assert.equal(formatAskUserAnswerSummary(parsed, modifiedSkipped), '⏭ 已交由 AI 自行判断');
+
+    // 5. zcodeBridge.buildBrokerResolution returns `decision: "modify"` + `modifiedInput`
+    const mockEntry = {
+        req: {requestId: 'req_ask_1', toolName: 'AskUserQuestion', ruleId: 'tool.userInteraction', input: sampleAskInput},
+        scope: {scopeKey: '', allowSessionRule: false},
+    };
+    const brokerMod = zcodeBridge.buildBrokerResolution(mockEntry, {
+        type: 'permission_response',
+        requestId: 'req_ask_1',
+        decision: 'modify',
+        modifiedInput: modifiedAnswered,
+    });
+    assert.equal(brokerMod.decision, 'modify');
+    assert.deepEqual(brokerMod.modifiedInput, modifiedAnswered);
+
+    // Defense-in-depth: even if an older caller sends `decision: "allow"`, AskUserQuestion upgrades to `modify` with `answers: {}`
+    const brokerFallback = zcodeBridge.buildBrokerResolution(mockEntry, {
+        type: 'permission_response',
+        requestId: 'req_ask_1',
+        decision: 'allow',
+    });
+    assert.equal(brokerFallback.decision, 'modify');
+    assert.deepEqual(brokerFallback.modifiedInput.answers, {});
+
+    // ZCode `permission.resolved` with `decision: "modify"` normalizes cleanly
+    const resolvedEvt = normalizeEvent('zcode', {
+        type: 'permission.resolved',
+        payload: {requestId: 'req_ask_1', toolCallId: 'call_ask_1', decision: 'modify'},
+    });
+    assert.deepEqual(resolvedEvt, {
+        type: 'permission_resolved',
+        requestId: 'req_ask_1',
+        toolCallId: 'call_ask_1',
+        decision: 'modify',
+    });
 });

@@ -125,12 +125,148 @@ export function mapReasoningEffort(effort) {
 
 const DESTRUCTIVE_SHELL_RE = /(?:^|[;&|]\s*)(?:sudo|su|rm\s+-[a-zA-Z]*[rf]|mkfs|dd\s+|fdisk|parted|shutdown|reboot|chmod\s+-R|chown\s+-R|>\s*\/etc\/)/i;
 
+export function isAskUserQuestionTool(toolName, input = null) {
+    const lower = String(toolName || '').trim().toLowerCase();
+    if (lower === 'askuserquestion') return true;
+    return Boolean(input && typeof input === 'object' && Array.isArray(input.questions) && input.questions.length > 0);
+}
+
+export function parseAskUserQuestions(input) {
+    const rawList = Array.isArray(input?.questions) ? input.questions : [];
+    const result = [];
+    for (const item of rawList) {
+        if (!item || typeof item !== 'object') continue;
+        const question = String(item.question || '').trim();
+        if (!question) continue;
+        const header = String(item.header || '').trim();
+        const multiSelect = Boolean(item.multiSelect);
+        const rawOptions = Array.isArray(item.options) ? item.options : [];
+        const options = [];
+        for (const opt of rawOptions) {
+            if (!opt || typeof opt !== 'object') continue;
+            const label = String(opt.label || '').trim();
+            if (!label) continue;
+            const normalizedOpt = {
+                label,
+                description: String(opt.description || '').trim(),
+            };
+            if (typeof opt.preview === 'string' && opt.preview.trim()) {
+                normalizedOpt.preview = opt.preview.trim();
+            }
+            options.push(normalizedOpt);
+        }
+        result.push({question, header, multiSelect, options});
+    }
+    return result;
+}
+
+export function summarizeAskUserQuestions(input) {
+    const questions = parseAskUserQuestions(input);
+    if (!questions.length) return '';
+    if (questions.length === 1) {
+        const q = questions[0];
+        return q.header ? `[${q.header}] ${q.question}` : q.question;
+    }
+    return questions
+        .map(q => (q.header ? `[${q.header}] ${q.question}` : q.question))
+        .join(' · ');
+}
+
+/**
+ * Builds a strict ZCode-compatible `modifiedInput` object for `AskUserQuestion`.
+ * Preserves only schema-permitted keys (`questions`, `answers`, `annotations`, `metadata`)
+ * and guarantees no blank string values exist in `answers`.
+ */
+export function buildAskUserModifiedInput(rawInput, drafts = {}, {skipAll = false} = {}) {
+    const baseQuestions = Array.isArray(rawInput?.questions) ? rawInput.questions : [];
+    const parsedQuestions = parseAskUserQuestions(rawInput);
+    const answers = {};
+    const annotations = {};
+
+    if (!skipAll) {
+        for (const q of parsedQuestions) {
+            const draft = drafts?.[q.question] || {};
+            const selectedLabels = (Array.isArray(draft.selectedLabels) ? draft.selectedLabels : [])
+                .map(s => String(s || '').trim())
+                .filter(Boolean);
+            const customText = String(draft.customText || '').trim();
+
+            if (q.multiSelect) {
+                const combined = [...selectedLabels, ...(customText ? [customText] : [])];
+                if (combined.length > 0) {
+                    answers[q.question] = combined.join(', ');
+                }
+            } else if (selectedLabels.length > 0) {
+                answers[q.question] = selectedLabels[0];
+                const matchedOpt = q.options.find(o => o.label === selectedLabels[0]);
+                const noteObj = {};
+                if (matchedOpt?.preview) noteObj.preview = matchedOpt.preview;
+                if (customText) noteObj.notes = customText;
+                if (Object.keys(noteObj).length > 0) {
+                    annotations[q.question] = noteObj;
+                }
+            } else if (customText) {
+                answers[q.question] = customText;
+            }
+        }
+    }
+
+    const modified = {
+        questions: baseQuestions,
+        answers,
+    };
+    if (Object.keys(annotations).length > 0) {
+        modified.annotations = annotations;
+    }
+    if (rawInput?.metadata && typeof rawInput.metadata === 'object') {
+        const cleanMeta = {};
+        if (typeof rawInput.metadata.source === 'string') {
+            cleanMeta.source = rawInput.metadata.source;
+        }
+        modified.metadata = cleanMeta;
+    }
+    return modified;
+}
+
+export function formatAskUserAnswerSummary(questions = [], modifiedInput = null) {
+    const answers = modifiedInput?.answers || {};
+    const annotations = modifiedInput?.annotations || {};
+    const entries = Object.entries(answers).filter(([, v]) => String(v || '').trim().length > 0);
+    if (entries.length === 0) {
+        return '⏭ 已交由 AI 自行判断';
+    }
+    const lines = [];
+    const list = Array.isArray(questions) && questions.length > 0
+        ? questions
+        : entries.map(([qText]) => ({question: qText, header: ''}));
+    for (const q of list) {
+        const val = answers[q.question];
+        const prefix = q.header || q.question;
+        if (!val) {
+            lines.push(`• ${prefix}：（未指定，交由 AI 判断）`);
+            continue;
+        }
+        const notes = annotations[q.question]?.notes;
+        lines.push(notes ? `✓ ${prefix}：${val}（备注：${notes}）` : `✓ ${prefix}：${val}`);
+    }
+    return lines.join('\n');
+}
+
 /**
  * Computes graded, command/action-scoped session approval keys.
- * Prevents broad tool-level `alwaysAllow` on dangerous tools like Bash/Edit/Write.
+ * Prevents broad tool-level `alwaysAllow` on dangerous tools like Bash/Edit/Write
+ * and interactive tools like AskUserQuestion.
  */
 export function computePermissionScope(toolName, summaryOrInput = '') {
     const tool = String(toolName || '工具').trim();
+    if (isAskUserQuestionTool(tool, typeof summaryOrInput === 'object' ? summaryOrInput : null)) {
+        return {
+            scopeKey: '',
+            allowSessionRule: false,
+            sessionRuleLabel: '',
+        };
+    }
+
     const rawSummary = typeof summaryOrInput === 'string'
         ? summaryOrInput.trim()
         : String(summaryOrInput?.command || summaryOrInput?.url || summaryOrInput?.file_path || summaryOrInput?.path || '').trim();
@@ -601,24 +737,40 @@ export function normalizeEvent(backend, record) {
         if (type === 'quickchat.permission_requested') {
             const p = record.payload || {};
             if (!p.requestId) return null;
-            let summary = p.summary || '';
+            const toolName = String(p.toolName || '工具');
+            const questions = parseAskUserQuestions(p.input);
+            const isQuestion = isAskUserQuestionTool(toolName, p.input) && questions.length > 0;
+            let summary = isQuestion
+                ? summarizeAskUserQuestions(p.input)
+                : (p.summary || '');
             if (!summary && p.input && typeof p.input === 'object') {
                 summary = p.input.command || p.input.url || p.input.file_path || p.input.path || p.input.pattern || p.input.query || p.input.title || '';
             }
-            const toolName = String(p.toolName || '工具');
-            const scope = computePermissionScope(toolName, summary || p.input || '');
-            return {
+            const scope = isQuestion
+                ? {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''}
+                : computePermissionScope(toolName, summary || p.input || '');
+            const evt = {
                 type: 'permission_request',
                 requestId: String(p.requestId),
                 toolCallId: String(p.toolCallId || ''),
                 toolName,
                 riskLevel: String(p.riskLevel || 'medium'),
-                reason: String(p.reason || '该操作需要您的授权'),
+                reason: String(p.reason || (isQuestion ? '请选择或输入您的回答以继续' : '该操作需要您的授权')),
                 summary: String(summary || ''),
-                scopeKey: p.scopeKey ? String(p.scopeKey) : scope.scopeKey,
-                allowSessionRule: typeof p.allowSessionRule === 'boolean' ? p.allowSessionRule : scope.allowSessionRule,
-                sessionRuleLabel: p.sessionRuleLabel ? String(p.sessionRuleLabel) : scope.sessionRuleLabel,
+                scopeKey: isQuestion ? '' : (p.scopeKey ? String(p.scopeKey) : scope.scopeKey),
+                allowSessionRule: isQuestion
+                    ? false
+                    : (typeof p.allowSessionRule === 'boolean' ? p.allowSessionRule : scope.allowSessionRule),
+                sessionRuleLabel: isQuestion
+                    ? ''
+                    : (p.sessionRuleLabel ? String(p.sessionRuleLabel) : scope.sessionRuleLabel),
             };
+            if (isQuestion) {
+                evt.isQuestion = true;
+                evt.questions = questions;
+                evt.rawInput = p.input;
+            }
+            return evt;
         }
         if (type === 'permission.resolved' || type === 'permission.denied') {
             const p = record.payload || {};
@@ -634,8 +786,11 @@ export function normalizeEvent(backend, record) {
             const kind = p.kind;
             const toolName = p.toolName || p.name || p.tool || '工具';
             const toolCallId = p.toolCallId ? String(p.toolCallId) : '';
+            const isQuestionTool = isAskUserQuestionTool(toolName, p.input);
             let summary = '';
-            if (p.input && typeof p.input === 'object') {
+            if (isQuestionTool && p.input && typeof p.input === 'object') {
+                summary = summarizeAskUserQuestions(p.input);
+            } else if (p.input && typeof p.input === 'object') {
                 summary = p.input.command || p.input.url || p.input.file_path || p.input.path || p.input.pattern || p.input.query || p.input.code || p.input.title || '';
             } else if (typeof p.input === 'string') {
                 summary = p.input;
@@ -646,6 +801,14 @@ export function normalizeEvent(backend, record) {
                 const evt = {type: 'tool_execution_start', toolName: String(toolName)};
                 if (toolCallId) evt.toolCallId = toolCallId;
                 if (summary) evt.summary = String(summary);
+                if (isQuestionTool) {
+                    const questions = parseAskUserQuestions(p.input);
+                    if (questions.length > 0) {
+                        evt.isQuestion = true;
+                        evt.questions = questions;
+                        evt.rawInput = p.input;
+                    }
+                }
                 return evt;
             }
             if (kind === 'result' || kind === 'error') {

@@ -444,18 +444,32 @@ export class PiClient {
         return {};
     }
 
-    _sendTurnPermissionResponse({requestId = '', decision = 'deny', alwaysAllow = false, scopeKey = ''} = {}) {
+    _sendTurnPermissionResponse({
+        requestId = '',
+        decision = 'deny',
+        alwaysAllow = false,
+        scopeKey = '',
+        modifiedInput = undefined,
+        reason = '',
+    } = {}) {
         const turn = this._turns.activeTurn;
         if (!turn || turn.finalized || !turn.stdin) {
             return Promise.resolve({sent: false});
         }
 
-        const payload = JSON.stringify({
+        const msgObj = {
             type: 'permission_response',
             requestId,
             decision,
             alwaysAllow: Boolean(alwaysAllow),
-        }) + '\n';
+        };
+        if (modifiedInput !== undefined) {
+            msgObj.modifiedInput = modifiedInput;
+        }
+        if (reason) {
+            msgObj.reason = String(reason);
+        }
+        const payload = JSON.stringify(msgObj) + '\n';
         const bytes = Encoder.encode(payload);
 
         return new Promise(resolve => {

@@ -9,8 +9,10 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {PiClient} from './piClient.js';
 import {
+    buildAskUserModifiedInput,
     computePermissionScope,
     detailedMessages,
+    formatAskUserAnswerSummary,
     getBackendCapabilities,
     messageText,
     messageThinking,
@@ -1305,11 +1307,13 @@ export default class QuickChat extends Extension {
     }
 
     _renderCardBody(card) {
-        const hasPendingApproval = card.toolNodes?.some(
+        const pendingNode = card.toolNodes?.find(
             n => n.status === 'pending_approval' || n.status === 'sending_approval'
         );
-        const placeholderText = hasPendingApproval
-            ? '请在上方展开的审批栏中选择是否允许执行…'
+        const placeholderText = pendingNode
+            ? (pendingNode.isQuestion
+                ? '请在上方问题卡片中选择或输入您的回答…'
+                : '请在上方展开的审批栏中选择是否允许执行…')
             : card.activeTool
                 ? `正在执行 ${card.toolNodes?.at(-1)?.toolName || '工具'}…`
                 : card.thinking
@@ -1376,23 +1380,38 @@ export default class QuickChat extends Extension {
             const node = tools.find(n => n.id === targetId);
             if (node) {
                 const brief = this._formatShortHint(node.summary, 28);
-                card.traceHintLabel.text = brief
-                    ? `${node.toolName}: ${brief}`
-                    : `${node.toolName}（点击小圆切换详情）`;
+                if (node.isQuestion) {
+                    card.traceHintLabel.text = brief
+                        ? `问答: ${brief}`
+                        : '交互式提问（点击小圆查看）';
+                } else {
+                    card.traceHintLabel.text = brief
+                        ? `${node.toolName}: ${brief}`
+                        : `${node.toolName}（点击小圆切换详情）`;
+                }
                 return;
             }
         }
 
         const pendingNode = tools.find(n => n.status === 'pending_approval' || n.status === 'sending_approval');
         if (pendingNode) {
-            card.traceHintLabel.text = pendingNode.status === 'sending_approval'
-                ? `⏳ 正在发送授权: ${pendingNode.toolName}`
-                : `⚠️ 待审批: ${pendingNode.toolName}`;
+            if (pendingNode.isQuestion) {
+                const brief = this._formatShortHint(pendingNode.summary, 24);
+                card.traceHintLabel.text = pendingNode.status === 'sending_approval'
+                    ? '⏳ 正在提交回答…'
+                    : (brief ? `💬 待回答: ${brief}` : '💬 待您回答问题');
+            } else {
+                card.traceHintLabel.text = pendingNode.status === 'sending_approval'
+                    ? `⏳ 正在发送授权: ${pendingNode.toolName}`
+                    : `⚠️ 待审批: ${pendingNode.toolName}`;
+            }
             return;
         }
         const runningNode = tools.find(n => n.status === 'running');
         if (runningNode) {
-            card.traceHintLabel.text = `正在执行 ${runningNode.toolName}…`;
+            card.traceHintLabel.text = runningNode.isQuestion
+                ? '正在提交回答并继续…'
+                : `正在执行 ${runningNode.toolName}…`;
             return;
         }
 
@@ -1400,6 +1419,212 @@ export default class QuickChat extends Extension {
         if (hasThinking) segs.push('思考');
         if (tools.length > 0) segs.push(`${tools.length} 项工具`);
         card.traceHintLabel.text = segs.length ? `${segs.join(' · ')}（点击小圆查看）` : '';
+    }
+
+    _hideQuestionForm(card) {
+        if (!card) return;
+        if (card.questionFormBox) {
+            if (card.renderedQuestionNodeId) {
+                card.questionFormBox.destroy_all_children();
+                card.renderedQuestionNodeId = null;
+                card.renderedQuestionWidgets = null;
+            }
+            card.questionFormBox.visible = false;
+        }
+        if (card.questionActions) {
+            card.questionActions.visible = false;
+        }
+    }
+
+    _syncQuestionFormState(card, node) {
+        if (!card || !node) return;
+        const interactive = node.status === 'pending_approval';
+        for (const w of card.renderedQuestionWidgets || []) {
+            const draft = node.questionDrafts?.[w.question] || {selectedLabels: [], customText: ''};
+            for (const oRef of w.optionRefs) {
+                const selected = draft.selectedLabels.includes(oRef.label);
+                oRef.indLbl.text = w.multiSelect ? (selected ? '☑' : '☐') : (selected ? '●' : '○');
+                if (selected) {
+                    oRef.btn.add_style_class_name('qc-question-opt-selected');
+                } else {
+                    oRef.btn.remove_style_class_name('qc-question-opt-selected');
+                }
+                oRef.btn.reactive = interactive;
+            }
+            if (w.customEntry) {
+                w.customEntry.reactive = interactive;
+                if (w.multiSelect) {
+                    w.customEntry.hint_text = '补充其他自定义项（可选，回车提交）…';
+                } else if (draft.selectedLabels.length > 0) {
+                    w.customEntry.hint_text = '已选上方选项，可在此补充备注（可选，回车提交）…';
+                } else {
+                    w.customEntry.hint_text = '或直接在此输入自定义回答（回车提交）…';
+                }
+            }
+        }
+
+        if (card.submitAnswerBtn) card.submitAnswerBtn.reactive = interactive;
+        if (card.skipAnswerBtn) card.skipAnswerBtn.reactive = interactive;
+        if (card.cancelQuestionBtn) card.cancelQuestionBtn.reactive = interactive;
+
+        const warnLines = [];
+        if (node.deliveryError) warnLines.push(`⚠️ ${node.deliveryError}`);
+        if (node.validationHint) warnLines.push(`💡 ${node.validationHint}`);
+        if (warnLines.length > 0) {
+            card.drawerBody.text = warnLines.join('\n');
+            card.drawerBody.visible = true;
+        } else {
+            card.drawerBody.visible = false;
+        }
+    }
+
+    _ensureQuestionFormRendered(card, node) {
+        if (!card?.questionFormBox || !node?.questions?.length) return;
+        if (!node.questionDrafts) {
+            node.questionDrafts = {};
+        }
+
+        if (card.renderedQuestionNodeId === node.id && Array.isArray(card.renderedQuestionWidgets)) {
+            this._syncQuestionFormState(card, node);
+            return;
+        }
+
+        card.questionFormBox.destroy_all_children();
+        card.renderedQuestionNodeId = node.id;
+        card.renderedQuestionWidgets = [];
+
+        for (const q of node.questions) {
+            if (!node.questionDrafts[q.question]) {
+                node.questionDrafts[q.question] = {selectedLabels: [], customText: ''};
+            }
+            const draft = node.questionDrafts[q.question];
+
+            const itemBox = new St.BoxLayout({
+                orientation: V,
+                style_class: 'qc-question-item',
+                x_expand: true,
+            });
+
+            const metaRow = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-question-meta-row',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            if (q.header) {
+                metaRow.add_child(new St.Label({
+                    text: q.header,
+                    style_class: 'qc-question-badge',
+                    y_align: Clutter.ActorAlign.CENTER,
+                }));
+            }
+            metaRow.add_child(new St.Label({
+                text: q.multiSelect ? '可多选' : '单选',
+                style_class: 'qc-question-mode',
+                y_align: Clutter.ActorAlign.CENTER,
+            }));
+            itemBox.add_child(metaRow);
+
+            const promptLbl = wrapLabel(q.question, 'qc-question-prompt');
+            itemBox.add_child(promptLbl);
+
+            const optsBox = new St.BoxLayout({
+                orientation: V,
+                style_class: 'qc-question-options',
+                x_expand: true,
+            });
+            const optionRefs = [];
+            for (const opt of q.options || []) {
+                const optBtn = new St.Button({
+                    style_class: 'qc-question-opt',
+                    x_expand: true,
+                    can_focus: true,
+                    reactive: true,
+                    track_hover: true,
+                    accessible_name: opt.label,
+                });
+                const optRow = new St.BoxLayout({
+                    orientation: H,
+                    style_class: 'qc-question-opt-row',
+                    x_expand: true,
+                    y_align: Clutter.ActorAlign.START,
+                });
+                const indLbl = new St.Label({
+                    text: q.multiSelect ? '☐' : '○',
+                    style_class: 'qc-question-indicator',
+                    y_align: Clutter.ActorAlign.START,
+                });
+                const txtCol = new St.BoxLayout({
+                    orientation: V,
+                    style_class: 'qc-question-opt-text',
+                    x_expand: true,
+                });
+                txtCol.add_child(wrapLabel(opt.label, 'qc-question-opt-label'));
+                if (opt.description) {
+                    txtCol.add_child(wrapLabel(opt.description, 'qc-question-opt-desc'));
+                }
+                optRow.add_child(indLbl);
+                optRow.add_child(txtCol);
+                optBtn.set_child(optRow);
+
+                optBtn.connect('clicked', () => {
+                    if (node.status !== 'pending_approval') return;
+                    node.validationHint = '';
+                    if (q.multiSelect) {
+                        const idx = draft.selectedLabels.indexOf(opt.label);
+                        if (idx >= 0) {
+                            draft.selectedLabels.splice(idx, 1);
+                        } else {
+                            draft.selectedLabels.push(opt.label);
+                        }
+                    } else if (draft.selectedLabels[0] === opt.label) {
+                        draft.selectedLabels = [];
+                    } else {
+                        draft.selectedLabels = [opt.label];
+                    }
+                    this._syncQuestionFormState(card, node);
+                });
+
+                optsBox.add_child(optBtn);
+                optionRefs.push({label: opt.label, btn: optBtn, indLbl});
+            }
+            if (optionRefs.length > 0) {
+                itemBox.add_child(optsBox);
+            }
+
+            const customEntry = new St.Entry({
+                style_class: 'qc-question-entry',
+                hint_text: '或直接在此输入自定义回答（回车提交）…',
+                can_focus: true,
+                x_expand: true,
+            });
+            if (draft.customText) {
+                customEntry.set_text(draft.customText);
+            }
+            const ct = customEntry.clutter_text;
+            ct.connect('text-changed', () => {
+                draft.customText = customEntry.get_text();
+                if (node.validationHint && draft.customText.trim()) {
+                    node.validationHint = '';
+                }
+                this._syncQuestionFormState(card, node);
+            });
+            ct.connect('activate', () => {
+                if (node.status === 'pending_approval') {
+                    this._submitQuestionDecision(card, 'answer');
+                }
+            });
+            itemBox.add_child(customEntry);
+
+            card.questionFormBox.add_child(itemBox);
+            card.renderedQuestionWidgets.push({
+                question: q.question,
+                multiSelect: q.multiSelect,
+                optionRefs,
+                customEntry,
+            });
+        }
+
+        this._syncQuestionFormState(card, node);
     }
 
     _updateCardActivity(card) {
@@ -1433,11 +1658,13 @@ export default class QuickChat extends Extension {
         // 4. Update collapsible detail drawer below dots
         const selId = card.selectedNodeId;
         if (!selId) {
+            this._hideQuestionForm(card);
             card.detailDrawer.visible = false;
             return;
         }
 
         if (selId === 'thinking') {
+            this._hideQuestionForm(card);
             if (!hasThinking) {
                 card.detailDrawer.visible = false;
                 return;
@@ -1454,6 +1681,7 @@ export default class QuickChat extends Extension {
 
         const node = tools.find(n => n.id === selId);
         if (!node) {
+            this._hideQuestionForm(card);
             card.detailDrawer.visible = false;
             return;
         }
@@ -1467,6 +1695,63 @@ export default class QuickChat extends Extension {
         }
 
         const durSuffix = node.duration > 0 ? ` (${(node.duration / 1000).toFixed(1)}s)` : '';
+
+        if (node.isQuestion && Array.isArray(node.questions) && node.questions.length > 0) {
+            let qTitle = '💬 交互式提问';
+            if (node.status === 'sending_approval') {
+                qTitle = '⏳ 正在提交您的回答…';
+            } else if (node.status === 'pending_approval') {
+                qTitle = node.questions.length > 1
+                    ? `💬 请回答以下问题（共 ${node.questions.length} 项）`
+                    : '💬 请选择或输入您的回答';
+            } else if (node.status === 'running') {
+                qTitle = '⏳ 已收到回答，AI 正在继续处理…';
+            } else if (node.status === 'denied') {
+                qTitle = '✕ 已取消本次提问';
+            } else if (node.status === 'error') {
+                qTitle = `⚠️ 提问处理异常${durSuffix}`;
+            } else if (node.approvalState === 'skipped') {
+                qTitle = `⏭ 已交由 AI 自行判断${durSuffix}`;
+            } else {
+                qTitle = `✓ 已回答问题${durSuffix}`;
+            }
+            card.drawerTitle.text = qTitle;
+
+            if (isAwaiting) {
+                card.drawerSummary.visible = false;
+                card.drawerActions.visible = false;
+                card.questionFormBox.visible = true;
+                card.questionActions.visible = true;
+                this._ensureQuestionFormRendered(card, node);
+                return;
+            }
+
+            this._hideQuestionForm(card);
+            card.drawerActions.visible = false;
+            if (node.summary) {
+                card.drawerSummary.text = node.summary;
+                card.drawerSummary.visible = true;
+            } else {
+                card.drawerSummary.visible = false;
+            }
+
+            const doneLines = [];
+            if (node.userAnswerSummary) {
+                doneLines.push(node.userAnswerSummary);
+            }
+            if (node.status === 'error' && node.detail) {
+                doneLines.push(`⚠️ ${node.detail}`);
+            }
+            if (doneLines.length > 0) {
+                card.drawerBody.text = doneLines.join('\n');
+                card.drawerBody.visible = true;
+            } else {
+                card.drawerBody.visible = false;
+            }
+            return;
+        }
+
+        this._hideQuestionForm(card);
         let statusTitle = `🔧 ${node.toolName}`;
         if (node.status === 'sending_approval') {
             statusTitle = `⏳ 正在发送授权：${node.toolName}…`;
@@ -1671,6 +1956,14 @@ export default class QuickChat extends Extension {
             drawerSummary.visible = false;
             detailDrawer.add_child(drawerSummary);
 
+            const questionFormBox = new St.BoxLayout({
+                orientation: V,
+                style_class: 'qc-question-form',
+                x_expand: true,
+                visible: false,
+            });
+            detailDrawer.add_child(questionFormBox);
+
             const drawerBody = wrapLabel('', 'qc-drawer-body');
             drawerBody.visible = false;
             detailDrawer.add_child(drawerBody);
@@ -1704,6 +1997,35 @@ export default class QuickChat extends Extension {
             drawerActions.add_child(denyBtn);
             detailDrawer.add_child(drawerActions);
 
+            const questionActions = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-approval-actions',
+                y_align: Clutter.ActorAlign.CENTER,
+                visible: false,
+            });
+            const submitAnswerBtn = button(
+                '✓ 提交回答',
+                () => this._submitQuestionDecision(card, 'answer'),
+                'qc-approval-btn qc-approval-allow',
+                '提交所选回答并继续'
+            );
+            const skipAnswerBtn = button(
+                '⏭ 交由 AI 判断',
+                () => this._submitQuestionDecision(card, 'skip'),
+                'qc-approval-btn qc-approval-always',
+                '不指定偏好，交由 AI 自行判断'
+            );
+            const cancelQuestionBtn = button(
+                '✕ 取消',
+                () => this._submitQuestionDecision(card, 'deny'),
+                'qc-approval-btn qc-approval-deny',
+                '取消本次提问'
+            );
+            questionActions.add_child(submitAnswerBtn);
+            questionActions.add_child(skipAnswerBtn);
+            questionActions.add_child(cancelQuestionBtn);
+            detailDrawer.add_child(questionActions);
+
             traceBox.add_child(detailDrawer);
             box.add_child(traceBox);
 
@@ -1715,11 +2037,18 @@ export default class QuickChat extends Extension {
             card.detailDrawer = detailDrawer;
             card.drawerTitle = drawerTitle;
             card.drawerSummary = drawerSummary;
+            card.questionFormBox = questionFormBox;
+            card.renderedQuestionNodeId = null;
+            card.renderedQuestionWidgets = null;
             card.drawerBody = drawerBody;
             card.drawerActions = drawerActions;
             card.allowBtn = allowBtn;
             card.alwaysBtn = alwaysBtn;
             card.denyBtn = denyBtn;
+            card.questionActions = questionActions;
+            card.submitAnswerBtn = submitAnswerBtn;
+            card.skipAnswerBtn = skipAnswerBtn;
+            card.cancelQuestionBtn = cancelQuestionBtn;
         }
 
         const bodyBox = new St.BoxLayout({
@@ -1968,6 +2297,12 @@ export default class QuickChat extends Extension {
                     ? info.allowSessionRule
                     : defaultScope.allowSessionRule,
                 sessionRuleLabel: info.sessionRuleLabel || defaultScope.sessionRuleLabel,
+                isQuestion: Boolean(info.isQuestion),
+                questions: Array.isArray(info.questions) ? info.questions : [],
+                rawInput: info.rawInput && typeof info.rawInput === 'object' ? info.rawInput : null,
+                questionDrafts: null,
+                validationHint: '',
+                userAnswerSummary: '',
                 deliveryError: '',
                 dotBtn: null,
             };
@@ -1978,7 +2313,7 @@ export default class QuickChat extends Extension {
                     can_focus: true,
                     reactive: true,
                     track_hover: true,
-                    accessible_name: `工具 ${node.toolName}`,
+                    accessible_name: node.isQuestion ? '交互式提问' : `工具 ${node.toolName}`,
                     y_align: Clutter.ActorAlign.CENTER,
                 });
                 dotBtn.connect('clicked', () => {
@@ -2004,7 +2339,21 @@ export default class QuickChat extends Extension {
             }
         }
 
-        if (info.summary && !node.summary) {
+        if (info.isQuestion) {
+            node.isQuestion = true;
+            node.allowSessionRule = false;
+            node.scopeKey = '';
+            node.sessionRuleLabel = '';
+            if (Array.isArray(info.questions) && info.questions.length > 0) {
+                node.questions = info.questions;
+            }
+            if (info.rawInput && typeof info.rawInput === 'object') {
+                node.rawInput = info.rawInput;
+            }
+            if (info.summary) {
+                node.summary = info.summary;
+            }
+        } else if (info.summary && !node.summary) {
             node.summary = info.summary;
         }
         if (info.reason && !node.reason) {
@@ -2013,19 +2362,104 @@ export default class QuickChat extends Extension {
         if (info.detail) {
             node.detail = info.detail;
         }
-        if (typeof info.scopeKey === 'string' && info.scopeKey) {
+        if (!node.isQuestion && typeof info.scopeKey === 'string' && info.scopeKey) {
             node.scopeKey = info.scopeKey;
         }
-        if (typeof info.allowSessionRule === 'boolean') {
+        if (!node.isQuestion && typeof info.allowSessionRule === 'boolean') {
             node.allowSessionRule = info.allowSessionRule;
         }
-        if (info.sessionRuleLabel) {
+        if (!node.isQuestion && info.sessionRuleLabel) {
             node.sessionRuleLabel = info.sessionRuleLabel;
         }
         if (typeof info.duration === 'number' && info.duration > 0) {
             node.duration = info.duration;
         }
         return node;
+    }
+
+    async _submitQuestionDecision(card, action = 'answer') {
+        if (!card?.toolNodes) return;
+        const target = card.toolNodes.find(
+            n => n.id === card.selectedNodeId && n.status === 'pending_approval'
+        ) || card.toolNodes.find(n => n.isQuestion && n.status === 'pending_approval');
+        if (!target) return;
+
+        if (action === 'deny') {
+            await this._submitActiveToolDecision(card, 'deny', false);
+            return;
+        }
+
+        const skipAll = action === 'skip';
+        const modifiedInput = buildAskUserModifiedInput(
+            target.rawInput || {questions: target.questions},
+            target.questionDrafts || {},
+            {skipAll}
+        );
+
+        if (!skipAll && Object.keys(modifiedInput.answers || {}).length === 0) {
+            target.validationHint = '请至少选择一项或输入自定义回答；若无需指定可点击「交由 AI 判断」';
+            this._syncQuestionFormState(card, target);
+            return;
+        }
+
+        target.validationHint = '';
+        const answerSummary = formatAskUserAnswerSummary(target.questions, modifiedInput);
+
+        target.status = 'sending_approval';
+        target.deliveryError = '';
+        card.dirty.tools = true;
+        if (!card.text) card.dirty.text = true;
+        card.scheduleRender();
+        this._setStatusIndicator('busy', skipAll ? '正在通知 AI 自行判断…' : '正在提交您的回答…');
+
+        let sent = false;
+        try {
+            const res = await this._client?.request('permission_response', {
+                requestId: target.requestId,
+                decision: 'modify',
+                alwaysAllow: false,
+                scopeKey: '',
+                toolName: target.toolName,
+                modifiedInput,
+                reason: skipAll ? '用户选择交由 AI 自行判断' : '用户在随问中提交了问题回答',
+            });
+            sent = Boolean(res?.sent);
+        } catch (_) {
+            sent = false;
+        }
+
+        if (!this._enabled) return;
+
+        if (!sent) {
+            target.status = 'pending_approval';
+            target.deliveryError = '回答未送达后端进程，请点击重试';
+            card.selectedNodeId = target.id;
+            card.dirty.tools = true;
+            card.flushRender(true);
+            this._setStatusIndicator('error', '⚠️ 回答未送达后端，请重试');
+            return;
+        }
+
+        target.status = 'running';
+        target.approvalState = skipAll ? 'skipped' : 'answered';
+        target.userAnswerSummary = answerSummary;
+
+        const nextPending = card.toolNodes.find(n => n.status === 'pending_approval');
+        card.selectedNodeId = nextPending ? nextPending.id : null;
+        card.activeTool = true;
+        card.dirty.tools = true;
+        if (!card.text) card.dirty.text = true;
+        card.scheduleRender();
+        this._updateAiTabBadge();
+
+        this._setStatusIndicator(
+            'busy',
+            nextPending
+                ? (nextPending.isQuestion
+                    ? '💬 请继续回答下一个问题…'
+                    : `⚠️ 等待您审批工具：${nextPending.toolName}`)
+                : '已收到您的回答，正在继续执行…'
+        );
     }
 
     async _submitActiveToolDecision(card, decision, alwaysAllow = false) {
@@ -2152,6 +2586,9 @@ export default class QuickChat extends Extension {
                 toolCallId: event.toolCallId || '',
                 toolName: event.toolName || '工具',
                 summary: event.summary || '',
+                isQuestion: Boolean(event.isQuestion),
+                questions: event.questions,
+                rawInput: event.rawInput,
             });
             if (node && node.status !== 'pending_approval' && node.status !== 'sending_approval' && node.status !== 'denied') {
                 node.status = 'running';
@@ -2159,7 +2596,12 @@ export default class QuickChat extends Extension {
             card.activeTool = true;
             card.dirty.tools = true;
             if (!card.text) card.dirty.text = true;
-            this._setStatusIndicator('busy', `正在执行工具：${node?.toolName || event.toolName || '工具'}`);
+            this._setStatusIndicator(
+                'busy',
+                node?.isQuestion
+                    ? '💬 正在准备交互式提问…'
+                    : `正在执行工具：${node?.toolName || event.toolName || '工具'}`
+            );
             card.scheduleRender();
         }
 
@@ -2174,6 +2616,9 @@ export default class QuickChat extends Extension {
                 scopeKey: event.scopeKey || '',
                 allowSessionRule: event.allowSessionRule,
                 sessionRuleLabel: event.sessionRuleLabel || '',
+                isQuestion: Boolean(event.isQuestion),
+                questions: event.questions,
+                rawInput: event.rawInput,
             });
             if (node) {
                 node.status = 'pending_approval';
@@ -2183,7 +2628,12 @@ export default class QuickChat extends Extension {
             card.activeTool = true;
             card.dirty.tools = true;
             if (!card.text) card.dirty.text = true;
-            this._setStatusIndicator('busy', `⚠️ 等待您审批工具：${node?.toolName || event.toolName || '工具'}`);
+            if (node?.isQuestion) {
+                const brief = this._formatShortHint(node.summary, 20);
+                this._setStatusIndicator('busy', brief ? `💬 等待回答：${brief}` : '💬 等待您回答问题…');
+            } else {
+                this._setStatusIndicator('busy', `⚠️ 等待您审批工具：${node?.toolName || event.toolName || '工具'}`);
+            }
             this._updateAiTabBadge();
             card.scheduleRender();
             this._scrollBottom(true);
@@ -2198,7 +2648,9 @@ export default class QuickChat extends Extension {
                 if (node && (node.status === 'pending_approval' || node.status === 'sending_approval')) {
                     const allow = event.decision !== 'deny';
                     node.status = allow ? 'running' : 'denied';
-                    node.approvalState = allow ? 'allowed' : 'denied';
+                    if (!node.approvalState || node.approvalState === 'pending') {
+                        node.approvalState = allow ? (node.isQuestion ? 'answered' : 'allowed') : 'denied';
+                    }
                     if (this._live.selectedNodeId === node.id) {
                         const nextPending = this._live.toolNodes.find(n => n.status === 'pending_approval');
                         this._live.selectedNodeId = nextPending ? nextPending.id : null;

@@ -21,8 +21,26 @@ let rl = null;
 let brokerPatched = false;
 let readyEmitted = false;
 
+function isInteractiveQuestionRequest(toolName, input, ruleId = '') {
+    const lower = String(toolName || '').trim().toLowerCase();
+    if (lower === 'askuserquestion' || ruleId === 'tool.userInteraction') return true;
+    return Boolean(input && typeof input === 'object' && Array.isArray(input.questions) && input.questions.length > 0);
+}
+
 function summarizeInput(toolName, input) {
     if (!input || typeof input !== 'object') return String(input ?? '');
+    if (Array.isArray(input.questions) && input.questions.length > 0) {
+        return input.questions
+            .map(q => {
+                const header = String(q?.header || '').trim();
+                const question = String(q?.question || '').trim();
+                if (!question && !header) return '';
+                return header && question ? `[${header}] ${question}` : (question || header);
+            })
+            .filter(Boolean)
+            .join(' · ')
+            .slice(0, 200);
+    }
     if (typeof input.command === 'string') return input.command;
     if (typeof input.url === 'string') return input.url;
     if (typeof input.file_path === 'string') return input.file_path;
@@ -41,6 +59,9 @@ function computeBridgeScope(toolName, summary) {
     const tool = String(toolName || '工具').trim();
     const cleanSummary = String(summary || '').trim();
     const lower = tool.toLowerCase();
+    if (lower === 'askuserquestion') {
+        return {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''};
+    }
     const isShell = lower === 'bash' || lower === 'sh' || lower.includes('shell') || lower.includes('exec') || lower.includes('repl');
     const isFileMutate = lower === 'write' || lower === 'edit' || lower === 'multiedit' || lower === 'notebookedit' || lower === 'delete';
 
@@ -98,6 +119,55 @@ function updateStdinRef() {
     } catch (_) {}
 }
 
+function buildBrokerResolution(entry, msg) {
+    const req = entry?.req || {};
+    const scope = entry?.scope || {scopeKey: '', allowSessionRule: false};
+
+    if (msg?.decision === 'modify' && msg.modifiedInput && typeof msg.modifiedInput === 'object') {
+        return {
+            decision: 'modify',
+            modifiedInput: msg.modifiedInput,
+            reason: typeof msg.reason === 'string' && msg.reason
+                ? msg.reason
+                : '用户在随问中提交了问题回答',
+            resolvedAt: new Date(),
+        };
+    }
+
+    // Defense-in-depth: AskUserQuestion requires `decision: "modify"` with `answers` object;
+    // a plain `allow` would leave `answers === undefined` and fail ZCode's schema check.
+    if (msg?.decision === 'allow' && isInteractiveQuestionRequest(req.toolName, req.input, req.ruleId)) {
+        const fallbackModified = {
+            questions: Array.isArray(req.input?.questions) ? req.input.questions : [],
+            answers: {},
+        };
+        if (req.input?.metadata && typeof req.input.metadata === 'object') {
+            const cleanMeta = {};
+            if (typeof req.input.metadata.source === 'string') {
+                cleanMeta.source = req.input.metadata.source;
+            }
+            fallbackModified.metadata = cleanMeta;
+        }
+        return {
+            decision: 'modify',
+            modifiedInput: fallbackModified,
+            reason: '用户选择交由 AI 自行判断',
+            resolvedAt: new Date(),
+        };
+    }
+
+    const allow = msg?.decision === 'allow';
+    const effectiveScopeKey = scope.allowSessionRule ? scope.scopeKey : '';
+
+    return {
+        decision: allow ? 'allow' : 'deny',
+        reason: allow
+            ? (msg?.alwaysAllow && effectiveScopeKey ? '用户在随问中授予范围许可' : '用户在随问中批准执行')
+            : '用户在随问中拒绝了该工具调用',
+        resolvedAt: new Date(),
+    };
+}
+
 function ensureStdinListener() {
     if (rl) {
         updateStdinRef();
@@ -128,20 +198,15 @@ function ensureStdinListener() {
         pendingRequests.delete(entry.req.requestId);
         updateStdinRef();
 
-        const allow = msg.decision === 'allow';
+        const resolution = buildBrokerResolution(entry, msg);
+        const allow = resolution.decision === 'allow';
         const effectiveScopeKey = entry.scope.allowSessionRule ? entry.scope.scopeKey : '';
 
         if (allow && msg.alwaysAllow && effectiveScopeKey) {
             approvedScopes.add(effectiveScopeKey);
         }
 
-        entry.settle({
-            decision: allow ? 'allow' : 'deny',
-            reason: allow
-                ? (msg.alwaysAllow && effectiveScopeKey ? '用户在随问中授予范围许可' : '用户在随问中批准执行')
-                : '用户在随问中拒绝了该工具调用',
-            resolvedAt: new Date(),
-        });
+        entry.settle(resolution);
 
         // Only auto-settle other pending requests if they match the exact same scoped rule!
         if (allow && msg.alwaysAllow && effectiveScopeKey) {
@@ -172,10 +237,13 @@ function ensureStdinListener() {
 }
 
 function handlePermissionRequest(req, opts = {}) {
+    const interactiveQuestion = isInteractiveQuestionRequest(req?.toolName, req?.input, req?.ruleId);
     const summary = summarizeInput(req?.toolName, req?.input);
-    const scope = computeBridgeScope(req?.toolName, summary);
+    const scope = interactiveQuestion
+        ? {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''}
+        : computeBridgeScope(req?.toolName, summary);
 
-    if (scope.allowSessionRule && scope.scopeKey && approvedScopes.has(scope.scopeKey)) {
+    if (!interactiveQuestion && scope.allowSessionRule && scope.scopeKey && approvedScopes.has(scope.scopeKey)) {
         opts?.claimResponse?.();
         return Promise.resolve({
             decision: 'allow',
@@ -286,6 +354,8 @@ if (isZCodeProcess || process.env.QUICK_CHAT_FORCE_BRIDGE === '1') {
 
 module.exports = {
     PROTOCOL_VERSION,
+    buildBrokerResolution,
     computeBridgeScope,
+    isInteractiveQuestionRequest,
     summarizeInput,
 };
