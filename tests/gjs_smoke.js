@@ -62,8 +62,14 @@ const md = new StreamingMarkdownParser();
 assert(md.update('# 标题\n\n```js\nconst x = 1;\n```\n', {finalize: true}).blocks.length === 2, 'Streaming Markdown blocks');
 
 const sse = new OpenAISseParser();
-const sseEvents = sse.pushBytes(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"你好"}}]}\r\n\r\ndata: [DONE]\r\n\r\n'));
-assert(sseEvents.some(e => e.type === 'delta' && e.textDelta === '你好'), 'SSE UTF-8 delta');
+const rawSseBytes = new TextEncoder().encode('data: {"choices":[{"delta":{"content":"你好🚀"}}]}\r\n\r\ndata: [DONE]\r\n\r\n');
+// Split right inside multi-byte UTF-8 sequence to verify GJS-compatible carry decoding without `{stream: true}`
+const sseEvents = [
+    ...sse.pushBytes(rawSseBytes.subarray(0, 41)),
+    ...sse.pushBytes(rawSseBytes.subarray(41)),
+];
+const sseFinal = sse.finish();
+assert(sseEvents.some(e => e.type === 'delta' && e.textDelta === '你好🚀') && sseFinal.completedCleanly, 'SSE split UTF-8 delta');
 assert(getBackendCapabilities('codex', 'readonly').supportsApproval === false, 'Codex capability honesty');
 assert(typeof BaseBackendAdapter === 'function' && typeof computeAdaptiveRenderDelayMs === 'function', 'Adapter & scheduler helpers');
 assert(buildBudgetedContextMessages([{role: 'user', content: 'hi'}], {currentPrompt: 'next'}).length === 1, 'Budgeted context');

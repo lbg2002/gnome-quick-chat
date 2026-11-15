@@ -198,6 +198,66 @@ function extractTextContent(content) {
 }
 
 /**
+ * GJS-compatible incremental UTF-8 byte decoder (`gjs` `TextDecoder.prototype.decode` throws
+ * `Error: TextDecoder does not implement the 'stream' option.` when `{stream: true}` is passed).
+ * Buffers 1–3 trailing incomplete UTF-8 bytes across TCP packet boundaries and decodes complete
+ * code-point slices with plain `decoder.decode(slice)`.
+ */
+class Utf8ChunkDecoder {
+    constructor() {
+        this._decoder = new TextDecoder('utf-8', {fatal: false});
+        this._carry = new Uint8Array(0);
+    }
+
+    decodeChunk(chunk) {
+        if (!chunk || chunk.byteLength === 0) return '';
+        const input = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        let combined = input;
+        if (this._carry.byteLength > 0) {
+            combined = new Uint8Array(this._carry.byteLength + input.byteLength);
+            combined.set(this._carry, 0);
+            combined.set(input, this._carry.byteLength);
+            this._carry = new Uint8Array(0);
+        }
+
+        const len = combined.byteLength;
+        let splitAt = len;
+
+        // Inspect at most the last 3 bytes for an incomplete multi-byte UTF-8 sequence
+        let idx = len - 1;
+        while (idx >= 0 && (len - idx) <= 3 && (combined[idx] & 0xc0) === 0x80) {
+            idx--;
+        }
+        if (idx >= 0 && (len - idx) <= 3) {
+            const lead = combined[idx];
+            let expectedLen = 1;
+            if (lead >= 0xc2 && lead <= 0xdf) expectedLen = 2;
+            else if (lead >= 0xe0 && lead <= 0xef) expectedLen = 3;
+            else if (lead >= 0xf0 && lead <= 0xf4) expectedLen = 4;
+
+            if (expectedLen > 1 && (len - idx) < expectedLen) {
+                splitAt = idx;
+            }
+        }
+
+        if (splitAt < len) {
+            this._carry = combined.slice(splitAt);
+        }
+        if (splitAt === 0) {
+            return '';
+        }
+        return this._decoder.decode(splitAt === len ? combined : combined.subarray(0, splitAt));
+    }
+
+    flush() {
+        if (this._carry.byteLength === 0) return '';
+        const rem = this._carry;
+        this._carry = new Uint8Array(0);
+        return this._decoder.decode(rem);
+    }
+}
+
+/**
  * Incremental W3C SSE + Non-SSE JSON Fallback Parser for OpenAI-compatible `/chat/completions`.
  */
 export class OpenAISseParser {
@@ -207,7 +267,7 @@ export class OpenAISseParser {
     } = {}) {
         this._limits = {...DEFAULT_SSE_LIMITS, ...limits};
         this._apiKey = String(apiKey || '');
-        this._decoder = new TextDecoder('utf-8', {fatal: false});
+        this._utf8 = new Utf8ChunkDecoder();
 
         this._lineBuffer = '';
         this._pendingCR = false;
@@ -233,8 +293,8 @@ export class OpenAISseParser {
      */
     pushBytes(chunk) {
         if (!chunk || chunk.byteLength === 0) return [];
-        const decoded = this._decoder.decode(chunk, {stream: true});
-        return this.pushText(decoded);
+        const decoded = this._utf8.decodeChunk(chunk);
+        return decoded ? this.pushText(decoded) : [];
     }
 
     pushText(chunkStr) {
@@ -409,7 +469,7 @@ export class OpenAISseParser {
     finish() {
         const trailingEvents = [];
         if (!this.fatalError && !this.sawDone) {
-            const tail = this._decoder.decode(new Uint8Array(0), {stream: false});
+            const tail = this._utf8.flush();
             if (tail) {
                 trailingEvents.push(...this.pushText(tail));
             }

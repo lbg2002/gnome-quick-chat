@@ -393,7 +393,7 @@ export class OpenAIAdapter extends BaseBackendAdapter {
             const status = msg.get_status();
 
             if (status < 200 || status >= 300) {
-                const errorChunks = [];
+                const errorByteChunks = [];
                 let errorBytes = 0;
                 const readErrorChunks = () => {
                     if (!this._turns.isCurrent(turn) || !activeBaseStream) {
@@ -410,19 +410,24 @@ export class OpenAIAdapter extends BaseBackendAdapter {
                         }
                         const chunk = gbytes ? gbytes.get_data() : null;
                         if (chunk && chunk.byteLength > 0 && errorBytes < DEFAULT_SSE_LIMITS.maxErrorBodyBytes) {
-                            const allowed = chunk.subarray(0, DEFAULT_SSE_LIMITS.maxErrorBodyBytes - errorBytes);
-                            errorChunks.push(Decoder.decode(allowed, {stream: true}));
+                            const allowed = chunk.slice(0, DEFAULT_SSE_LIMITS.maxErrorBodyBytes - errorBytes);
+                            errorByteChunks.push(allowed);
                             errorBytes += allowed.byteLength;
                             if (errorBytes < DEFAULT_SSE_LIMITS.maxErrorBodyBytes) {
                                 readErrorChunks();
                                 return;
                             }
                         }
-                        errorChunks.push(Decoder.decode(new Uint8Array(0), {stream: false}));
+                        const merged = new Uint8Array(errorBytes);
+                        let offset = 0;
+                        for (const part of errorByteChunks) {
+                            merged.set(part, offset);
+                            offset += part.byteLength;
+                        }
                         const detail = formatSanitizedHttpError(
                             status,
                             msg.get_reason_phrase() || '',
-                            errorChunks.join(''),
+                            errorBytes > 0 ? Decoder.decode(merged) : '',
                             {apiKey: this._runtime.apiKey}
                         );
                         settleOpenAI({status: 'failed', errorText: detail});
