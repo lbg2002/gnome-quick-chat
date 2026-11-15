@@ -431,7 +431,6 @@ function createPermissionBrokerController({
                     });
                 }
             }, approvalTimeoutMs);
-            timeoutHandle.unref?.();
         }
 
         const entry = {
