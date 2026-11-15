@@ -1,127 +1,195 @@
 'use strict';
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const readline = require('node:readline');
+const vm = require('node:vm');
 
 const PROTOCOL_VERSION = 1;
-const DESTRUCTIVE_SHELL_RE = /(?:^|[;&|]\s*)(?:sudo|su|rm\s+-[a-zA-Z]*[rf]|mkfs|dd\s+|fdisk|parted|shutdown|reboot|chmod\s+-R|chown\s+-R|>\s*\/etc\/)/i;
+const BRIDGE_FAIL_EXIT_CODE = 78;
+const DEFAULT_APPROVAL_TIMEOUT_MS = 300_000;
 
-const pendingRequests = new Map();
-const approvedScopes = new Set();
-
-try {
-    const rawScopes = process.env.QUICK_CHAT_APPROVED_SCOPES || '';
-    if (rawScopes.startsWith('[')) {
-        for (const s of JSON.parse(rawScopes)) {
-            if (typeof s === 'string' && s.trim()) approvedScopes.add(s.trim());
+function loadSharedPermissionPolicy({forceVmFallback = false} = {}) {
+    const policyPath = path.join(__dirname, 'core', 'permissionPolicy.js');
+    if (!forceVmFallback) {
+        try {
+            return require(policyPath);
+        } catch (err) {
+            if (!err || (err.code !== 'ERR_REQUIRE_ESM' && err.code !== 'ERR_UNKNOWN_FILE_EXTENSION')) {
+                // Fall through to VM loader if available, otherwise fail closed below
+            }
         }
     }
-} catch (_) {}
 
-let rl = null;
-let brokerPatched = false;
-let readyEmitted = false;
-
-function isInteractiveQuestionRequest(toolName, input, ruleId = '') {
-    const lower = String(toolName || '').trim().toLowerCase();
-    if (lower === 'askuserquestion' || ruleId === 'tool.userInteraction') return true;
-    return Boolean(input && typeof input === 'object' && Array.isArray(input.questions) && input.questions.length > 0);
-}
-
-function summarizeInput(toolName, input) {
-    if (!input || typeof input !== 'object') return String(input ?? '');
-    if (Array.isArray(input.questions) && input.questions.length > 0) {
-        return input.questions
-            .map(q => {
-                const header = String(q?.header || '').trim();
-                const question = String(q?.question || '').trim();
-                if (!question && !header) return '';
-                return header && question ? `[${header}] ${question}` : (question || header);
-            })
-            .filter(Boolean)
-            .join(' · ')
-            .slice(0, 200);
-    }
-    if (typeof input.command === 'string') return input.command;
-    if (typeof input.url === 'string') return input.url;
-    if (typeof input.file_path === 'string') return input.file_path;
-    if (typeof input.path === 'string') return input.path;
-    if (typeof input.pattern === 'string') return input.pattern;
-    if (typeof input.query === 'string') return input.query;
-    if (typeof input.title === 'string') return input.title;
     try {
-        return JSON.stringify(input).slice(0, 200);
-    } catch (_) {
-        return '';
-    }
-}
+        const esmSource = fs.readFileSync(policyPath, 'utf8');
+        const exportedNames = [];
+        const cjsSource = esmSource
+            .replace(/^export\s+const\s+([A-Za-z0-9_$]+)\s*=/gm, (_, name) => {
+                exportedNames.push(name);
+                return `const ${name} =`;
+            })
+            .replace(/^export\s+function\s+([A-Za-z0-9_$]+)\s*\(/gm, (_, name) => {
+                exportedNames.push(name);
+                return `function ${name}(`;
+            }) +
+            '\n' +
+            exportedNames.map(n => `exports.${n} = ${n};`).join('\n');
 
-function computeBridgeScope(toolName, summary) {
-    const tool = String(toolName || '工具').trim();
-    const cleanSummary = String(summary || '').trim();
-    const lower = tool.toLowerCase();
-    if (lower === 'askuserquestion') {
-        return {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''};
-    }
-    const isShell = lower === 'bash' || lower === 'sh' || lower.includes('shell') || lower.includes('exec') || lower.includes('repl');
-    const isFileMutate = lower === 'write' || lower === 'edit' || lower === 'multiedit' || lower === 'notebookedit' || lower === 'delete';
-
-    if (isShell) {
-        if (!cleanSummary || DESTRUCTIVE_SHELL_RE.test(cleanSummary)) {
-            return {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''};
-        }
-        const normalizedCmd = cleanSummary.replace(/\s+/g, ' ').slice(0, 120);
-        return {
-            scopeKey: `${tool}:cmd:${normalizedCmd}`,
-            allowSessionRule: true,
-            sessionRuleLabel: '✓ 本次会话允许该命令',
+        const sandbox = {
+            exports: {},
+            TextEncoder,
+            Uint8Array,
+            Uint32Array,
+            DataView,
+            URL,
+            Set,
+            Map,
+            Math,
+            Number,
+            String,
+            Boolean,
+            Array,
+            Object,
+            JSON,
+            RegExp,
         };
-    }
-
-    if (isFileMutate) {
-        if (!cleanSummary || cleanSummary.startsWith('/etc/') || cleanSummary.startsWith('/usr/')) {
-            return {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''};
+        vm.runInNewContext(cjsSource, sandbox, {filename: policyPath});
+        if (typeof sandbox.exports.evaluatePermissionPolicy === 'function') {
+            return sandbox.exports;
         }
-        return {
-            scopeKey: `${tool}:file:${cleanSummary}`,
-            allowSessionRule: true,
-            sessionRuleLabel: '✓ 本次会话允许修改该文件',
-        };
-    }
+    } catch (_) {}
 
-    if (lower === 'webfetch' && cleanSummary) {
-        const urlMatch = /^(?:url:\s*)?https?:\/\/([^/?#:\s]+)/i.exec(cleanSummary);
-        const host = urlMatch ? urlMatch[1].toLowerCase() : '';
-        if (host) {
-            return {
-                scopeKey: `${tool}:host:${host}`,
-                allowSessionRule: true,
-                sessionRuleLabel: `✓ 允许访问 ${host}`,
-            };
-        }
-    }
-
+    // Fail-closed fallback if policy module is unreadable: never grant session rules!
     return {
-        scopeKey: `tool:${tool}`,
-        allowSessionRule: true,
-        sessionRuleLabel: '✓ 本次会话始终允许',
+        isInteractiveQuestionTool(toolName, input, ruleId = '') {
+            const lower = String(toolName || '').trim().toLowerCase();
+            if (lower === 'askuserquestion' || ruleId === 'tool.userInteraction') return true;
+            return Boolean(input && typeof input === 'object' && Array.isArray(input.questions) && input.questions.length > 0);
+        },
+        summarizeToolInput(toolName, input) {
+            if (!input || typeof input !== 'object') return String(input ?? '');
+            return String(input.command || input.url || input.file_path || input.path || '').slice(0, 200);
+        },
+        evaluatePermissionPolicy({toolName = '工具'} = {}) {
+            return {
+                toolName: String(toolName || '工具'),
+                kind: 'unknown',
+                operationLabel: '受限单次操作',
+                riskLevel: 'high',
+                riskLabel: '高风险',
+                riskWarnings: ['权限策略模块未就绪，已降级为仅单次审批'],
+                fullCommand: '',
+                cwd: '',
+                realCwd: '',
+                displayPath: '',
+                realPath: '',
+                networkOrigin: '',
+                targetMismatch: false,
+                symlinkEscape: false,
+                scopeKey: '',
+                allowSessionRule: false,
+                sessionRuleLabel: '',
+            };
+        },
     };
 }
 
-function updateStdinRef() {
+const sharedPolicy = loadSharedPermissionPolicy();
+
+function createNodeFsEnv() {
+    return {
+        realpath(targetPath) {
+            return fs.realpathSync(targetPath);
+        },
+        isSymlink(targetPath) {
+            try {
+                return fs.lstatSync(targetPath).isSymbolicLink();
+            } catch (_) {
+                return false;
+            }
+        },
+        exists(targetPath) {
+            try {
+                return fs.existsSync(targetPath);
+            } catch (_) {
+                return false;
+            }
+        },
+    };
+}
+
+function injectPromptFromFileIfConfigured(argv = process.argv, env = process.env) {
+    const promptFile = String(env.QUICK_CHAT_PROMPT_FILE || '').trim();
+    if (!promptFile) return false;
+    delete env.QUICK_CHAT_PROMPT_FILE;
+
     try {
-        if (pendingRequests.size > 0) {
-            process.stdin.resume();
-            process.stdin.ref?.();
-        } else {
-            process.stdin.pause();
-            process.stdin.unref?.();
+        const st = fs.lstatSync(promptFile);
+        if (!st.isFile() || st.isSymbolicLink()) {
+            try { fs.unlinkSync(promptFile); } catch (_) {}
+            throw new Error('Prompt 临时文件不是普通私有文件');
         }
-    } catch (_) {}
+        const promptText = fs.readFileSync(promptFile, 'utf8');
+        try { fs.unlinkSync(promptFile); } catch (_) {}
+
+        for (let i = 0; i < argv.length; i++) {
+            const arg = String(argv[i] || '');
+            if (arg === '--prompt' && i + 1 < argv.length) {
+                argv[i + 1] = promptText;
+                return true;
+            }
+            if (arg.startsWith('--prompt=')) {
+                argv[i] = `--prompt=${promptText}`;
+                return true;
+            }
+        }
+        argv.push(`--prompt=${promptText}`);
+        return true;
+    } catch (err) {
+        try { fs.unlinkSync(promptFile); } catch (_) {}
+        if (env.QUICK_CHAT_REQUIRE_PROMPT_FILE === '1') {
+            try {
+                process.stderr.write(`[Quick Chat Bridge] 读取 Prompt 文件失败: ${err.message}\n`);
+            } catch (_) {}
+            process.exit(BRIDGE_FAIL_EXIT_CODE);
+        }
+        return false;
+    }
+}
+
+function isInteractiveQuestionRequest(toolName, input, ruleId = '') {
+    return sharedPolicy.isInteractiveQuestionTool(toolName, input, ruleId);
+}
+
+function summarizeInput(toolName, input) {
+    return sharedPolicy.summarizeToolInput(toolName, input);
+}
+
+function computeBridgeScope(toolName, summaryOrInput, context = {}) {
+    const isObj = Boolean(summaryOrInput && typeof summaryOrInput === 'object');
+    const fsEnv = context.fsEnv !== undefined ? context.fsEnv : createNodeFsEnv();
+    return sharedPolicy.evaluatePermissionPolicy({
+        toolName,
+        input: isObj ? summaryOrInput : null,
+        summary: isObj ? (context.summary || summarizeInput(toolName, summaryOrInput)) : String(summaryOrInput ?? ''),
+        sessionId: context.sessionId ?? process.env.QUICK_CHAT_SESSION_ID ?? '',
+        cwd: context.cwd ?? process.cwd(),
+        workspace: context.workspace ?? process.env.QUICK_CHAT_WORKSPACE ?? '',
+        homeDir: context.homeDir ?? os.homedir(),
+        fsEnv,
+        allowRepeatShellInSession: Boolean(
+            context.allowRepeatShellInSession ?? (process.env.QUICK_CHAT_ALLOW_REPEAT_SHELL === '1')
+        ),
+        ruleId: context.ruleId || '',
+        reportedRiskLevel: context.reportedRiskLevel || '',
+    });
 }
 
 function buildBrokerResolution(entry, msg) {
     const req = entry?.req || {};
-    const scope = entry?.scope || {scopeKey: '', allowSessionRule: false};
+    const scope = entry?.policy || entry?.scope || {scopeKey: '', allowSessionRule: false};
 
     if (msg?.decision === 'modify' && msg.modifiedInput && typeof msg.modifiedInput === 'object') {
         return {
@@ -163,14 +231,392 @@ function buildBrokerResolution(entry, msg) {
         decision: allow ? 'allow' : 'deny',
         reason: allow
             ? (msg?.alwaysAllow && effectiveScopeKey ? '用户在随问中授予范围许可' : '用户在随问中批准执行')
-            : '用户在随问中拒绝了该工具调用',
+            : (typeof msg?.reason === 'string' && msg.reason ? msg.reason : '用户在随问中拒绝了该工具调用'),
         resolvedAt: new Date(),
     };
 }
 
+function createPermissionBrokerController({
+    sessionId = process.env.QUICK_CHAT_SESSION_ID || '',
+    turnId = process.env.QUICK_CHAT_TURN_ID || '',
+    workspace = process.env.QUICK_CHAT_WORKSPACE || '',
+    homeDir = os.homedir(),
+    fsEnv = createNodeFsEnv(),
+    allowRepeatShellInSession = process.env.QUICK_CHAT_ALLOW_REPEAT_SHELL === '1',
+    approvalTimeoutMs = Number(process.env.QUICK_CHAT_APPROVAL_TIMEOUT_MS || DEFAULT_APPROVAL_TIMEOUT_MS),
+    initialApprovedScopes = [],
+    emitEvent = null,
+    onPendingCountChange = null,
+} = {}) {
+    const pendingRequests = new Map();
+    const approvedScopes = new Set();
+    for (const s of initialApprovedScopes) {
+        if (typeof s === 'string' && s.startsWith('qc_scope_v1_')) {
+            approvedScopes.add(s);
+        }
+    }
+
+    const emit = obj => {
+        try {
+            emitEvent?.(obj);
+        } catch (_) {}
+    };
+
+    const notifyPendingCount = () => {
+        try {
+            onPendingCountChange?.(pendingRequests.size);
+        } catch (_) {}
+    };
+
+    const emitResolved = ({requestId, toolCallId = '', decision, autoApproved = false, timedOut = false, scopeKey = ''}) => {
+        emit({
+            type: 'quickchat.permission_resolved',
+            protocolVersion: PROTOCOL_VERSION,
+            turnId,
+            sessionId,
+            payload: {
+                requestId: String(requestId || ''),
+                toolCallId: String(toolCallId || ''),
+                decision,
+                autoApproved,
+                timedOut,
+                scopeKey,
+            },
+        });
+    };
+
+    function handlePermissionRequest(req, opts = {}) {
+        if (!req || typeof req !== 'object') {
+            return Promise.resolve({
+                decision: 'deny',
+                reason: '无效的权限请求对象',
+                resolvedAt: new Date(),
+            });
+        }
+
+        const requestId = typeof req.requestId === 'string' && req.requestId.trim()
+            ? req.requestId.trim()
+            : '';
+        if (!requestId) {
+            return Promise.resolve({
+                decision: 'deny',
+                reason: '权限请求缺少 requestId，已安全拒绝',
+                resolvedAt: new Date(),
+            });
+        }
+
+        if (pendingRequests.has(requestId)) {
+            return Promise.resolve({
+                decision: 'deny',
+                reason: `重复的审批请求 ID (${requestId})，已拒绝`,
+                resolvedAt: new Date(),
+            });
+        }
+
+        const interactiveQuestion = isInteractiveQuestionRequest(req.toolName, req.input, req.ruleId);
+        const summary = summarizeInput(req.toolName, req.input);
+        const policy = interactiveQuestion
+            ? {
+                toolName: String(req.toolName || 'AskUserQuestion'),
+                kind: 'question',
+                operationLabel: '交互式提问',
+                riskLevel: 'low',
+                riskLabel: '低风险',
+                riskWarnings: [],
+                fullCommand: '',
+                cwd: '',
+                realCwd: '',
+                displayPath: '',
+                realPath: '',
+                networkOrigin: '',
+                targetMismatch: false,
+                symlinkEscape: false,
+                scopeKey: '',
+                allowSessionRule: false,
+                sessionRuleLabel: '',
+            }
+            : sharedPolicy.evaluatePermissionPolicy({
+                toolName: req.toolName,
+                input: req.input,
+                summary,
+                ruleId: req.ruleId || '',
+                reportedRiskLevel: req.riskLevel || '',
+                sessionId: req.sessionId || sessionId,
+                cwd: req.cwd || (req.input && typeof req.input === 'object' ? req.input.cwd : '') || process.cwd(),
+                workspace,
+                homeDir,
+                fsEnv,
+                allowRepeatShellInSession,
+            });
+
+        if (!interactiveQuestion && policy.allowSessionRule && policy.scopeKey && approvedScopes.has(policy.scopeKey)) {
+            try { opts?.claimResponse?.(); } catch (_) {}
+            emitResolved({
+                requestId,
+                toolCallId: req.toolCallId || '',
+                decision: 'allow',
+                autoApproved: true,
+                scopeKey: policy.scopeKey,
+            });
+            return Promise.resolve({
+                decision: 'allow',
+                reason: `Auto-approved by QuickChat scoped rule (${policy.scopeKey})`,
+                resolvedAt: new Date(),
+            });
+        }
+
+        let settled = false;
+        let resolvePromise;
+        let timeoutHandle = null;
+        let abortHandler = null;
+
+        const promise = new Promise(resolve => {
+            resolvePromise = resolve;
+        });
+
+        const cleanupListeners = () => {
+            if (timeoutHandle !== null) {
+                clearTimeout(timeoutHandle);
+                timeoutHandle = null;
+            }
+            if (abortHandler && opts?.signal && typeof opts.signal.removeEventListener === 'function') {
+                try {
+                    opts.signal.removeEventListener('abort', abortHandler);
+                } catch (_) {}
+                abortHandler = null;
+            }
+        };
+
+        const settle = result => {
+            if (settled) return false;
+            settled = true;
+            cleanupListeners();
+            pendingRequests.delete(requestId);
+            notifyPendingCount();
+            try {
+                opts?.claimResponse?.();
+            } catch (_) {}
+            resolvePromise(result);
+            return true;
+        };
+
+        if (opts?.signal) {
+            if (opts.signal.aborted) {
+                settle({decision: 'deny', reason: 'Cancelled', resolvedAt: new Date()});
+                return promise;
+            }
+            abortHandler = () => {
+                if (settle({decision: 'deny', reason: 'Cancelled', resolvedAt: new Date()})) {
+                    emitResolved({
+                        requestId,
+                        toolCallId: req.toolCallId || '',
+                        decision: 'deny',
+                    });
+                }
+            };
+            if (typeof opts.signal.addEventListener === 'function') {
+                opts.signal.addEventListener('abort', abortHandler, {once: true});
+            }
+        }
+
+        if (Number.isFinite(approvalTimeoutMs) && approvalTimeoutMs > 0) {
+            timeoutHandle = setTimeout(() => {
+                timeoutHandle = null;
+                if (settle({decision: 'deny', reason: '审批等待超时，已安全拒绝', resolvedAt: new Date()})) {
+                    emitResolved({
+                        requestId,
+                        toolCallId: req.toolCallId || '',
+                        decision: 'deny',
+                        timedOut: true,
+                    });
+                }
+            }, approvalTimeoutMs);
+            timeoutHandle.unref?.();
+        }
+
+        const entry = {
+            req: {...req, requestId},
+            turnId,
+            opts,
+            policy,
+            scope: policy,
+            settle,
+        };
+        pendingRequests.set(requestId, entry);
+        notifyPendingCount();
+
+        emit({
+            type: 'quickchat.permission_requested',
+            protocolVersion: PROTOCOL_VERSION,
+            turnId,
+            sessionId: req.sessionId || sessionId,
+            payload: {
+                requestId,
+                toolCallId: req.toolCallId || '',
+                toolName: req.toolName || '工具',
+                operationLabel: policy.operationLabel,
+                riskLevel: policy.riskLevel,
+                riskLabel: policy.riskLabel,
+                riskWarnings: policy.riskWarnings,
+                reason: req.reason || '',
+                summary,
+                fullCommand: policy.fullCommand,
+                cwd: policy.cwd,
+                realCwd: policy.realCwd,
+                displayPath: policy.displayPath,
+                realPath: policy.realPath,
+                networkOrigin: policy.networkOrigin,
+                targetMismatch: policy.targetMismatch,
+                symlinkEscape: policy.symlinkEscape,
+                scopeKey: policy.scopeKey,
+                allowSessionRule: policy.allowSessionRule,
+                sessionRuleLabel: policy.sessionRuleLabel,
+                input: req.input || {},
+            },
+        });
+
+        return promise;
+    }
+
+    function handlePermissionResponseMessage(msg) {
+        if (!msg || typeof msg !== 'object' || msg.type !== 'permission_response') {
+            return {accepted: false, reason: 'invalid_message_type'};
+        }
+
+        // Strict ID verification: NEVER match missing/blank requestId to an arbitrary pending request!
+        const targetId = typeof msg.requestId === 'string' ? msg.requestId.trim() : '';
+        if (!targetId) {
+            return {accepted: false, reason: 'missing_request_id'};
+        }
+
+        const entry = pendingRequests.get(targetId);
+        if (!entry) {
+            return {accepted: false, reason: 'unknown_or_expired_request_id'};
+        }
+
+        const incomingTurnId = typeof msg.turnId === 'string' ? msg.turnId.trim() : '';
+        if (entry.turnId && incomingTurnId && incomingTurnId !== entry.turnId) {
+            return {accepted: false, reason: 'turn_id_mismatch'};
+        }
+
+        const resolution = buildBrokerResolution(entry, msg);
+        const allow = resolution.decision === 'allow';
+        const effectiveScopeKey = entry.policy.allowSessionRule ? entry.policy.scopeKey : '';
+
+        if (allow && msg.alwaysAllow && effectiveScopeKey) {
+            approvedScopes.add(effectiveScopeKey);
+        }
+
+        entry.settle(resolution);
+        emitResolved({
+            requestId: targetId,
+            toolCallId: entry.req?.toolCallId || '',
+            decision: resolution.decision,
+            autoApproved: false,
+            scopeKey: allow && msg.alwaysAllow ? effectiveScopeKey : '',
+        });
+
+        // Auto-settle parallel pending requests ONLY if they match the exact same deterministic scopeKey,
+        // and explicitly notify the host UI for every auto-settled requestId!
+        const autoSettledIds = [];
+        if (allow && msg.alwaysAllow && effectiveScopeKey) {
+            for (const [otherId, otherEntry] of Array.from(pendingRequests.entries())) {
+                if (otherEntry.policy?.allowSessionRule && otherEntry.policy.scopeKey === effectiveScopeKey) {
+                    otherEntry.settle({
+                        decision: 'allow',
+                        reason: '用户在随问中授予同类范围许可',
+                        resolvedAt: new Date(),
+                    });
+                    autoSettledIds.push(otherId);
+                    emitResolved({
+                        requestId: otherId,
+                        toolCallId: otherEntry.req?.toolCallId || '',
+                        decision: 'allow',
+                        autoApproved: true,
+                        scopeKey: effectiveScopeKey,
+                    });
+                }
+            }
+        }
+
+        return {accepted: true, requestId: targetId, decision: resolution.decision, autoSettledIds};
+    }
+
+    function closeAllPending(reason = '输入流已关闭') {
+        for (const [id, entry] of Array.from(pendingRequests.entries())) {
+            if (entry.settle({
+                decision: 'deny',
+                reason,
+                resolvedAt: new Date(),
+            })) {
+                emitResolved({
+                    requestId: id,
+                    toolCallId: entry.req?.toolCallId || '',
+                    decision: 'deny',
+                });
+            }
+        }
+    }
+
+    function revokeApprovedScopes() {
+        approvedScopes.clear();
+    }
+
+    return {
+        pendingRequests,
+        approvedScopes,
+        handlePermissionRequest,
+        handlePermissionResponseMessage,
+        closeAllPending,
+        revokeApprovedScopes,
+    };
+}
+
+// =====================================================================
+// Process-level ZCode runtime hook (only active inside ZCode CLI process)
+// =====================================================================
+let initialScopesFromEnv = [];
+try {
+    const rawScopes = process.env.QUICK_CHAT_APPROVED_SCOPES || '';
+    if (rawScopes.startsWith('[')) {
+        const parsed = JSON.parse(rawScopes);
+        if (Array.isArray(parsed)) {
+            initialScopesFromEnv = parsed;
+        }
+    }
+} catch (_) {}
+
+let rl = null;
+let brokerPatched = false;
+let readyEmitted = false;
+
+function writeStdoutJsonLine(obj) {
+    try {
+        process.stdout.write(`${JSON.stringify(obj)}\n`);
+    } catch (_) {}
+}
+
+function updateProcessStdinRef(pendingCount) {
+    try {
+        if (pendingCount > 0) {
+            process.stdin.resume();
+            process.stdin.ref?.();
+        } else {
+            process.stdin.pause();
+            process.stdin.unref?.();
+        }
+    } catch (_) {}
+}
+
+const defaultController = createPermissionBrokerController({
+    initialApprovedScopes: initialScopesFromEnv,
+    emitEvent: writeStdoutJsonLine,
+    onPendingCountChange: updateProcessStdinRef,
+});
+
 function ensureStdinListener() {
     if (rl) {
-        updateStdinRef();
+        updateProcessStdinRef(defaultController.pendingRequests.size);
         return;
     }
     rl = readline.createInterface({
@@ -187,136 +633,26 @@ function ensureStdinListener() {
         } catch (_) {
             return;
         }
-        if (msg.type !== 'permission_response') return;
-
-        const targetId = msg.requestId;
-        const entry = targetId
-            ? pendingRequests.get(targetId)
-            : pendingRequests.values().next().value;
-        if (!entry) return;
-
-        pendingRequests.delete(entry.req.requestId);
-        updateStdinRef();
-
-        const resolution = buildBrokerResolution(entry, msg);
-        const allow = resolution.decision === 'allow';
-        const effectiveScopeKey = entry.scope.allowSessionRule ? entry.scope.scopeKey : '';
-
-        if (allow && msg.alwaysAllow && effectiveScopeKey) {
-            approvedScopes.add(effectiveScopeKey);
-        }
-
-        entry.settle(resolution);
-
-        // Only auto-settle other pending requests if they match the exact same scoped rule!
-        if (allow && msg.alwaysAllow && effectiveScopeKey) {
-            for (const [otherId, otherEntry] of Array.from(pendingRequests.entries())) {
-                if (otherEntry.scope?.allowSessionRule && otherEntry.scope.scopeKey === effectiveScopeKey) {
-                    pendingRequests.delete(otherId);
-                    otherEntry.settle({
-                        decision: 'allow',
-                        reason: '用户在随问中授予同类范围许可',
-                        resolvedAt: new Date(),
-                    });
-                }
-            }
-            updateStdinRef();
-        }
+        defaultController.handlePermissionResponseMessage(msg);
     });
     rl.on('close', () => {
-        for (const [id, entry] of pendingRequests.entries()) {
-            pendingRequests.delete(id);
-            entry.settle({
-                decision: 'deny',
-                reason: '输入流已关闭',
-                resolvedAt: new Date(),
-            });
-        }
+        defaultController.closeAllPending('输入流已关闭');
     });
-    updateStdinRef();
+    process.stdin.on('error', () => {
+        defaultController.closeAllPending('输入流异常中断');
+    });
+    updateProcessStdinRef(defaultController.pendingRequests.size);
 }
 
-function handlePermissionRequest(req, opts = {}) {
-    const interactiveQuestion = isInteractiveQuestionRequest(req?.toolName, req?.input, req?.ruleId);
-    const summary = summarizeInput(req?.toolName, req?.input);
-    const scope = interactiveQuestion
-        ? {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''}
-        : computeBridgeScope(req?.toolName, summary);
-
-    if (!interactiveQuestion && scope.allowSessionRule && scope.scopeKey && approvedScopes.has(scope.scopeKey)) {
-        opts?.claimResponse?.();
-        return Promise.resolve({
-            decision: 'allow',
-            reason: `Auto-approved by QuickChat scoped rule (${scope.scopeKey})`,
-            resolvedAt: new Date(),
-        });
-    }
-
-    ensureStdinListener();
-
-    let settled = false;
-    let resolvePromise;
-    const promise = new Promise(resolve => {
-        resolvePromise = resolve;
-    });
-
-    const settle = result => {
-        if (settled) return;
-        settled = true;
-        pendingRequests.delete(req.requestId);
-        updateStdinRef();
-        try {
-            opts?.claimResponse?.();
-        } catch (_) {}
-        resolvePromise(result);
-    };
-
-    if (opts?.signal) {
-        if (opts.signal.aborted) {
-            settle({decision: 'deny', reason: 'Cancelled', resolvedAt: new Date()});
-            return promise;
-        }
-        opts.signal.addEventListener('abort', () => {
-            settle({decision: 'deny', reason: 'Cancelled', resolvedAt: new Date()});
-        }, {once: true});
-    }
-
-    pendingRequests.set(req.requestId, {req, opts, scope, settle});
-    updateStdinRef();
-
-    try {
-        process.stdout.write(JSON.stringify({
-            type: 'quickchat.permission_requested',
-            protocolVersion: PROTOCOL_VERSION,
-            sessionId: req.sessionId || '',
-            payload: {
-                requestId: req.requestId,
-                toolCallId: req.toolCallId || '',
-                toolName: req.toolName || '工具',
-                riskLevel: req.riskLevel || 'medium',
-                reason: req.reason || '',
-                summary,
-                scopeKey: scope.scopeKey,
-                allowSessionRule: scope.allowSessionRule,
-                sessionRuleLabel: scope.sessionRuleLabel,
-                input: req.input || {},
-            },
-        }) + '\n');
-    } catch (_) {}
-
-    return promise;
-}
-
-function emitBridgeReadyOnce() {
+function emitBridgeReadyOnce(extra = {}) {
     if (readyEmitted) return;
     readyEmitted = true;
-    try {
-        process.stdout.write(JSON.stringify({
-            type: 'quickchat.bridge_ready',
-            protocolVersion: PROTOCOL_VERSION,
-            patched: brokerPatched,
-        }) + '\n');
-    } catch (_) {}
+    writeStdoutJsonLine({
+        type: 'quickchat.bridge_ready',
+        protocolVersion: PROTOCOL_VERSION,
+        patched: brokerPatched,
+        ...extra,
+    });
 }
 
 function patchDenyPermissionBroker(BrokerClass, origDefineProp) {
@@ -324,16 +660,30 @@ function patchDenyPermissionBroker(BrokerClass, origDefineProp) {
     BrokerClass.prototype.__qcPatched = true;
     brokerPatched = true;
     BrokerClass.prototype.requestPermission = function (req, opts = {}) {
-        return handlePermissionRequest(req, opts);
+        ensureStdinListener();
+        return defaultController.handlePermissionRequest(req, opts);
     };
-    // Restore original Object.defineProperty immediately once target class is hooked
     if (origDefineProp && Object.defineProperty !== origDefineProp) {
         Object.defineProperty = origDefineProp;
     }
+    emitBridgeReadyOnce();
 }
 
 const isZCodeProcess = process.argv.some(arg => String(arg).includes('zcode'));
 if (isZCodeProcess || process.env.QUICK_CHAT_FORCE_BRIDGE === '1') {
+    injectPromptFromFileIfConfigured(process.argv, process.env);
+
+    const requireBridgeStrict = process.env.QUICK_CHAT_REQUIRE_BRIDGE === '1';
+    const expectedProto = Number(process.env.QUICK_CHAT_BRIDGE_PROTOCOL || PROTOCOL_VERSION);
+    if (requireBridgeStrict && expectedProto !== PROTOCOL_VERSION) {
+        emitBridgeReadyOnce({
+            patched: false,
+            fatal: true,
+            error: `ZCode 桥接协议版本不匹配（期望 v${expectedProto}，实际 v${PROTOCOL_VERSION}）`,
+        });
+        process.exit(BRIDGE_FAIL_EXIT_CODE);
+    }
+
     const origDefineProperty = Object.defineProperty;
     Object.defineProperty = function (target, prop, desc) {
         const res = origDefineProperty.call(this, target, prop, desc);
@@ -348,14 +698,26 @@ if (isZCodeProcess || process.env.QUICK_CHAT_FORCE_BRIDGE === '1') {
         if (Object.defineProperty !== origDefineProperty) {
             Object.defineProperty = origDefineProperty;
         }
+        if (!brokerPatched && requireBridgeStrict) {
+            emitBridgeReadyOnce({
+                patched: false,
+                fatal: true,
+                error: '当前 ZCode 版本未命中 DenyPermissionBroker 审批钩子，已安全阻止任务执行',
+            });
+            process.exit(BRIDGE_FAIL_EXIT_CODE);
+        }
         emitBridgeReadyOnce();
     });
 }
 
 module.exports = {
     PROTOCOL_VERSION,
+    BRIDGE_FAIL_EXIT_CODE,
     buildBrokerResolution,
     computeBridgeScope,
+    createPermissionBrokerController,
+    injectPromptFromFileIfConfigured,
     isInteractiveQuestionRequest,
+    loadSharedPermissionPolicy,
     summarizeInput,
 };

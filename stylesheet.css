@@ -585,6 +585,12 @@
     border-color: rgba(255, 123, 99, 0.75);
 }
 
+/* Orange-slate dot = Tool interrupted before confirmed finish (已中断/未确认完成) */
+.qc-dot-tool-interrupted {
+    background-color: #e66100;
+    border-color: rgba(255, 190, 111, 0.75);
+}
+
 /* Highlight ring when a circle is clicked / expanded */
 .qc-dot-selected {
     border-width: 2px;

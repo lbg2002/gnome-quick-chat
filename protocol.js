@@ -1,4 +1,17 @@
 // Pure helpers shared with GNOME extension and Node unit tests. No GNOME dependencies.
+import {
+    DISPLAY_HIGH_RISK_SHELL_RE,
+    computePermissionScope,
+    evaluatePermissionPolicy,
+    isInteractiveQuestionTool,
+    summarizeToolInput,
+} from './core/permissionPolicy.js';
+
+export {computePermissionScope, evaluatePermissionPolicy};
+
+const UTF8_ENC = new TextEncoder();
+export const MAX_ARGV_PROMPT_BYTES = 32 * 1024;
+export const MAX_TOTAL_PROMPT_BYTES = 512 * 1024;
 
 const ANSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;
 
@@ -50,50 +63,90 @@ export function detailedMessages(messages) {
             role: m.role,
             text: messageText(m),
             thinking: m.role === 'assistant' ? messageThinking(m) : '',
+            createdAt: m.createdAt || '',
+            modelId: m.modelId || '',
+            status: m.status || 'completed',
         }))
         .filter(m => m.text.length > 0 || m.thinking.length > 0);
 }
 
-export function getBackendCapabilities(backend) {
+/**
+ * Authoritative capability matrix for ZCode CLI, Codex CLI, and OpenAI-compatible API.
+ * Never claims forced OS sandbox for ZCode readonly, and never treats prompts as a tool boundary in Codex.
+ */
+export function getBackendCapabilities(backend, cliCaps = null) {
     switch (backend) {
         case 'zcode':
             return {
+                pureChat: cliCaps?.probed ? Boolean(cliCaps.supportsDisallowedTools) : true,
+                readOnlyFiles: true,
+                fileWrite: true,
+                shellExec: true,
                 supportsTools: true,
                 supportsApproval: true,
-                supportsResume: true,
+                networkAccess: true,
+                interactiveQuestions: true,
+                supportsCancel: true,
+                supportsResume: cliCaps?.probed ? Boolean(cliCaps.supportsResume) : true,
                 supportsThinking: true,
                 supportsSkills: true,
                 supportsMcp: true,
+                supportedModes: ['chat', 'readonly', 'full'],
                 modeLabels: [
                     '纯问答 (禁用本地与联网工具)',
-                    '智能审批 Agent (推荐 · 敏感工具气泡内审批)',
-                    '全自动 Agent (免审批自动执行一切工具)',
+                    '需审批 Agent (推荐 · 敏感操作需您授权，非系统级沙箱)',
+                    '高权限全自动 Agent (免审批执行读写与命令 · 谨慎开启)',
                 ],
-                modeBadges: {chat: '纯问答', readonly: '智能审批', full: '全自动 Agent'},
+                modeBadges: {chat: '纯问答', readonly: '需审批 Agent', full: '高权限全自动'},
             };
-        case 'codex':
+        case 'codex': {
+            const supportsPureChat = Boolean(cliCaps?.supportsDisableTools);
             return {
+                pureChat: supportsPureChat,
+                readOnlyFiles: true,
+                fileWrite: true,
+                shellExec: true,
                 supportsTools: true,
                 supportsApproval: false,
-                supportsResume: true,
+                networkAccess: true,
+                interactiveQuestions: false,
+                supportsCancel: true,
+                supportsResume: cliCaps?.probed ? Boolean(cliCaps.supportsResume) : true,
                 supportsThinking: true,
                 supportsSkills: false,
                 supportsMcp: true,
+                supportedModes: supportsPureChat ? ['chat', 'readonly', 'full'] : ['readonly', 'full'],
+                pureChatRecommendation: 'Codex CLI 无真实禁用工具参数，已切换为只读沙箱 Agent；如需真正无工具纯问答请使用 OpenAI API。',
                 modeLabels: [
-                    '纯问答 (受限只读沙箱 · 指示仅作答)',
-                    '只读沙箱 Agent (允许只读检索 · 无弹窗审批)',
-                    '全自动 Agent (无沙箱读写与执行命令)',
+                    supportsPureChat
+                        ? '纯问答 (禁用 CLI 工具)'
+                        : '只读沙箱 Agent (Codex 无纯问答开关 · 纯问答推荐 OpenAI API)',
+                    '只读沙箱 Agent (CLI 只读沙箱策略 · 无弹窗审批)',
+                    '高权限全自动 Agent (无沙箱读写与执行命令 · 谨慎开启)',
                 ],
-                modeBadges: {chat: '纯问答', readonly: '只读沙箱', full: '全自动 Agent'},
+                modeBadges: {
+                    chat: supportsPureChat ? '纯问答' : '只读沙箱',
+                    readonly: '只读沙箱',
+                    full: '高权限全自动',
+                },
             };
+        }
         case 'unconfigured':
             return {
+                pureChat: false,
+                readOnlyFiles: false,
+                fileWrite: false,
+                shellExec: false,
                 supportsTools: false,
                 supportsApproval: false,
+                networkAccess: false,
+                interactiveQuestions: false,
+                supportsCancel: false,
                 supportsResume: false,
                 supportsThinking: false,
                 supportsSkills: false,
                 supportsMcp: false,
+                supportedModes: [],
                 modeLabels: [
                     '未配置可用后端 (请在设置中选择或配置引擎)',
                     '未配置可用后端 (请在设置中选择或配置引擎)',
@@ -103,20 +156,107 @@ export function getBackendCapabilities(backend) {
             };
         default:
             return {
+                pureChat: true,
+                readOnlyFiles: false,
+                fileWrite: false,
+                shellExec: false,
                 supportsTools: false,
                 supportsApproval: false,
+                networkAccess: false,
+                interactiveQuestions: false,
+                supportsCancel: true,
                 supportsResume: true,
                 supportsThinking: true,
                 supportsSkills: false,
                 supportsMcp: false,
+                supportedModes: ['chat'],
                 modeLabels: [
-                    '纯问答 (HTTP 流式对话，不调用本机工具)',
-                    '纯问答 (OpenAI API 模式无本机工具)',
-                    '纯问答 (OpenAI API 模式无本机工具)',
+                    '纯问答 (HTTP 流式对话，不挂载任何本地工具)',
+                    '纯问答 (OpenAI API 仅支持无本地工具问答)',
+                    '纯问答 (OpenAI API 仅支持无本地工具问答)',
                 ],
-                modeBadges: {chat: '', readonly: '', full: ''},
+                modeBadges: {chat: '纯问答', readonly: '纯问答', full: '纯问答'},
             };
     }
+}
+
+export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly', cliCaps = null) {
+    const mode = ['chat', 'readonly', 'full'].includes(requestedMode) ? requestedMode : 'readonly';
+    if (backend === 'openai') {
+        return {effectiveMode: 'chat', downgradedFromChat: false, notice: ''};
+    }
+    if (backend === 'codex' && mode === 'chat' && !cliCaps?.supportsDisableTools) {
+        return {
+            effectiveMode: 'readonly',
+            downgradedFromChat: true,
+            notice: 'Codex CLI 当前版本无真实禁用工具开关，已按只读沙箱 Agent 运行；如需严格纯问答请使用 OpenAI API。',
+        };
+    }
+    return {effectiveMode: mode, downgradedFromChat: false, notice: ''};
+}
+
+export function parseZCodeHelpCapabilities(helpText = '', versionText = '') {
+    const raw = `${helpText || ''}\n${versionText || ''}`;
+    const hasHelp = Boolean(String(helpText || '').trim());
+    if (!hasHelp) {
+        return {
+            probed: false,
+            version: String(versionText || '').trim(),
+            supportsStreamJson: true,
+            supportsPromptFlag: true,
+            supportsCwdFlag: true,
+            supportsModeFlag: true,
+            supportsDisallowedTools: true,
+            supportsResume: true,
+            supportsWorkflowMode: true,
+            supportsToolsearchMode: true,
+        };
+    }
+    return {
+        probed: true,
+        version: String(versionText || '').trim(),
+        supportsStreamJson: /--output-format\b/.test(raw),
+        supportsPromptFlag: /--prompt\b/.test(raw),
+        supportsCwdFlag: /--cwd\b/.test(raw),
+        supportsModeFlag: /--mode\b/.test(raw),
+        supportsDisallowedTools: /--disallowed-tools\b/.test(raw),
+        supportsResume: /--resume\b/.test(raw),
+        supportsWorkflowMode: /--workflow-mode\b/.test(raw),
+        supportsToolsearchMode: /--toolsearch-mode\b/.test(raw),
+    };
+}
+
+export function parseCodexHelpCapabilities(helpText = '', versionText = '') {
+    const raw = `${helpText || ''}\n${versionText || ''}`;
+    const hasHelp = Boolean(String(helpText || '').trim());
+    if (!hasHelp) {
+        return {
+            probed: false,
+            version: String(versionText || '').trim(),
+            supportsExecSubcommand: true,
+            supportsJsonFlag: true,
+            supportsConfigOverride: true,
+            supportsCwdFlag: true,
+            supportsSkipGitRepoCheck: true,
+            supportsColorFlag: true,
+            supportsResume: true,
+            supportsStdinPrompt: true,
+            supportsDisableTools: false,
+        };
+    }
+    return {
+        probed: true,
+        version: String(versionText || '').trim(),
+        supportsExecSubcommand: /\bexec\b/.test(raw),
+        supportsJsonFlag: /--json\b/.test(raw),
+        supportsConfigOverride: /(?:^|\s)-c(?:,|\s)|\b--config\b/.test(raw),
+        supportsCwdFlag: /(?:^|\s)-C(?:,|\s)|\b--cd\b/.test(raw),
+        supportsSkipGitRepoCheck: /--skip-git-repo-check\b/.test(raw),
+        supportsColorFlag: /--color\b/.test(raw),
+        supportsResume: /\bresume\b/.test(raw),
+        supportsStdinPrompt: /\bstdin\b|\[PROMPT\]|<PROMPT>|-\s+read/i.test(raw),
+        supportsDisableTools: /--(?:no-tools|disable-tools|disallowed-tools)\b/.test(raw),
+    };
 }
 
 export function mapReasoningEffort(effort) {
@@ -132,7 +272,7 @@ export function mapReasoningEffort(effort) {
     }
 }
 
-const DESTRUCTIVE_SHELL_RE = /(?:^|[;&|]\s*)(?:sudo|su|rm\s+-[a-zA-Z]*[rf]|mkfs|dd\s+|fdisk|parted|shutdown|reboot|chmod\s+-R|chown\s+-R|>\s*\/etc\/)/i;
+const DESTRUCTIVE_SHELL_RE = DISPLAY_HIGH_RISK_SHELL_RE;
 
 export function isAskUserQuestionTool(toolName, input = null) {
     const lower = String(toolName || '').trim().toLowerCase();
@@ -261,80 +401,6 @@ export function formatAskUserAnswerSummary(questions = [], modifiedInput = null)
     return lines.join('\n');
 }
 
-/**
- * Computes graded, command/action-scoped session approval keys.
- * Prevents broad tool-level `alwaysAllow` on dangerous tools like Bash/Edit/Write
- * and interactive tools like AskUserQuestion.
- */
-export function computePermissionScope(toolName, summaryOrInput = '') {
-    const tool = String(toolName || '工具').trim();
-    if (isAskUserQuestionTool(tool, typeof summaryOrInput === 'object' ? summaryOrInput : null)) {
-        return {
-            scopeKey: '',
-            allowSessionRule: false,
-            sessionRuleLabel: '',
-        };
-    }
-
-    const rawSummary = typeof summaryOrInput === 'string'
-        ? summaryOrInput.trim()
-        : String(summaryOrInput?.command || summaryOrInput?.url || summaryOrInput?.file_path || summaryOrInput?.path || '').trim();
-
-    const lower = tool.toLowerCase();
-    const isShell = lower === 'bash' || lower === 'sh' || lower.includes('shell') || lower.includes('exec') || lower.includes('repl');
-    const isFileMutate = lower === 'write' || lower === 'edit' || lower === 'multiedit' || lower === 'notebookedit' || lower === 'delete';
-
-    if (isShell) {
-        if (!rawSummary || DESTRUCTIVE_SHELL_RE.test(rawSummary)) {
-            return {
-                scopeKey: '',
-                allowSessionRule: false,
-                sessionRuleLabel: '',
-            };
-        }
-        // Scope strictly to the normalized command string (never all Bash commands!)
-        const normalizedCmd = rawSummary.replace(/\s+/g, ' ').slice(0, 120);
-        return {
-            scopeKey: `${tool}:cmd:${normalizedCmd}`,
-            allowSessionRule: true,
-            sessionRuleLabel: '✓ 本次会话允许该命令',
-        };
-    }
-
-    if (isFileMutate) {
-        if (!rawSummary || rawSummary.startsWith('/etc/') || rawSummary.startsWith('/usr/')) {
-            return {
-                scopeKey: '',
-                allowSessionRule: false,
-                sessionRuleLabel: '',
-            };
-        }
-        return {
-            scopeKey: `${tool}:file:${rawSummary}`,
-            allowSessionRule: true,
-            sessionRuleLabel: '✓ 本次会话允许修改该文件',
-        };
-    }
-
-    if (lower === 'webfetch' && rawSummary) {
-        const urlMatch = /^(?:url:\s*)?https?:\/\/([^/?#:\s]+)/i.exec(rawSummary);
-        const host = urlMatch ? urlMatch[1].toLowerCase() : '';
-        if (host) {
-            return {
-                scopeKey: `${tool}:host:${host}`,
-                allowSessionRule: true,
-                sessionRuleLabel: `✓ 允许访问 ${host}`,
-            };
-        }
-    }
-
-    return {
-        scopeKey: `tool:${tool}`,
-        allowSessionRule: true,
-        sessionRuleLabel: '✓ 本次会话始终允许',
-    };
-}
-
 export function buildModelSignature(backend, config = {}) {
     if (backend === 'openai') {
         const url = String(config.openaiBaseUrl || '').trim().replace(/\/+$/, '');
@@ -440,21 +506,52 @@ export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromp
     ].join('\n');
 }
 
-export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace = '') {
+function assertPromptWithinLimit(rawPrompt, {viaArgv = false} = {}) {
+    const bytes = UTF8_ENC.encode(rawPrompt).byteLength;
+    if (bytes > MAX_TOTAL_PROMPT_BYTES) {
+        throw new Error(`输入内容过长（${Math.ceil(bytes / 1024)} KB），超出单次请求上限（${MAX_TOTAL_PROMPT_BYTES / 1024} KB）`);
+    }
+    if (viaArgv && bytes > MAX_ARGV_PROMPT_BYTES) {
+        throw new Error(`当前 CLI 参数模式单次提问上限为 ${MAX_ARGV_PROMPT_BYTES / 1024} KB，请缩短内容后重试`);
+    }
+}
+
+export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace = '', options = {}) {
     const mode = config?.mode;
+    const cliCaps = options?.cliCaps || config?.cliCapabilities || null;
+    const usePromptFile = Boolean(options?.usePromptFile);
+    const rawPrompt = String(prompt ?? '');
+    assertPromptWithinLimit(rawPrompt, {viaArgv: !usePromptFile});
+
+    if (cliCaps?.probed) {
+        if (!cliCaps.supportsStreamJson || !cliCaps.supportsPromptFlag || !cliCaps.supportsModeFlag) {
+            throw new Error('当前 ZCode CLI 版本不支持必需的流式 JSON 或权限模式参数，请升级 ZCode CLI');
+        }
+        if (mode === 'chat' && !cliCaps.supportsDisallowedTools) {
+            throw new Error('当前 ZCode CLI 版本不支持 --disallowed-tools，无法安全强制纯问答无工具模式；请改用 OpenAI API');
+        }
+    }
+
     const effectiveCwd = String(workspace || config?.resolvedWorkspace || '').trim();
     const prefix = Array.isArray(config?.commandPrefix) && config.commandPrefix.length
         ? [...config.commandPrefix]
         : [config?.executable || 'zcode'];
+
+    // Use `--prompt=<value>` as a single option token so prompts starting with `-` can never inject CLI flags!
     const args = [
         ...prefix,
-        ...(effectiveCwd ? ['--cwd', effectiveCwd] : []),
-        '--prompt', String(prompt ?? ''),
+        ...(effectiveCwd && (!cliCaps?.probed || cliCaps.supportsCwdFlag) ? ['--cwd', effectiveCwd] : []),
+        `--prompt=${usePromptFile ? '' : rawPrompt}`,
         '--output-format', 'stream-json',
         '--no-color',
-        '--workflow-mode', 'disabled',
-        '--toolsearch-mode', 'off',
     ];
+    if (!cliCaps?.probed || cliCaps.supportsWorkflowMode) {
+        args.push('--workflow-mode', 'disabled');
+    }
+    if (!cliCaps?.probed || cliCaps.supportsToolsearchMode) {
+        args.push('--toolsearch-mode', 'off');
+    }
+
     if (mode === 'full') {
         args.push('--mode', 'yolo');
     } else if (mode === 'readonly') {
@@ -462,16 +559,36 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
     } else {
         args.push('--mode', 'plan', '--disallowed-tools', 'Bash Edit Write Read Grep Glob LS WebFetch WebSearch TodoWrite NotebookEdit');
     }
-    if (resumeSessionId) {
-        args.push('--resume', resumeSessionId);
+
+    if (resumeSessionId && (!cliCaps?.probed || cliCaps.supportsResume)) {
+        args.push(`--resume=${resumeSessionId}`);
     }
     return args;
 }
 
-export function buildCodexArgs(config, workspace, prompt, resumeSessionId = '') {
-    const mode = config?.mode;
+export function buildCodexArgs(config, workspace, prompt, resumeSessionId = '', options = {}) {
+    const cliCaps = options?.cliCaps || config?.cliCapabilities || null;
+    const stdinPrompt = Boolean(options?.stdinPrompt);
+    const rawPrompt = String(prompt ?? '');
+    assertPromptWithinLimit(rawPrompt, {viaArgv: !stdinPrompt});
+
+    if (cliCaps?.probed) {
+        if (!cliCaps.supportsExecSubcommand || !cliCaps.supportsJsonFlag || !cliCaps.supportsConfigOverride) {
+            throw new Error('当前 Codex CLI 版本不支持必需的 exec --json -c 沙箱参数，请升级 Codex CLI');
+        }
+    }
+
+    // Never treat prompt text as a permission boundary! Mode is enforced strictly via Codex CLI sandbox_mode.
+    const {effectiveMode} = normalizeEffectiveAgentMode('codex', config?.mode || 'readonly', cliCaps);
     const exec = config?.executable || 'codex';
-    const common = ['--json', '--skip-git-repo-check', '--color', 'never'];
+    const common = ['--json'];
+    if (!cliCaps?.probed || cliCaps.supportsSkipGitRepoCheck) {
+        common.push('--skip-git-repo-check');
+    }
+    if (!cliCaps?.probed || cliCaps.supportsColorFlag) {
+        common.push('--color', 'never');
+    }
+
     const provider = String(config?.provider ?? '').trim();
     const model = String(config?.model ?? '').trim();
     if (provider && provider !== 'openai') {
@@ -484,18 +601,22 @@ export function buildCodexArgs(config, workspace, prompt, resumeSessionId = '') 
     if (effort) {
         common.push('-c', `model_reasoning_effort=${JSON.stringify(effort)}`);
     }
-    if (mode === 'full') {
+    if (effectiveMode === 'full') {
         common.push('-c', 'sandbox_mode="danger-full-access"', '-c', 'approval_policy="never"');
     } else {
         common.push('-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"');
     }
-    const effectivePrompt = mode === 'chat'
-        ? `[纯问答模式：请直接回答问题，不要执行本地命令或调用检索工具]\n${String(prompt ?? '')}`
-        : String(prompt ?? '');
-    if (resumeSessionId) {
-        return [exec, 'exec', 'resume', ...common, resumeSessionId, effectivePrompt];
+
+    const promptArg = stdinPrompt ? '-' : rawPrompt;
+    if (resumeSessionId && (!cliCaps?.probed || cliCaps.supportsResume)) {
+        return stdinPrompt
+            ? [exec, 'exec', 'resume', ...common, '--', resumeSessionId, '-']
+            : [exec, 'exec', 'resume', ...common, '--', resumeSessionId, promptArg];
     }
-    return [exec, 'exec', ...common, ...(workspace ? ['-C', workspace] : []), effectivePrompt];
+    const cwdFlags = workspace && (!cliCaps?.probed || cliCaps.supportsCwdFlag) ? ['-C', workspace] : [];
+    return stdinPrompt
+        ? [exec, 'exec', ...common, ...cwdFlags, '-']
+        : [exec, 'exec', ...common, ...cwdFlags, '--', promptArg];
 }
 
 export function parseZCodeProviderCatalog(personalConfigObj, builtinConfigObj = null) {
@@ -591,7 +712,7 @@ export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = 
         }
     }
 
-    if (!matchedProvider && rawModel) {
+    if (!matchedProvider && !rawProvider && rawModel) {
         matchedProvider = providers.find(p => p.models.some(m => m.toLowerCase() === rawModel.toLowerCase()))
             || providers[0]
             || null;
@@ -784,6 +905,8 @@ export function normalizeEvent(backend, record) {
                 type: 'bridge_ready',
                 protocolVersion: Number(record.protocolVersion || 1),
                 patched: Boolean(record.patched),
+                fatal: Boolean(record.fatal),
+                error: record.error ? String(record.error) : '',
             };
         }
         if (type === 'quickchat.permission_requested') {
@@ -791,46 +914,89 @@ export function normalizeEvent(backend, record) {
             if (!p.requestId) return null;
             const toolName = String(p.toolName || '工具');
             const questions = parseAskUserQuestions(p.input);
-            const isQuestion = isAskUserQuestionTool(toolName, p.input) && questions.length > 0;
+            const isQuestion = (isInteractiveQuestionTool(toolName, p.input) || isAskUserQuestionTool(toolName, p.input)) && questions.length > 0;
             let summary = isQuestion
                 ? summarizeAskUserQuestions(p.input)
-                : (p.summary || '');
+                : (p.summary || summarizeToolInput(toolName, p.input) || '');
             if (!summary && p.input && typeof p.input === 'object') {
                 summary = p.input.command || p.input.url || p.input.file_path || p.input.path || p.input.pattern || p.input.query || p.input.title || '';
             }
-            const scope = isQuestion
-                ? {scopeKey: '', allowSessionRule: false, sessionRuleLabel: ''}
-                : computePermissionScope(toolName, summary || p.input || '');
+            const fallbackPolicy = isQuestion
+                ? {
+                    operationLabel: '交互式提问',
+                    riskLevel: 'low',
+                    riskLabel: '低风险',
+                    riskWarnings: [],
+                    fullCommand: '',
+                    cwd: '',
+                    realCwd: '',
+                    displayPath: '',
+                    realPath: '',
+                    networkOrigin: '',
+                    targetMismatch: false,
+                    symlinkEscape: false,
+                    scopeKey: '',
+                    allowSessionRule: false,
+                    sessionRuleLabel: '',
+                }
+                : evaluatePermissionPolicy({
+                    toolName,
+                    input: p.input || null,
+                    summary,
+                    reportedRiskLevel: p.riskLevel || '',
+                    sessionId: record.sessionId || '',
+                    cwd: p.cwd || '',
+                });
+
+            const allowSessionRule = isQuestion
+                ? false
+                : (typeof p.allowSessionRule === 'boolean' ? p.allowSessionRule : fallbackPolicy.allowSessionRule);
+            const scopeKey = (!allowSessionRule || isQuestion)
+                ? ''
+                : (p.scopeKey ? String(p.scopeKey) : fallbackPolicy.scopeKey);
+
             const evt = {
                 type: 'permission_request',
                 requestId: String(p.requestId),
                 toolCallId: String(p.toolCallId || ''),
                 toolName,
-                riskLevel: String(p.riskLevel || 'medium'),
+                operationLabel: String(p.operationLabel || fallbackPolicy.operationLabel || ''),
+                riskLevel: String(p.riskLevel || fallbackPolicy.riskLevel || 'medium'),
+                riskLabel: String(p.riskLabel || fallbackPolicy.riskLabel || '中风险'),
+                riskWarnings: Array.isArray(p.riskWarnings) ? p.riskWarnings.map(String) : fallbackPolicy.riskWarnings,
                 reason: String(p.reason || (isQuestion ? '请选择或输入您的回答以继续' : '该操作需要您的授权')),
                 summary: String(summary || ''),
-                scopeKey: isQuestion ? '' : (p.scopeKey ? String(p.scopeKey) : scope.scopeKey),
-                allowSessionRule: isQuestion
-                    ? false
-                    : (typeof p.allowSessionRule === 'boolean' ? p.allowSessionRule : scope.allowSessionRule),
-                sessionRuleLabel: isQuestion
-                    ? ''
-                    : (p.sessionRuleLabel ? String(p.sessionRuleLabel) : scope.sessionRuleLabel),
+                fullCommand: String(p.fullCommand ?? fallbackPolicy.fullCommand ?? ''),
+                cwd: String(p.cwd ?? fallbackPolicy.cwd ?? ''),
+                realCwd: String(p.realCwd ?? fallbackPolicy.realCwd ?? ''),
+                displayPath: String(p.displayPath ?? fallbackPolicy.displayPath ?? ''),
+                realPath: String(p.realPath ?? fallbackPolicy.realPath ?? ''),
+                networkOrigin: String(p.networkOrigin ?? fallbackPolicy.networkOrigin ?? ''),
+                targetMismatch: Boolean(p.targetMismatch || fallbackPolicy.targetMismatch),
+                symlinkEscape: Boolean(p.symlinkEscape || fallbackPolicy.symlinkEscape),
+                scopeKey,
+                allowSessionRule: Boolean(allowSessionRule && scopeKey),
+                sessionRuleLabel: Boolean(allowSessionRule && scopeKey)
+                    ? String(p.sessionRuleLabel || fallbackPolicy.sessionRuleLabel || '')
+                    : '',
+                rawInput: p.input && typeof p.input === 'object' ? p.input : null,
             };
             if (isQuestion) {
                 evt.isQuestion = true;
                 evt.questions = questions;
-                evt.rawInput = p.input;
             }
             return evt;
         }
-        if (type === 'permission.resolved' || type === 'permission.denied') {
+        if (type === 'quickchat.permission_resolved' || type === 'permission.resolved' || type === 'permission.denied') {
             const p = record.payload || {};
             return {
                 type: 'permission_resolved',
                 requestId: String(p.requestId || ''),
                 toolCallId: String(p.toolCallId || ''),
                 decision: String(p.decision || (type === 'permission.denied' ? 'deny' : 'allow')),
+                autoApproved: Boolean(p.autoApproved),
+                timedOut: Boolean(p.timedOut),
+                scopeKey: p.scopeKey ? String(p.scopeKey) : '',
             };
         }
         if (type === 'tool.updated') {
@@ -850,7 +1016,11 @@ export function normalizeEvent(backend, record) {
             if (!summary && p.description) summary = p.description;
 
             if (kind === 'started' || kind === 'scheduled') {
-                const evt = {type: 'tool_execution_start', toolName: String(toolName)};
+                const evt = {
+                    type: 'tool_execution_start',
+                    toolName: String(toolName),
+                    rawInput: p.input && typeof p.input === 'object' ? p.input : null,
+                };
                 if (toolCallId) evt.toolCallId = toolCallId;
                 if (summary) evt.summary = String(summary);
                 if (isQuestionTool) {
@@ -858,7 +1028,6 @@ export function normalizeEvent(backend, record) {
                     if (questions.length > 0) {
                         evt.isQuestion = true;
                         evt.questions = questions;
-                        evt.rawInput = p.input;
                     }
                 }
                 return evt;
@@ -880,6 +1049,9 @@ export function normalizeEvent(backend, record) {
             }
             return null;
         }
+        if (type === 'turn.completed') {
+            return {type: 'turn_completed'};
+        }
         if (type === 'turn.failed') {
             const err = record.payload?.message || record.payload?.error || '请求执行失败';
             return {
@@ -888,10 +1060,13 @@ export function normalizeEvent(backend, record) {
             };
         }
         if (type === 'result') {
+            const isErr = Boolean(record.is_error || record.subtype === 'error');
             return {
                 type: 'turn_result',
                 sessionId: record.sessionId || '',
                 text: typeof record.response === 'string' ? record.response : '',
+                isError: isErr,
+                errorMessage: isErr ? String(record.error || record.message || 'ZCode 执行返回错误') : '',
             };
         }
         return null;

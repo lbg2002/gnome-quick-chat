@@ -23,6 +23,7 @@ gnome-extensions pack . \
   --extra-source=protocol.js \
   --extra-source=zcodeBridge.cjs \
   --extra-source=core \
+  --extra-source=runtime \
   --extra-source=ui
 
 echo "✓ 扩展标准安装包已生成至：$out_dir/quick-chat@lbg2002.github.io.shell-extension.zip"

@@ -60,6 +60,9 @@ test('messageThinking and detailedMessages extract assistant reasoning separatel
         role: 'assistant',
         text: '最终结论',
         thinking: '先分析步骤',
+        createdAt: '',
+        modelId: '',
+        status: 'completed',
     }]);
 });
 
@@ -67,8 +70,8 @@ test('ZCode and Codex argument builders map permission modes, reasoning effort, 
     const zChat = buildZCodeArgs({commandPrefix: ['node', '/opt/ZCode/resources/glm/zcode.cjs'], mode: 'chat'}, '你好', 'sess_1');
     assert.equal(zChat[0], 'node');
     assert.ok(zChat.includes('stream-json'));
-    assert.ok(zChat.includes('--resume'));
-    assert.equal(zChat[zChat.indexOf('--resume') + 1], 'sess_1');
+    assert.ok(zChat.includes('--prompt=你好'));
+    assert.ok(zChat.includes('--resume=sess_1'));
     assert.equal(zChat[zChat.indexOf('--mode') + 1], 'plan');
 
     const zRead = buildZCodeArgs({executable: 'zcode', mode: 'readonly'}, '查股价');
@@ -76,7 +79,7 @@ test('ZCode and Codex argument builders map permission modes, reasoning effort, 
 
     const zFull = buildZCodeArgs({executable: 'zcode', mode: 'full'}, '执行');
     assert.equal(zFull[zFull.indexOf('--mode') + 1], 'yolo');
-    assert.ok(!zFull.includes('--resume'));
+    assert.ok(!zFull.some(a => a.startsWith('--resume')));
 
     const cRead = buildCodexArgs(
         {executable: 'codex', mode: 'readonly', model: 'gpt-5', reasoningEffort: 'fast'},
@@ -89,6 +92,7 @@ test('ZCode and Codex argument builders map permission modes, reasoning effort, 
     assert.ok(cRead.includes('--json'));
     assert.ok(cRead.includes('sandbox_mode="read-only"'));
     assert.ok(cRead.includes('model_reasoning_effort="low"'));
+    assert.ok(cRead.includes('--'));
 
     const cResume = buildCodexArgs({executable: 'codex', mode: 'full'}, '/tmp/w', '继续', 'thread_9');
     assert.deepEqual(cResume.slice(0, 3), ['codex', 'exec', 'resume']);
@@ -98,7 +102,7 @@ test('ZCode and Codex argument builders map permission modes, reasoning effort, 
 test('normalizeEvent unifies ZCode and Codex events without duplicate settlement and preserves parallel toolCallIds', () => {
     assert.deepEqual(
         normalizeEvent('zcode', {type: 'quickchat.bridge_ready', protocolVersion: 1, patched: true}),
-        {type: 'bridge_ready', protocolVersion: 1, patched: true}
+        {type: 'bridge_ready', protocolVersion: 1, patched: true, fatal: false, error: ''}
     );
     assert.deepEqual(
         normalizeEvent('zcode', {type: 'model.streaming', payload: {kind: 'text_delta', delta: 'Hello'}}),
@@ -112,16 +116,17 @@ test('normalizeEvent unifies ZCode and Codex events without duplicate settlement
     // Parallel same-name tools in ZCode preserve distinct toolCallId
     assert.deepEqual(
         normalizeEvent('zcode', {type: 'tool.updated', payload: {kind: 'started', toolCallId: 'call_a', toolName: 'Bash', input: {command: 'ls -la'}}}),
-        {type: 'tool_execution_start', toolCallId: 'call_a', toolName: 'Bash', summary: 'ls -la'}
+        {type: 'tool_execution_start', toolCallId: 'call_a', toolName: 'Bash', summary: 'ls -la', rawInput: {command: 'ls -la'}}
     );
     assert.deepEqual(
         normalizeEvent('zcode', {type: 'tool.updated', payload: {kind: 'started', toolCallId: 'call_b', toolName: 'Bash', input: {command: 'pwd'}}}),
-        {type: 'tool_execution_start', toolCallId: 'call_b', toolName: 'Bash', summary: 'pwd'}
+        {type: 'tool_execution_start', toolCallId: 'call_b', toolName: 'Bash', summary: 'pwd', rawInput: {command: 'pwd'}}
     );
 
     // Scoped permission normalization
     const permEvt = normalizeEvent('zcode', {
         type: 'quickchat.permission_requested',
+        sessionId: 'sess_1',
         payload: {
             requestId: 'qc_perm_1',
             toolCallId: 'call_1',
@@ -132,9 +137,9 @@ test('normalizeEvent unifies ZCode and Codex events without duplicate settlement
         },
     });
     assert.equal(permEvt.type, 'permission_request');
-    assert.equal(permEvt.scopeKey, 'WebFetch:host:finance.yahoo.com');
+    assert.match(permEvt.scopeKey, /^qc_scope_v1_net_[0-9a-f]{64}$/);
     assert.equal(permEvt.allowSessionRule, true);
-    assert.equal(permEvt.sessionRuleLabel, '✓ 允许访问 finance.yahoo.com');
+    assert.equal(permEvt.sessionRuleLabel, '✓ 本次会话允许访问 https://finance.yahoo.com');
 
     // Codex turn.completed emits turn_completed (NOT agent_settled) to prevent double settlement
     assert.deepEqual(
@@ -167,33 +172,88 @@ test('normalizeEvent unifies ZCode and Codex events without duplicate settlement
     );
 });
 
-test('Scoped permission rules isolate commands/hosts/files and block destructive session-wide rules', () => {
-    const safeCmd = computePermissionScope('Bash', 'df -h');
-    const otherCmd = computePermissionScope('Bash', 'uname -a');
+test('Scoped permission rules default Shell to allow-once and isolate SHA-256 keys across commands/hosts/files', () => {
+    const mockFsEnv = {
+        realpath: p => p,
+        isSymlink: () => false,
+        exists: () => true,
+    };
+
+    // Shell commands default to one-time execution only
+    const defaultShell = computePermissionScope('Bash', {command: 'df -h'}, {
+        sessionId: 'sess_1',
+        cwd: '/home/user/proj',
+        workspace: '/home/user/proj',
+        fsEnv: mockFsEnv,
+    });
+    assert.equal(defaultShell.allowSessionRule, false);
+    assert.equal(defaultShell.scopeKey, '');
+
+    // When session repeat is explicitly enabled, lossless SHA-256 distinguishes commands
+    const safeCmd = computePermissionScope('Bash', {command: 'df -h'}, {
+        sessionId: 'sess_1',
+        cwd: '/home/user/proj',
+        workspace: '/home/user/proj',
+        fsEnv: mockFsEnv,
+        allowRepeatShellInSession: true,
+    });
+    const otherCmd = computePermissionScope('Bash', {command: 'uname -a'}, {
+        sessionId: 'sess_1',
+        cwd: '/home/user/proj',
+        workspace: '/home/user/proj',
+        fsEnv: mockFsEnv,
+        allowRepeatShellInSession: true,
+    });
     assert.equal(safeCmd.allowSessionRule, true);
-    assert.equal(safeCmd.scopeKey, 'Bash:cmd:df -h');
+    assert.match(safeCmd.scopeKey, /^qc_scope_v1_shell_[0-9a-f]{64}$/);
     assert.notEqual(safeCmd.scopeKey, otherCmd.scopeKey);
 
     // Destructive commands disallow session-level auto-approval in both protocol.js and zcodeBridge.cjs
     for (const dangerous of ['rm -rf ~/Documents', 'sudo apt remove gjs', 'echo x && rm -rf /tmp/a', 'dd if=/dev/zero of=/dev/sda']) {
-        const pScope = computePermissionScope('Bash', dangerous);
-        const bScope = zcodeBridge.computeBridgeScope('Bash', dangerous);
+        const pScope = computePermissionScope('Bash', {command: dangerous}, {
+            sessionId: 'sess_1',
+            cwd: '/home/user/proj',
+            workspace: '/home/user/proj',
+            fsEnv: mockFsEnv,
+            allowRepeatShellInSession: true,
+        });
+        const bScope = zcodeBridge.computeBridgeScope('Bash', {command: dangerous}, {
+            sessionId: 'sess_1',
+            cwd: '/home/user/proj',
+            workspace: '/home/user/proj',
+            fsEnv: mockFsEnv,
+            allowRepeatShellInSession: true,
+        });
         assert.equal(pScope.allowSessionRule, false, `protocol should block session rule for: ${dangerous}`);
         assert.equal(pScope.scopeKey, '');
         assert.equal(bScope.allowSessionRule, false, `bridge should block session rule for: ${dangerous}`);
         assert.equal(bScope.scopeKey, '');
     }
 
-    // System config paths disallow session-level auto-approval
-    assert.equal(computePermissionScope('Edit', '/etc/passwd').allowSessionRule, false);
-    assert.equal(computePermissionScope('Edit', '/home/user/notes.md').scopeKey, 'Edit:file:/home/user/notes.md');
-
-    // Bridge protocol version handshake
-    assert.equal(zcodeBridge.PROTOCOL_VERSION, 1);
+    // System config paths disallow session-level auto-approval; workspace files produce SHA-256 scope keys
     assert.equal(
-        zcodeBridge.computeBridgeScope('WebFetch', 'https://api.github.com/repos').scopeKey,
-        'WebFetch:host:api.github.com'
+        computePermissionScope('Edit', {file_path: '/etc/passwd'}, {
+            sessionId: 'sess_1',
+            workspace: '/home/user/proj',
+            fsEnv: mockFsEnv,
+        }).allowSessionRule,
+        false
     );
+    const notesScope = computePermissionScope('Edit', {file_path: '/home/user/proj/notes.md'}, {
+        sessionId: 'sess_1',
+        workspace: '/home/user/proj',
+        homeDir: '/home/user',
+        fsEnv: mockFsEnv,
+    });
+    assert.equal(notesScope.allowSessionRule, true);
+    assert.match(notesScope.scopeKey, /^qc_scope_v1_file_[0-9a-f]{64}$/);
+
+    // Bridge protocol version handshake & GJS/CJS parity
+    assert.equal(zcodeBridge.PROTOCOL_VERSION, 1);
+    const netBridge = zcodeBridge.computeBridgeScope('WebFetch', 'https://api.github.com/repos', {sessionId: 'sess_1'});
+    const netProto = computePermissionScope('WebFetch', 'https://api.github.com/repos', {sessionId: 'sess_1'});
+    assert.equal(netBridge.allowSessionRule, true);
+    assert.equal(netBridge.scopeKey, netProto.scopeKey);
 });
 
 test('Markdown to Pango parser safely escapes XML and maintains frozen block stability during large streaming', () => {
@@ -531,6 +591,9 @@ test('ZCode AskUserQuestion interactive Q&A parses questions, blocks session aut
         requestId: 'req_ask_1',
         toolCallId: 'call_ask_1',
         decision: 'modify',
+        autoApproved: false,
+        timedOut: false,
+        scopeKey: '',
     });
 });
 

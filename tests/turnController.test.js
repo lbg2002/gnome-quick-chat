@@ -53,8 +53,30 @@ test('Cancel Turn A and immediately start Turn B: late callbacks from Turn A nev
     assert.equal(persisted.length, 2); // Partial A (saved on cancel) + Answer B
     const settledEvents = events.filter(e => e.type === 'agent_settled');
     assert.equal(settledEvents.length, 2);
-    assert.deepEqual(settledEvents[0], {turnId: turnA.id, type: 'agent_settled', aborted: true});
-    assert.deepEqual(settledEvents[1], {turnId: turnB.id, type: 'agent_settled', aborted: false});
+    assert.deepEqual(settledEvents[0], {
+        turnId: turnA.id,
+        messageId: turnA.messageId,
+        sessionId: '',
+        clientGeneration: 0,
+        type: 'agent_settled',
+        status: 'cancelled',
+        aborted: true,
+        timedOut: false,
+        interrupted: false,
+        errorMessage: '',
+    });
+    assert.deepEqual(settledEvents[1], {
+        turnId: turnB.id,
+        messageId: turnB.messageId,
+        sessionId: '',
+        clientGeneration: 0,
+        type: 'agent_settled',
+        status: 'completed',
+        aborted: false,
+        timedOut: false,
+        interrupted: false,
+        errorMessage: '',
+    });
 });
 
 test('Duplicate end events and simultaneous timeout + abort settle at most once and clean temp files', () => {

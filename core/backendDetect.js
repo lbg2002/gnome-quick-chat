@@ -2,7 +2,9 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {
     expandHomePath,
+    parseCodexHelpCapabilities,
     parseCodexProviderCatalog,
+    parseZCodeHelpCapabilities,
     parseZCodeProviderCatalog,
 } from '../protocol.js';
 import {
@@ -13,6 +15,7 @@ import {
 } from './configMigration.js';
 
 const Decoder = new TextDecoder('utf-8');
+const cliCapabilitiesCache = new Map();
 
 export function readJsonFileSync(path) {
     if (!path || !GLib.file_test(path, GLib.FileTest.EXISTS)) return null;
@@ -58,8 +61,8 @@ function readFileHeadSync(path, maxBytes = 2048) {
     }
 }
 
-function probeCliVersionSync(executablePath) {
-    if (!executablePath || !GLib.file_test(executablePath, GLib.FileTest.IS_EXECUTABLE)) {
+function runShortProbeCommandSync(argv, extraEnv = {}, maxChars = 8192) {
+    if (!Array.isArray(argv) || !argv.length || !argv[0] || !GLib.file_test(argv[0], GLib.FileTest.IS_EXECUTABLE)) {
         return '';
     }
     try {
@@ -67,9 +70,12 @@ function probeCliVersionSync(executablePath) {
             flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
         });
         launcher.setenv('NO_COLOR', '1', true);
-        const proc = launcher.spawnv([executablePath, '--version']);
+        for (const [k, v] of Object.entries(extraEnv)) {
+            launcher.setenv(k, String(v), true);
+        }
+        const proc = launcher.spawnv(argv);
         let timedOut = false;
-        const killTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
+        const killTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1400, () => {
             timedOut = true;
             try { proc.force_exit(); } catch (_) {}
             return GLib.SOURCE_REMOVE;
@@ -84,10 +90,47 @@ function probeCliVersionSync(executablePath) {
             try { GLib.source_remove(killTimer); } catch (_) {}
         }
         if (timedOut) return '';
-        return `${stdout}\n${stderr}`.trim().slice(0, 400);
+        return `${stdout}\n${stderr}`.trim().slice(0, maxChars);
     } catch (_) {
         return '';
     }
+}
+
+function probeCliVersionSync(executablePath) {
+    return runShortProbeCommandSync([executablePath, '--version'], {}, 400);
+}
+
+/**
+ * Probes and caches actual CLI flags (`--help` / `exec --help` + `--version`) so Quick Chat
+ * validates supported arguments rather than assuming all CLI versions accept identical flags.
+ */
+export function probeCliCapabilities(backend, commandPrefixOrExe, extraEnv = {}) {
+    const prefix = Array.isArray(commandPrefixOrExe)
+        ? commandPrefixOrExe.filter(Boolean)
+        : [String(commandPrefixOrExe || '').trim()].filter(Boolean);
+    if (!prefix.length) {
+        return backend === 'zcode'
+            ? parseZCodeHelpCapabilities('', '')
+            : parseCodexHelpCapabilities('', '');
+    }
+
+    const cacheKey = `${backend}:${prefix.join('\u0000')}`;
+    if (cliCapabilitiesCache.has(cacheKey)) {
+        return cliCapabilitiesCache.get(cacheKey);
+    }
+
+    const versionOut = runShortProbeCommandSync([...prefix, '--version'], extraEnv, 500);
+    const helpArgs = backend === 'codex' ? [...prefix, 'exec', '--help'] : [...prefix, '--help'];
+    let helpOut = runShortProbeCommandSync(helpArgs, extraEnv, 12000);
+    if (!helpOut && backend === 'codex') {
+        helpOut = runShortProbeCommandSync([...prefix, '--help'], extraEnv, 12000);
+    }
+
+    const parsed = backend === 'zcode'
+        ? parseZCodeHelpCapabilities(helpOut, versionOut)
+        : parseCodexHelpCapabilities(helpOut, versionOut);
+    cliCapabilitiesCache.set(cacheKey, parsed);
+    return parsed;
 }
 
 export function listNvmBinDirs(homeDir) {

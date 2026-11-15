@@ -8,21 +8,23 @@ import {
     buildCrossBackendPromptWithContext,
     buildZCodeArgs,
     buildZCodePersonalConfigOverride,
+    getBackendCapabilities,
     mapReasoningEffort,
-    normalizeEvent,
+    normalizeEffectiveAgentMode,
     normalizeOpenAIEndpoint,
     parseOpenAISSELine,
-    stripAnsi,
 } from './protocol.js';
 import {
     buildSearchPath,
     createGioCliEnv,
     detectBackendSelection,
     findExecutableInDirs,
+    probeCliCapabilities,
     readJsonFileSync,
 } from './core/backendDetect.js';
 import {UNCONFIGURED_BACKEND_MESSAGE} from './core/configMigration.js';
 import {
+    cleanupStaleRuntimeFiles,
     getPrivateRuntimeDir,
     getUserSpecialDirs,
     removeFileQuietly,
@@ -30,18 +32,64 @@ import {
 } from './core/paths.js';
 import {SessionStore} from './core/sessionStore.js';
 import {TurnController} from './core/turnController.js';
+import {
+    BRIDGE_EXPECTED_PROTOCOL_VERSION,
+    CliTurnMonitor,
+    DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS,
+    DEFAULT_KILL_GRACE_MS,
+    buildProcessGroupKillArgv,
+    evaluateSubprocessOutcome,
+    isSafeProcessGroupId,
+    prepareZCodeConfigOverride,
+    validateCliPromptLength,
+    wrapArgvWithSetsid,
+} from './runtime/cliProcessRunner.js';
 
 export {buildSearchPath, findExecutableInDirs};
 
 const Encoder = new TextEncoder();
 const Decoder = new TextDecoder('utf-8');
+const DEFAULT_APPROVAL_TIMEOUT_SEC = 300;
+
+function resolveKillExecutable() {
+    if (GLib.file_test('/bin/kill', GLib.FileTest.IS_EXECUTABLE)) return '/bin/kill';
+    if (GLib.file_test('/usr/bin/kill', GLib.FileTest.IS_EXECUTABLE)) return '/usr/bin/kill';
+    return '';
+}
+
+function resolveSetsidExecutable(pathDirs = []) {
+    if (GLib.file_test('/usr/bin/setsid', GLib.FileTest.IS_EXECUTABLE)) return '/usr/bin/setsid';
+    if (GLib.file_test('/bin/setsid', GLib.FileTest.IS_EXECUTABLE)) return '/bin/setsid';
+    return findExecutableInDirs('setsid', pathDirs) || '';
+}
+
+function signalIsolatedProcessGroup(pgid, signalName, killBin) {
+    if (!killBin || !isSafeProcessGroupId(pgid)) return false;
+    try {
+        const argv = buildProcessGroupKillArgv(pgid, signalName, killBin);
+        const killer = Gio.Subprocess.new(
+            argv,
+            Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE
+        );
+        killer.wait_async(null, (p, res) => {
+            try { p.wait_finish(res); } catch (_) {}
+        });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
 
 /**
- * Sends SIGTERM first, gives the CLI subprocess 800ms to flush & reap children cleanly,
- * and falls back to SIGKILL (force_exit) only if it has not exited in time.
+ * Terminates a CLI subprocess and its isolated `setsid` process group cleanly:
+ * sends SIGTERM first, gives DEFAULT_KILL_GRACE_MS (800ms) for clean exit,
+ * and escalates to SIGKILL only within the child's own isolated process group.
  */
-function terminateSubprocessGracefully(proc) {
+function terminateProcessTreeGracefully(proc, {pgid = 0, isolatedProcessGroup = false} = {}) {
     if (!proc) return;
+    const killBin = isolatedProcessGroup ? resolveKillExecutable() : '';
+    const canKillGroup = Boolean(isolatedProcessGroup && killBin && isSafeProcessGroupId(pgid));
+
     let exited = false;
     try {
         proc.wait_async(null, (p, res) => {
@@ -50,83 +98,57 @@ function terminateSubprocessGracefully(proc) {
         });
     } catch (_) {}
 
+    if (canKillGroup) {
+        signalIsolatedProcessGroup(pgid, 'TERM', killBin);
+    }
     try {
         proc.send_signal(15); // SIGTERM
     } catch (_) {
+        if (canKillGroup) signalIsolatedProcessGroup(pgid, 'KILL', killBin);
         try { proc.force_exit(); } catch (__) {}
         return;
     }
 
-    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, DEFAULT_KILL_GRACE_MS, () => {
         if (!exited) {
+            if (canKillGroup) {
+                signalIsolatedProcessGroup(pgid, 'KILL', killBin);
+            }
             try { proc.force_exit(); } catch (_) {}
         }
         return GLib.SOURCE_REMOVE;
     });
 }
 
+function createDefaultZCodeConfigIo() {
+    return {
+        homeDir: GLib.get_home_dir(),
+        fileExists: p => Boolean(p && GLib.file_test(p, GLib.FileTest.EXISTS)),
+        readJson: readJsonFileSync,
+        getRuntimeDir: getPrivateRuntimeDir,
+        makeUuid: () => GLib.uuid_string_random(),
+        writePrivateFile: (p, bytes) => writePrivateFileSync(p, bytes),
+        removeFile: removeFileQuietly,
+    };
+}
+
 /**
- * Generates an isolated, 0600-permission temporary ZCode personal provider config file
- * inside XDG_RUNTIME_DIR/gnome-quick-chat without EVER modifying ~/.zcode/v2/provider_config.json.
+ * Generates and verifies an isolated 0600 temporary ZCode personal provider config file
+ * inside XDG_RUNTIME_DIR/gnome-quick-chat without modifying ~/.zcode/v2/provider_config.json.
+ *
+ * Fail-closed (Stage B2): if the user explicitly configured provider, model, or reasoningEffort
+ * and the config cannot be read, applied, written, or verified on disk, throws an explicit Error
+ * rather than silently running another model.
  */
-function createIsolatedZCodeConfigOverride(config) {
-    const home = GLib.get_home_dir();
-    const personalPath = GLib.build_filenamev([home, '.zcode', 'v2', 'provider_config.json']);
-    if (!GLib.file_test(personalPath, GLib.FileTest.EXISTS)) {
-        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
-    }
-    const personalObj = readJsonFileSync(personalPath);
-    if (!personalObj) {
-        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
-    }
-
-    const desiredProvider = (config?.provider || '').trim();
-    const desiredModel = (config?.model || '').trim();
-    const reasoningEffort = (config?.reasoningEffort || 'default').trim();
-
-    if (!desiredProvider && !desiredModel && (!reasoningEffort || reasoningEffort === 'default')) {
-        const defSel = personalObj?.config?.defaultModelSelection;
-        return {
-            env: {},
-            tempFilePath: '',
-            resolvedProvider: defSel?.providerId || '',
-            resolvedModel: defSel?.modelId || '',
-        };
-    }
-
-    const override = buildZCodePersonalConfigOverride(personalObj, {
-        provider: desiredProvider,
-        model: desiredModel,
-        reasoningEffort,
-    });
-    if (!override || !override.configObj) {
-        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
-    }
-
-    try {
-        const runtimeDir = getPrivateRuntimeDir();
-        const tempFilePath = GLib.build_filenamev([
-            runtimeDir,
-            `zcode-provider-${GLib.uuid_string_random()}.json`,
-        ]);
-        const bytes = Encoder.encode(JSON.stringify(override.configObj, null, 2));
-        writePrivateFileSync(tempFilePath, bytes);
-        return {
-            env: {ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: tempFilePath},
-            tempFilePath,
-            resolvedProvider: override.providerId,
-            resolvedModel: override.modelId,
-        };
-    } catch (err) {
-        console.warn(`[Quick Chat] Failed to write isolated ZCode config: ${err.message}`);
-        return {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
-    }
+export function createIsolatedZCodeConfigOverride(config, ioEnv = null) {
+    return prepareZCodeConfigOverride(config, ioEnv || createDefaultZCodeConfigIo());
 }
 
 export function resolveBackendRuntime(config = {}) {
     const rawZCodePath = String(config.zcodePath || '').trim();
     const rawCodexPath = String(config.codexPath || '').trim();
     const rawBaseUrl = String(config.openaiBaseUrl || '').trim();
+    const requestedMode = String(config.mode || 'readonly').trim();
 
     const selection = detectBackendSelection({
         configuredBackend: config.backend || 'auto',
@@ -142,6 +164,10 @@ export function resolveBackendRuntime(config = {}) {
             available: false,
             reason: selection.reason || UNCONFIGURED_BACKEND_MESSAGE,
             label: '未配置后端',
+            resolvedProvider: '',
+            resolvedModel: '',
+            capabilities: getBackendCapabilities('unconfigured', requestedMode),
+            effectiveModeInfo: {effectiveMode: 'chat', downgradedFromChat: false, notice: ''},
         };
     }
 
@@ -151,6 +177,7 @@ export function resolveBackendRuntime(config = {}) {
 
     if (effective === 'openai') {
         const modelId = String(config.openaiModel || config.model || '').trim();
+        const effectiveModeInfo = normalizeEffectiveAgentMode('openai', requestedMode);
         return {
             backend: 'openai',
             available: true,
@@ -159,9 +186,13 @@ export function resolveBackendRuntime(config = {}) {
             modelsUrl: normalizeOpenAIEndpoint(rawBaseUrl, '/models'),
             apiKey: String(config.openaiApiKey || '').trim(),
             modelId,
+            resolvedProvider: 'openai',
+            resolvedModel: modelId,
             systemPrompt: String(config.systemPrompt || '').trim(),
             reasoningEffort: mapReasoningEffort(config.reasoningEffort),
             label: modelId || 'OpenAI API',
+            capabilities: getBackendCapabilities('openai', effectiveModeInfo.effectiveMode),
+            effectiveModeInfo,
         };
     }
 
@@ -188,6 +219,10 @@ export function resolveBackendRuntime(config = {}) {
                 reasoningEffort: config.reasoningEffort || 'default',
             })
             : null;
+        const resolvedProvider = preview?.providerId
+            || config.provider
+            || personalObj?.config?.defaultModelSelection?.providerId
+            || '';
         const effectiveModel = preview?.modelId
             || config.model
             || personalObj?.config?.defaultModelSelection?.modelId
@@ -216,52 +251,66 @@ export function resolveBackendRuntime(config = {}) {
                 ? defaultBundledCjs
                 : '');
 
+        const setsidPath = resolveSetsidExecutable(pathDirs);
         const nodeExe = findExecutableInDirs('node', pathDirs);
+
+        let executable = '';
+        let commandPrefix = [];
+        let extraEnv = {...baseEnv};
+        let pathEnv = '';
+        let probePrefix = [];
+        let probeEnv = {...baseEnv};
+
         if (cjsTarget) {
             if (nodeExe) {
-                return {
-                    backend: 'zcode',
-                    available: true,
-                    executable: nodeExe,
-                    commandPrefix: [nodeExe, ...bridgeArgs, cjsTarget],
-                    extraEnv: baseEnv,
-                    pathEnv: buildSearchPath(nodeExe).join(':'),
-                    label,
-                };
+                executable = nodeExe;
+                commandPrefix = [nodeExe, ...bridgeArgs, cjsTarget];
+                probePrefix = [nodeExe, cjsTarget];
+                pathEnv = buildSearchPath(nodeExe).join(':');
+            } else {
+                const electronExe = '/opt/ZCode/zcode';
+                if (!GLib.file_test(electronExe, GLib.FileTest.IS_EXECUTABLE)) {
+                    throw new Error('找到 ZCode 脚本但缺少 Node 或 Electron 运行时');
+                }
+                executable = electronExe;
+                commandPrefix = [electronExe, ...bridgeArgs, cjsTarget];
+                probePrefix = [electronExe, cjsTarget];
+                extraEnv = {...baseEnv, ELECTRON_RUN_AS_NODE: '1'};
+                probeEnv = {...baseEnv, ELECTRON_RUN_AS_NODE: '1'};
+                pathEnv = pathDirs.join(':');
             }
-
-            const electronExe = '/opt/ZCode/zcode';
-            if (GLib.file_test(electronExe, GLib.FileTest.IS_EXECUTABLE)) {
-                return {
-                    backend: 'zcode',
-                    available: true,
-                    executable: electronExe,
-                    commandPrefix: [electronExe, ...bridgeArgs, cjsTarget],
-                    extraEnv: {...baseEnv, ELECTRON_RUN_AS_NODE: '1'},
-                    pathEnv: pathDirs.join(':'),
-                    label,
-                };
+        } else {
+            const zcodeExe = resolvedCustom || findExecutableInDirs('zcode', pathDirs);
+            if (!zcodeExe) {
+                throw new Error('未检测到本机 ZCode CLI，请安装 ZCode 或在设置中检查路径');
             }
-            throw new Error('找到 ZCode 脚本但缺少 Node 或 Electron 运行时');
+            executable = zcodeExe;
+            commandPrefix = [zcodeExe];
+            probePrefix = [zcodeExe];
+            pathEnv = buildSearchPath(zcodeExe).join(':');
+            if (bridgePath && !bridgePath.includes('"')) {
+                const existingNodeOpts = GLib.getenv('NODE_OPTIONS') || '';
+                extraEnv.NODE_OPTIONS = `${existingNodeOpts} --require "${bridgePath}"`.trim();
+            }
         }
 
-        const zcodeExe = resolvedCustom || findExecutableInDirs('zcode', pathDirs);
-        if (!zcodeExe) {
-            throw new Error('未检测到本机 ZCode CLI，请安装 ZCode 或在设置中检查路径');
-        }
-        const extraEnv = {...baseEnv};
-        if (bridgePath && !bridgePath.includes('"')) {
-            const existingNodeOpts = GLib.getenv('NODE_OPTIONS') || '';
-            extraEnv.NODE_OPTIONS = `${existingNodeOpts} --require "${bridgePath}"`.trim();
-        }
+        const cliCapabilities = probeCliCapabilities('zcode', probePrefix, probeEnv);
+        const effectiveModeInfo = normalizeEffectiveAgentMode('zcode', requestedMode, cliCapabilities);
         return {
             backend: 'zcode',
             available: true,
-            executable: zcodeExe,
-            commandPrefix: [zcodeExe],
+            executable,
+            commandPrefix,
+            bridgePath,
+            setsidPath,
             extraEnv,
-            pathEnv: buildSearchPath(zcodeExe).join(':'),
+            pathEnv,
+            resolvedProvider,
+            resolvedModel: effectiveModel,
             label,
+            cliCapabilities,
+            effectiveModeInfo,
+            capabilities: getBackendCapabilities('zcode', effectiveModeInfo.effectiveMode, cliCapabilities),
         };
     }
 
@@ -272,12 +321,22 @@ export function resolveBackendRuntime(config = {}) {
         if (!codexExe) {
             throw new Error('未检测到本机 Codex CLI 可执行文件');
         }
+        const setsidPath = resolveSetsidExecutable(cliEnv.pathDirs);
+        const cliCapabilities = probeCliCapabilities('codex', [codexExe], {});
+        const effectiveModeInfo = normalizeEffectiveAgentMode('codex', requestedMode, cliCapabilities);
+        const resolvedModel = String(config.model || '').trim();
         return {
             backend: 'codex',
             available: true,
             executable: codexExe,
+            setsidPath,
             pathEnv: buildSearchPath(codexExe).join(':'),
-            label: config.model || 'Codex',
+            resolvedProvider: String(config.provider || 'openai').trim(),
+            resolvedModel,
+            label: resolvedModel || 'Codex',
+            cliCapabilities,
+            effectiveModeInfo,
+            capabilities: getBackendCapabilities('codex', effectiveModeInfo.effectiveMode, cliCapabilities),
         };
     }
 
@@ -289,7 +348,7 @@ export class BackendClient {
         this._event = onEvent;
         this._exit = onExit;
         this._closed = false;
-        this._stderrLines = [];
+        this._clientGeneration = 0;
         this._httpSession = null;
         this._approvedScopes = new Set();
         this._turns = new TurnController(evt => {
@@ -298,12 +357,14 @@ export class BackendClient {
         this._store = null;
     }
 
-    start(config, workspace, sessionDir, sessionId) {
+    start(config, workspace, sessionDir, sessionId, options = {}) {
         this._config = config;
         this._workspace = workspace;
         this._sessionDir = sessionDir;
         this._sessionId = sessionId;
+        this._clientGeneration = Number(options.clientGeneration || 0);
         this._specialDirs = getUserSpecialDirs();
+        cleanupStaleRuntimeFiles();
         this._runtime = resolveBackendRuntime(config);
         this._backend = this._runtime.backend;
 
@@ -311,6 +372,10 @@ export class BackendClient {
             this._httpSession = new Soup.Session({timeout: 120});
         }
         this._store = new SessionStore(sessionId);
+    }
+
+    revokeApprovedScopes() {
+        this._approvedScopes.clear();
     }
 
     _buildXdgEnvVars() {
@@ -333,20 +398,10 @@ export class BackendClient {
         }
     }
 
-    _readStderr(stream, cancellable) {
-        if (this._closed || !stream) return;
-        stream.read_line_async(GLib.PRIORITY_DEFAULT, cancellable, (src, result) => {
-            if (this._closed) return;
-            try {
-                const [line] = src.read_line_finish_utf8(result);
-                if (line === null) return;
-                const clean = stripAnsi(line).trim();
-                if (clean) {
-                    this._stderrLines.push(clean);
-                    if (this._stderrLines.length > 8) this._stderrLines.shift();
-                }
-                this._readStderr(stream, cancellable);
-            } catch (_) {}
+    _terminateTurnProcess(turn, proc) {
+        terminateProcessTreeGracefully(proc, {
+            pgid: turn?.processGroupId || 0,
+            isolatedProcessGroup: Boolean(turn?.isolatedProcessGroup),
         });
     }
 
@@ -363,19 +418,38 @@ export class BackendClient {
                 backend: this._backend,
                 unconfigured: this._backend === 'unconfigured',
                 reason: this._runtime?.reason || '',
-                model: {id: this._runtime.label},
+                model: {
+                    id: this._runtime.label,
+                    provider: this._runtime.resolvedProvider || '',
+                    modelId: this._runtime.resolvedModel || '',
+                },
+                capabilities: this._runtime.capabilities || null,
+                effectiveMode: this._runtime.effectiveModeInfo?.effectiveMode || (this._config?.mode || 'readonly'),
+                modeNotice: this._runtime.effectiveModeInfo?.notice || '',
+                cliVersion: this._runtime.cliCapabilities?.version || '',
             };
         }
         if (type === 'get_messages') {
             return {messages: this._store ? [...this._store.messages] : []};
         }
+        if (type === 'revoke_scopes') {
+            this.revokeApprovedScopes();
+            return {revoked: true};
+        }
         if (type === 'abort') {
+            const active = this._turns.activeTurn;
+            if (!active || active.finalized) {
+                return {aborted: false};
+            }
+            if (fields.turnId && active.id !== String(fields.turnId)) {
+                return {aborted: false, stale: true};
+            }
             this._turns.cancelActiveTurn({
                 onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
-                onTerminateProcess: proc => terminateSubprocessGracefully(proc),
+                onTerminateProcess: proc => this._terminateTurnProcess(active, proc),
                 onCleanupTempFiles: files => files.forEach(removeFileQuietly),
             });
-            return {aborted: true};
+            return {aborted: true, turnId: active.id};
         }
         if (type === 'permission_response') {
             return this._sendTurnPermissionResponse(fields);
@@ -384,32 +458,49 @@ export class BackendClient {
             if (this._backend === 'unconfigured') {
                 throw new Error(this._runtime?.reason || UNCONFIGURED_BACKEND_MESSAGE);
             }
+            const turnMeta = {
+                turnId: fields.turnId || '',
+                messageId: fields.messageId || '',
+                clientGeneration: fields.clientGeneration ?? this._clientGeneration,
+                lifecycleGeneration: fields.lifecycleGeneration ?? 0,
+            };
             if (this._backend === 'openai') {
-                return this._runOpenAITurn(fields.message || '');
+                return this._runOpenAITurn(fields.message || '', turnMeta);
             }
-            return this._runSingleTurnSubprocess(fields.message || '');
+            return this._runSingleTurnSubprocess(fields.message || '', turnMeta);
         }
         return {};
     }
 
     _sendTurnPermissionResponse({
+        turnId = '',
         requestId = '',
         decision = 'deny',
         alwaysAllow = false,
+        allowSessionRule = false,
         scopeKey = '',
         modifiedInput = undefined,
         reason = '',
     } = {}) {
         const turn = this._turns.activeTurn;
-        if (!turn || turn.finalized || !turn.stdin) {
-            return Promise.resolve({sent: false});
+        const cleanReqId = String(requestId || '').trim();
+        if (!turn || turn.finalized || !turn.stdin || !cleanReqId) {
+            return Promise.resolve({sent: false, rejected: 'no_active_turn_or_request_id'});
+        }
+        if (turnId && String(turnId) !== turn.id) {
+            return Promise.resolve({sent: false, rejected: 'turn_id_mismatch'});
+        }
+        if (!turn.pendingApprovals.has(cleanReqId)) {
+            return Promise.resolve({sent: false, rejected: 'unknown_or_already_resolved_request'});
         }
 
+        const effectiveAlwaysAllow = Boolean(decision === 'allow' && alwaysAllow && allowSessionRule && scopeKey);
         const msgObj = {
             type: 'permission_response',
-            requestId,
-            decision,
-            alwaysAllow: Boolean(alwaysAllow),
+            turnId: turn.id,
+            requestId: cleanReqId,
+            decision: decision === 'allow' ? 'allow' : 'deny',
+            alwaysAllow: effectiveAlwaysAllow,
         };
         if (modifiedInput !== undefined) {
             msgObj.modifiedInput = modifiedInput;
@@ -426,11 +517,11 @@ export class BackendClient {
                     try {
                         stream.write_all_finish(res);
                         stream.flush_async(GLib.PRIORITY_DEFAULT, turn.cancellable, () => {});
-                        if (this._turns.isCurrent(turn)) {
-                            if (decision === 'allow' && alwaysAllow && scopeKey) {
+                        if (this._turns.matchesIdentity(turn, {turnId: turn.id})) {
+                            if (effectiveAlwaysAllow) {
                                 this._approvedScopes.add(scopeKey);
                             }
-                            this._turns.leaveApproval(turn, requestId);
+                            this._turns.leaveApproval(turn, cleanReqId);
                         }
                         resolve({sent: true});
                     } catch (_) {
@@ -457,12 +548,15 @@ export class BackendClient {
             timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutSec, () => {
                 timerId = 0;
                 if (this._turns.isCurrent(turn)) {
+                    turn.timedOut = true;
                     try { turn.cancellable?.cancel?.(); } catch (_) {}
                     this._turns.finalizeTurn(turn, {
-                        errorText: onTimeoutMessage,
+                        status: 'timed_out',
+                        timedOut: true,
                         aborted: false,
+                        errorText: onTimeoutMessage,
                         onPersistAssistant: msg => this._store?.appendMessage(msg, this._backend, this._config),
-                        onTerminateProcess: proc => terminateSubprocessGracefully(proc),
+                        onTerminateProcess: proc => this._terminateTurnProcess(turn, proc),
                         onCleanupTempFiles: files => files.forEach(removeFileQuietly),
                     });
                 }
@@ -473,6 +567,39 @@ export class BackendClient {
         turn.resetWatchdog = reset;
         turn.cleanupWatchdog = pause;
         reset();
+    }
+
+    _attachApprovalWatchdog(turn, timeoutSec = DEFAULT_APPROVAL_TIMEOUT_SEC) {
+        let approvalTimerId = 0;
+        const clearApproval = () => {
+            if (approvalTimerId) {
+                try { GLib.source_remove(approvalTimerId); } catch (_) {}
+                approvalTimerId = 0;
+            }
+        };
+        const startApproval = () => {
+            clearApproval();
+            if (!this._turns.isCurrent(turn) || timeoutSec <= 0) return;
+            approvalTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutSec, () => {
+                approvalTimerId = 0;
+                if (this._turns.isCurrent(turn)) {
+                    turn.timedOut = true;
+                    try { turn.cancellable?.cancel?.(); } catch (_) {}
+                    this._turns.finalizeTurn(turn, {
+                        status: 'timed_out',
+                        timedOut: true,
+                        aborted: false,
+                        errorText: `等待工具审批超时（${timeoutSec}s），已安全拒绝并终止本轮任务`,
+                        onPersistAssistant: msg => this._store?.appendMessage(msg, this._backend, this._config),
+                        onTerminateProcess: proc => this._terminateTurnProcess(turn, proc),
+                        onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+                    });
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+        };
+        turn.startApprovalWatchdog = startApproval;
+        turn.clearApprovalWatchdog = clearApproval;
     }
 
     _discoverOpenAIModelAsync(cancellable) {
@@ -491,6 +618,11 @@ export class BackendClient {
             this._httpSession.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, cancellable, (sess, res) => {
                 try {
                     const bytes = sess.send_and_read_finish(res);
+                    const status = msg.get_status();
+                    if (status < 200 || status >= 300) {
+                        reject(new Error(`拉取 /models 失败（HTTP ${status}），请在设置中手动填写模型 ID`));
+                        return;
+                    }
                     const text = Decoder.decode(bytes.get_data() || new Uint8Array());
                     const parsed = JSON.parse(text);
                     const list = Array.isArray(parsed.data) ? parsed.data : [];
@@ -500,6 +632,7 @@ export class BackendClient {
                         return;
                     }
                     this._runtime.modelId = firstId;
+                    this._runtime.resolvedModel = firstId;
                     this._runtime.label = firstId;
                     resolve(firstId);
                 } catch (e) {
@@ -509,9 +642,14 @@ export class BackendClient {
         });
     }
 
-    async _runOpenAITurn(promptText) {
+    async _runOpenAITurn(promptText, turnMeta = {}) {
         const cancellable = new Gio.Cancellable();
         const turn = this._turns.beginTurn({
+            turnId: turnMeta.turnId,
+            messageId: turnMeta.messageId,
+            sessionId: this._sessionId,
+            clientGeneration: turnMeta.clientGeneration ?? this._clientGeneration,
+            lifecycleGeneration: turnMeta.lifecycleGeneration ?? 0,
             backend: 'openai',
             promptText,
             cancellable,
@@ -523,7 +661,7 @@ export class BackendClient {
         try {
             modelId = await this._discoverOpenAIModelAsync(turn.cancellable);
         } catch (err) {
-            this._turns.finalizeTurn(turn, {errorText: err.message});
+            this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
             throw err;
         }
 
@@ -544,7 +682,7 @@ export class BackendClient {
         const msg = Soup.Message.new('POST', this._runtime.chatUrl);
         if (!msg) {
             const err = new Error(`无效的 OpenAI 接口地址：${this._runtime.chatUrl}`);
-            this._turns.finalizeTurn(turn, {errorText: err.message});
+            this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
             throw err;
         }
 
@@ -569,8 +707,17 @@ export class BackendClient {
         this._turns.emitForTurn(turn, {type: 'message_start', modelId, message: {role: 'assistant'}});
         this._attachTurnWatchdog(turn, 120, 'OpenAI 接口响应超时（120s）');
 
+        let dataStream = null;
+        const closeOpenAIStream = () => {
+            if (!dataStream) return;
+            const s = dataStream;
+            dataStream = null;
+            try { s.close_async(GLib.PRIORITY_DEFAULT, null, (st, r) => { try { st.close_finish(r); } catch (_) {} }); } catch (_) {}
+        };
+
         const nonSseLines = [];
         const settleOpenAI = (errorText = '') => {
+            closeOpenAIStream();
             if (!this._turns.isCurrent(turn)) return;
 
             if (!turn.text && nonSseLines.length > 0 && !errorText) {
@@ -591,23 +738,38 @@ export class BackendClient {
                 }
             }
 
-            // Detect abnormal SSE truncation (EOF without [DONE] marker)
-            if (!turn.aborted && !errorText && !turn.sawDoneMarker) {
-                if (!turn.text) {
-                    errorText = '响应连接意外中断（未收到完整流结束标记）';
-                } else {
-                    turn.text += '\n\n*(⚠️ 网络流提前中断，以上回答可能不完整)*';
-                }
+            let status = '';
+            let interrupted = false;
+            if (turn.timedOut) {
+                status = 'timed_out';
+            } else if (turn.aborted) {
+                status = 'cancelled';
+            } else if (errorText) {
+                status = 'failed';
+            } else if (!turn.sawDoneMarker) {
+                status = 'interrupted';
+                interrupted = true;
+                errorText = '响应连接意外中断（未收到完整流结束标记）';
+            } else {
+                status = 'completed';
             }
 
             this._turns.finalizeTurn(turn, {
+                status,
+                interrupted,
                 errorText,
                 onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
             });
         };
 
         this._httpSession.send_async(msg, GLib.PRIORITY_DEFAULT, turn.cancellable, (sess, res) => {
-            if (!this._turns.isCurrent(turn)) return;
+            if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                try {
+                    const staleStream = sess.send_finish(res);
+                    staleStream?.close_async(GLib.PRIORITY_DEFAULT, null, (st, r) => { try { st.close_finish(r); } catch (_) {} });
+                } catch (_) {}
+                return;
+            }
             let baseStream;
             try {
                 baseStream = sess.send_finish(res);
@@ -617,14 +779,17 @@ export class BackendClient {
             }
 
             const status = msg.get_status();
-            const dataStream = new Gio.DataInputStream({base_stream: baseStream});
+            dataStream = new Gio.DataInputStream({base_stream: baseStream});
 
             if (status < 200 || status >= 300) {
                 const errLines = [];
                 const readErr = () => {
-                    if (!this._turns.isCurrent(turn)) return;
+                    if (!this._turns.isCurrent(turn) || !dataStream) return;
                     dataStream.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
-                        if (!this._turns.isCurrent(turn)) return;
+                        if (!this._turns.isCurrent(turn)) {
+                            closeOpenAIStream();
+                            return;
+                        }
                         try {
                             const [line] = s.read_line_finish_utf8(r);
                             if (line !== null) {
@@ -655,9 +820,12 @@ export class BackendClient {
             }
 
             const readSseLine = () => {
-                if (!this._turns.isCurrent(turn)) return;
+                if (!this._turns.isCurrent(turn) || !dataStream) return;
                 dataStream.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
-                    if (!this._turns.isCurrent(turn)) return;
+                    if (!this._turns.isCurrent(turn)) {
+                        closeOpenAIStream();
+                        return;
+                    }
                     try {
                         const [line] = s.read_line_finish_utf8(r);
                         if (line === null) {
@@ -694,30 +862,103 @@ export class BackendClient {
             readSseLine();
         });
 
-        return {disposition: 'streaming'};
+        return {disposition: 'streaming', turnId: turn.id};
     }
 
-    _runSingleTurnSubprocess(promptText) {
+    _runSingleTurnSubprocess(promptText, turnMeta = {}) {
         const cancellable = new Gio.Cancellable();
         const turn = this._turns.beginTurn({
+            turnId: turnMeta.turnId,
+            messageId: turnMeta.messageId,
+            sessionId: this._sessionId,
+            clientGeneration: turnMeta.clientGeneration ?? this._clientGeneration,
+            lifecycleGeneration: turnMeta.lifecycleGeneration ?? 0,
             backend: this._backend,
             promptText,
             cancellable,
+            deferTempCleanupUntilProcessExit: true,
         });
+
+        const cliCaps = this._runtime?.cliCapabilities || null;
+        const modeInfo = normalizeEffectiveAgentMode(this._backend, this._config?.mode || 'readonly', cliCaps);
+        const effectiveMode = modeInfo.effectiveMode;
 
         const historyBeforePrompt = this._store ? [...this._store.messages] : [];
         const remoteId = this._store?.remoteSessionId || '';
         const promptWithDesktopEnv = augmentPromptWithDesktopContext(promptText, this._specialDirs, {
             isFirstTurn: !remoteId,
-            mode: this._config?.mode,
+            mode: effectiveMode,
             workspace: this._workspace,
         });
         const effectiveCliPrompt = (!remoteId && historyBeforePrompt.length > 0)
             ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptWithDesktopEnv)
             : promptWithDesktopEnv;
 
+        const requireBridgeHandshake = this._backend === 'zcode' && effectiveMode === 'readonly';
+        if (requireBridgeHandshake && !this._runtime?.bridgePath) {
+            const err = new Error('未找到 ZCode 权限审批桥接模块（zcodeBridge.cjs），已阻止在需审批模式下启动任务');
+            this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
+            return Promise.reject(err);
+        }
+
+        let zcodeIsolated = {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
+        let promptTempFilePath = '';
+        let rawArgv = [];
+        const useZCodePromptFile = Boolean(this._backend === 'zcode' && this._runtime?.bridgePath);
+        const useCodexStdin = Boolean(this._backend === 'codex' && cliCaps?.supportsStdinPrompt !== false);
+
+        try {
+            validateCliPromptLength(effectiveCliPrompt, {
+                viaArgv: !(useZCodePromptFile || useCodexStdin),
+            });
+
+            if (this._backend === 'zcode') {
+                zcodeIsolated = createIsolatedZCodeConfigOverride(this._config);
+                if (zcodeIsolated.tempFilePath) {
+                    turn.tempFiles.push(zcodeIsolated.tempFilePath);
+                }
+                if (zcodeIsolated.resolvedModel) {
+                    this._runtime.resolvedProvider = zcodeIsolated.resolvedProvider || this._runtime.resolvedProvider;
+                    this._runtime.resolvedModel = zcodeIsolated.resolvedModel;
+                    this._runtime.label = zcodeIsolated.resolvedModel;
+                }
+                if (useZCodePromptFile) {
+                    const runtimeDir = getPrivateRuntimeDir();
+                    promptTempFilePath = GLib.build_filenamev([
+                        runtimeDir,
+                        `zcode-prompt-${GLib.uuid_string_random()}.txt`,
+                    ]);
+                    writePrivateFileSync(promptTempFilePath, Encoder.encode(effectiveCliPrompt));
+                    turn.tempFiles.push(promptTempFilePath);
+                }
+            }
+
+            const spawnConfig = {
+                ...this._config,
+                mode: effectiveMode,
+                executable: this._runtime.executable,
+                commandPrefix: this._runtime.commandPrefix,
+                cliCapabilities: cliCaps,
+            };
+            rawArgv = this._backend === 'zcode'
+                ? buildZCodeArgs(spawnConfig, effectiveCliPrompt, remoteId, this._workspace, {
+                    cliCaps,
+                    usePromptFile: Boolean(promptTempFilePath),
+                })
+                : buildCodexArgs(spawnConfig, this._workspace, effectiveCliPrompt, remoteId, {
+                    cliCaps,
+                    stdinPrompt: useCodexStdin,
+                });
+        } catch (prepErr) {
+            this._turns.finalizeTurn(turn, {
+                status: 'failed',
+                errorText: prepErr.message,
+                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+            });
+            return Promise.reject(prepErr);
+        }
+
         this._store?.appendMessage({role: 'user', content: promptText}, this._backend, this._config);
-        this._stderrLines = [];
 
         const launcher = new Gio.SubprocessLauncher({
             flags:
@@ -729,17 +970,20 @@ export class BackendClient {
         launcher.setenv('PATH', this._runtime.pathEnv, true);
         launcher.setenv('NO_COLOR', '1', true);
 
-        const zcodeIsolated = this._backend === 'zcode'
-            ? createIsolatedZCodeConfigOverride(this._config)
-            : {env: {}, tempFilePath: ''};
-        if (zcodeIsolated.tempFilePath) {
-            turn.tempFiles.push(zcodeIsolated.tempFilePath);
-        }
-
         const turnExtraEnv = {
             ...this._buildXdgEnvVars(),
             ...(this._runtime.extraEnv || {}),
             ...zcodeIsolated.env,
+            QUICK_CHAT_SESSION_ID: String(this._sessionId || ''),
+            QUICK_CHAT_TURN_ID: String(turn.id || ''),
+            QUICK_CHAT_WORKSPACE: String(this._workspace || ''),
+            ...(promptTempFilePath ? {QUICK_CHAT_PROMPT_FILE: promptTempFilePath} : {}),
+            ...(requireBridgeHandshake
+                ? {
+                    QUICK_CHAT_REQUIRE_BRIDGE: '1',
+                    QUICK_CHAT_BRIDGE_PROTOCOL: String(BRIDGE_EXPECTED_PROTOCOL_VERSION),
+                }
+                : {}),
             ...(this._approvedScopes.size > 0
                 ? {QUICK_CHAT_APPROVED_SCOPES: JSON.stringify(Array.from(this._approvedScopes))}
                 : {}),
@@ -748,166 +992,333 @@ export class BackendClient {
             launcher.setenv(k, String(v), true);
         }
 
-        const spawnConfig = {
-            ...this._config,
-            executable: this._runtime.executable,
-            commandPrefix: this._runtime.commandPrefix,
-        };
-        const argv = this._backend === 'zcode'
-            ? buildZCodeArgs(spawnConfig, effectiveCliPrompt, remoteId, this._workspace)
-            : buildCodexArgs(spawnConfig, this._workspace, effectiveCliPrompt, remoteId);
+        const wrappedSpawn = wrapArgvWithSetsid(rawArgv, this._runtime.setsidPath);
+        const turnTempFiles = [...turn.tempFiles];
 
+        let proc;
         try {
-            turn.process = launcher.spawnv(argv);
-            if (this._backend === 'zcode') {
-                turn.stdin = turn.process.get_stdin_pipe();
-            } else {
-                try { turn.process.get_stdin_pipe()?.close(null); } catch (_) {}
-            }
-        } catch (error) {
+            proc = launcher.spawnv(wrappedSpawn.argv);
+            turn.process = proc;
+            turn.isolatedProcessGroup = wrappedSpawn.isolatedProcessGroup;
+            turn.processGroupId = Number.parseInt(proc.get_identifier?.() || '', 10) || 0;
+        } catch (spawnErr) {
             this._turns.finalizeTurn(turn, {
-                errorText: error.message,
+                status: 'failed',
+                errorText: spawnErr.message,
                 onCleanupTempFiles: files => files.forEach(removeFileQuietly),
             });
-            return Promise.reject(error);
+            return Promise.reject(spawnErr);
         }
 
-        const stdout = new Gio.DataInputStream({base_stream: turn.process.get_stdout_pipe()});
-        const stderr = new Gio.DataInputStream({base_stream: turn.process.get_stderr_pipe()});
-        this._readStderr(stderr, turn.cancellable);
+        const stdinPipe = proc.get_stdin_pipe();
+        if (this._backend === 'zcode') {
+            turn.stdin = stdinPipe;
+        } else if (useCodexStdin && stdinPipe) {
+            const promptBytes = Encoder.encode(effectiveCliPrompt);
+            stdinPipe.write_all_async(promptBytes, GLib.PRIORITY_DEFAULT, turn.cancellable, (s, r) => {
+                try {
+                    s.write_all_finish(r);
+                } catch (writeErr) {
+                    if (this._turns.isCurrent(turn) && !turn.aborted) {
+                        turn.error = `向 Codex CLI 写入提问内容失败：${writeErr.message}`;
+                    }
+                } finally {
+                    try { s.close_async(GLib.PRIORITY_DEFAULT, null, (st, cr) => { try { st.close_finish(cr); } catch (_) {} }); } catch (_) {}
+                }
+            });
+        } else if (stdinPipe) {
+            try { stdinPipe.close(null); } catch (_) {}
+        }
+
+        const stdout = new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()});
+        const stderr = new Gio.DataInputStream({base_stream: proc.get_stderr_pipe()});
+
+        const monitor = new CliTurnMonitor({
+            turnId: turn.id,
+            backend: this._backend,
+            requireBridgeHandshake,
+        });
+
+        let handshakeTimerId = 0;
+        const clearHandshakeTimer = () => {
+            if (handshakeTimerId) {
+                try { GLib.source_remove(handshakeTimerId); } catch (_) {}
+                handshakeTimerId = 0;
+            }
+        };
+
+        let stdoutDone = false;
+        let stderrDone = false;
+        let processExited = false;
+        let exitCode = null;
+        let termSignal = null;
+        let streamsClosed = false;
+
+        const closeIoPipes = () => {
+            if (streamsClosed) return;
+            streamsClosed = true;
+            try { stdout.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => { try { s.close_finish(r); } catch (_) {} }); } catch (_) {}
+            try { stderr.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => { try { s.close_finish(r); } catch (_) {} }); } catch (_) {}
+            if (turn.stdin) {
+                const st = turn.stdin;
+                turn.stdin = null;
+                try { st.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => { try { s.close_finish(r); } catch (_) {} }); } catch (_) {}
+            }
+        };
+
+        const abortTurnForFatalMonitorError = () => {
+            clearHandshakeTimer();
+            if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                return;
+            }
+            closeIoPipes();
+            this._turns.finalizeTurn(turn, {
+                status: 'failed',
+                errorText: monitor.fatalError || 'CLI 安全校验未通过',
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                onTerminateProcess: p => this._terminateTurnProcess(turn, p),
+                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+            });
+        };
+
+        const trySettleWhenComplete = () => {
+            if (!stdoutDone || !stderrDone || !processExited) return;
+            clearHandshakeTimer();
+            closeIoPipes();
+
+            if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                return;
+            }
+
+            if (requireBridgeHandshake && monitor.isHandshakePending) {
+                monitor.markHandshakeTimedOut();
+            }
+
+            const outcome = evaluateSubprocessOutcome({
+                exitCode,
+                termSignal,
+                sawDoneMarker: turn.sawDoneMarker,
+                turnError: turn.error,
+                fatalError: monitor.fatalError,
+                aborted: turn.aborted,
+                timedOut: turn.timedOut,
+                stderrSummary: monitor.getStderrSummary(),
+            });
+
+            this._turns.finalizeTurn(turn, {
+                status: outcome.status,
+                aborted: outcome.aborted,
+                timedOut: outcome.timedOut,
+                interrupted: outcome.interrupted,
+                errorText: outcome.errorMessage,
+                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
+                onTerminateProcess: p => this._terminateTurnProcess(turn, p),
+                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+            });
+        };
+
+        if (requireBridgeHandshake) {
+            handshakeTimerId = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT,
+                DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS,
+                () => {
+                    handshakeTimerId = 0;
+                    if (monitor.markHandshakeTimedOut()) {
+                        abortTurnForFatalMonitorError();
+                    }
+                    return GLib.SOURCE_REMOVE;
+                }
+            );
+        }
+
+        // Wait for real OS exit status and delete sensitive 0600 temp files ONLY after process exit!
+        proc.wait_async(null, (p, res) => {
+            try {
+                p.wait_finish(res);
+                if (p.get_if_exited()) {
+                    exitCode = p.get_exit_status();
+                }
+                if (p.get_if_signaled()) {
+                    termSignal = p.get_term_sig();
+                }
+            } catch (_) {}
+
+            for (const f of turnTempFiles) {
+                removeFileQuietly(f);
+            }
+            turn.tempFiles = [];
+
+            processExited = true;
+            trySettleWhenComplete();
+        });
+
+        const readStderrLoop = () => {
+            if (this._closed || turn.aborted || turn.timedOut) {
+                stderrDone = true;
+                trySettleWhenComplete();
+                return;
+            }
+            stderr.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (src, res) => {
+                if (this._closed) {
+                    stderrDone = true;
+                    return;
+                }
+                try {
+                    const [line] = src.read_line_finish_utf8(res);
+                    if (line === null) {
+                        stderrDone = true;
+                        trySettleWhenComplete();
+                        return;
+                    }
+                    if (this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                        monitor.pushStderrLine(turn.id, line);
+                    }
+                    readStderrLoop();
+                } catch (_) {
+                    stderrDone = true;
+                    trySettleWhenComplete();
+                }
+            });
+        };
 
         this._turns.markStreaming(turn);
         this._attachTurnWatchdog(turn, 120, '响应超时（120s 无输出）');
+        this._attachApprovalWatchdog(
+            turn,
+            Number(this._config?.approvalTimeoutSec) > 0
+                ? Number(this._config.approvalTimeoutSec)
+                : DEFAULT_APPROVAL_TIMEOUT_SEC
+        );
+
+        if (modeInfo.notice) {
+            this._turns.emitForTurn(turn, {
+                type: 'mode_notice',
+                effectiveMode,
+                message: modeInfo.notice,
+            });
+        }
 
         const seenPermissionIds = new Set();
 
-        const settleSubprocess = (errOverride = '') => {
-            if (!this._turns.isCurrent(turn)) return;
-            const errMsg = errOverride
-                || turn.error
-                || (!turn.text && !turn.aborted && this._stderrLines.length
-                    ? this._stderrLines.slice(-2).join(' ')
-                    : '');
-            this._turns.finalizeTurn(turn, {
-                errorText: errMsg,
-                onPersistAssistant: m => this._store?.appendMessage(m, this._backend, this._config),
-                onTerminateProcess: proc => terminateSubprocessGracefully(proc),
-                onCleanupTempFiles: files => files.forEach(removeFileQuietly),
-            });
-        };
-
-        const readNextLine = () => {
-            if (!this._turns.isCurrent(turn)) return;
+        const readStdoutLoop = () => {
+            if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                stdoutDone = true;
+                trySettleWhenComplete();
+                return;
+            }
             stdout.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (stream, res) => {
-                if (!this._turns.isCurrent(turn)) return;
+                if (!this._turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                    stdoutDone = true;
+                    trySettleWhenComplete();
+                    return;
+                }
                 try {
                     const [line] = stream.read_line_finish_utf8(res);
                     if (line === null) {
-                        settleSubprocess('');
+                        stdoutDone = true;
+                        trySettleWhenComplete();
                         return;
                     }
                     if (turn.state !== 'awaiting_approval') {
                         turn.resetWatchdog?.();
                     }
 
-                    const trimmed = line.trim();
-                    let record = null;
-                    if (trimmed.startsWith('{')) {
-                        try { record = JSON.parse(trimmed); } catch (_) {}
+                    const checked = monitor.processStdoutLine(turn.id, line);
+                    if (checked.fatalError) {
+                        abortTurnForFatalMonitorError();
+                        return;
                     }
-                    if (record) {
-                        const norm = normalizeEvent(this._backend, record);
-                        if (norm) {
-                            if (norm.type === 'bridge_ready') {
-                                if (!norm.patched && this._config?.mode === 'readonly') {
-                                    this._turns.emitForTurn(turn, {
-                                        type: 'bridge_warning',
-                                        message: '当前 ZCode 版本未命中交互审批钩子，敏感工具可能被默认拦截',
-                                    });
-                                }
-                            } else if (norm.type === 'permission_request') {
-                                if (!seenPermissionIds.has(norm.requestId)) {
-                                    seenPermissionIds.add(norm.requestId);
-                                    this._turns.enterApproval(turn, norm.requestId);
-                                    this._turns.emitForTurn(turn, norm);
-                                }
-                            } else if (norm.type === 'permission_resolved') {
-                                this._turns.leaveApproval(turn, norm.requestId);
+                    if (monitor.isHandshakeVerified) {
+                        clearHandshakeTimer();
+                    }
+
+                    const norm = checked.normalized;
+                    if (norm) {
+                        if (norm.type === 'bridge_ready') {
+                            this._turns.emitForTurn(turn, norm);
+                        } else if (norm.type === 'permission_request') {
+                            if (norm.requestId && !seenPermissionIds.has(norm.requestId)) {
+                                seenPermissionIds.add(norm.requestId);
+                                this._turns.enterApproval(turn, norm.requestId);
                                 this._turns.emitForTurn(turn, norm);
-                            } else if (norm.type === 'session_bound' && norm.sessionId) {
+                            }
+                        } else if (norm.type === 'permission_resolved') {
+                            if (norm.requestId) {
+                                this._turns.leaveApproval(turn, norm.requestId);
+                            }
+                            this._turns.emitForTurn(turn, norm);
+                        } else if (norm.type === 'session_bound' && norm.sessionId) {
+                            this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                        } else if (norm.type === 'turn_completed') {
+                            turn.sawDoneMarker = true;
+                        } else if (norm.type === 'turn_result') {
+                            if (norm.sessionId) {
                                 this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
-                            } else if (norm.type === 'turn_completed') {
-                                turn.sawDoneMarker = true;
-                            } else if (norm.type === 'turn_result') {
-                                if (norm.sessionId) {
-                                    this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
-                                }
-                                if (norm.text && !turn.text) {
-                                    turn.text = norm.text;
-                                }
-                            } else if (norm.type === 'text_snapshot') {
-                                const delta = norm.text.startsWith(turn.text)
-                                    ? norm.text.slice(turn.text.length)
-                                    : norm.text;
-                                turn.text = norm.text;
-                                if (delta) {
-                                    this._turns.emitForTurn(turn, {
-                                        type: 'message_update',
-                                        assistantMessageEvent: {type: 'text_delta', delta},
-                                    });
-                                }
-                            } else if (norm.type === 'thinking_snapshot') {
-                                const delta = norm.text.startsWith(turn.thinking)
-                                    ? norm.text.slice(turn.thinking.length)
-                                    : norm.text;
-                                turn.thinking = norm.text;
-                                if (delta) {
-                                    this._turns.emitForTurn(turn, {
-                                        type: 'message_update',
-                                        assistantMessageEvent: {type: 'thinking_delta', delta},
-                                    });
-                                }
+                            }
+                            if (norm.isError) {
+                                turn.error = norm.errorMessage || 'ZCode 执行返回错误';
                             } else {
-                                if (norm.sessionId) {
-                                    this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
-                                }
-                                if (norm.type === 'message_update') {
-                                    const ev = norm.assistantMessageEvent;
-                                    if (ev?.type === 'text_delta') turn.text += ev.delta || '';
-                                    if (ev?.type === 'thinking_delta') turn.thinking += ev.delta || '';
-                                    this._turns.emitForTurn(turn, norm);
-                                } else if (norm.type === 'message_end' && norm.message) {
-                                    if (typeof norm.message.content === 'string' && norm.message.content) {
-                                        turn.text = norm.message.content;
-                                    }
-                                    if (norm.message.errorMessage) {
-                                        turn.error = norm.message.errorMessage;
-                                    }
-                                    // Defer final `message_end` emission to `finalizeTurn` so it fires exactly once!
-                                } else {
-                                    this._turns.emitForTurn(turn, norm);
+                                turn.sawDoneMarker = true;
+                                if (norm.text && !turn.text) {
+                                    this._turns.replaceText(turn, norm.text);
                                 }
                             }
+                        } else if (norm.type === 'text_snapshot') {
+                            this._turns.replaceText(turn, norm.text);
+                        } else if (norm.type === 'thinking_snapshot') {
+                            this._turns.replaceThinking(turn, norm.text);
+                        } else if (norm.type === 'message_update') {
+                            if (norm.sessionId) {
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                            }
+                            const ev = norm.assistantMessageEvent;
+                            if (ev?.type === 'text_delta') {
+                                this._turns.appendText(turn, ev.delta || '');
+                            } else if (ev?.type === 'thinking_delta') {
+                                this._turns.appendThinking(turn, ev.delta || '');
+                            } else {
+                                this._turns.emitForTurn(turn, norm);
+                            }
+                        } else if (norm.type === 'message_end' && norm.message) {
+                            if (norm.sessionId) {
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                            }
+                            if (typeof norm.message.content === 'string' && norm.message.content) {
+                                this._turns.replaceText(turn, norm.message.content);
+                            }
+                            if (norm.message.errorMessage) {
+                                turn.error = norm.message.errorMessage;
+                            }
+                            // Defer final `message_end` emission to `finalizeTurn` after exit status verification.
+                        } else {
+                            if (norm.sessionId) {
+                                this._store?.setRemoteSessionId(norm.sessionId, this._backend, this._config);
+                            }
+                            this._turns.emitForTurn(turn, norm);
                         }
                     }
-                    readNextLine();
+                    readStdoutLoop();
                 } catch (err) {
-                    if (!turn.aborted) {
-                        settleSubprocess(err.message);
+                    stdoutDone = true;
+                    if (!turn.aborted && !turn.timedOut && !turn.error) {
+                        turn.error = err.message;
                     }
+                    trySettleWhenComplete();
                 }
             });
         };
 
-        readNextLine();
-        return Promise.resolve({disposition: 'streaming'});
+        readStderrLoop();
+        readStdoutLoop();
+        return Promise.resolve({disposition: 'streaming', turnId: turn.id});
     }
 
     close() {
         if (this._closed) return;
         this._closed = true;
+        const active = this._turns.activeTurn;
         this._turns.dispose(
-            proc => terminateSubprocessGracefully(proc),
+            proc => this._terminateTurnProcess(active, proc),
             files => files.forEach(removeFileQuietly)
         );
         try { this._httpSession?.abort(); } catch (_) {}

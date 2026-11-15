@@ -6,6 +6,7 @@ import Soup from 'gi://Soup?version=3.0';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 import {
     getBackendCapabilities,
+    normalizeEffectiveAgentMode,
     normalizeOpenAIEndpoint,
 } from './protocol.js';
 import {
@@ -413,17 +414,79 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const modes = ['chat', 'readonly', 'full'];
         const modeComboModel = Gtk.StringList.new([
             '纯问答 (禁用本地工具)',
-            '智能审批 Agent (推荐 · 敏感工具气泡内审批)',
-            '全自动 Agent (免审批自动执行一切工具)',
+            '需审批 Agent (推荐 · 敏感操作气泡内审批)',
+            '全自动高权限 Agent (高危 · 免审批直接执行)',
         ]);
         const modeRow = new Adw.ComboRow({
             title: 'Agent 权限模式',
             model: modeComboModel,
         });
         modeRow.selected = Math.max(0, modes.indexOf(getStr('agent-mode', 'readonly')));
+
+        const confirmEnableFullMode = onResult => {
+            const heading = '确认开启高权限「全自动 Agent」模式？';
+            const body =
+                '开启后，CLI Agent 将在不弹出审批提示的情况下直接执行本机 Shell 命令、修改或删除文件并访问网络。\n\n' +
+                '仅建议在受信任任务与受控工作目录中临时开启；日常使用建议保持「需审批 Agent」或「只读沙箱 Agent」。';
+            if (typeof Adw.AlertDialog === 'function') {
+                const dlg = new Adw.AlertDialog({heading, body});
+                dlg.add_response('cancel', '保持安全模式');
+                dlg.add_response('confirm', '我已知晓风险，开启全自动');
+                dlg.set_response_appearance('confirm', Adw.ResponseAppearance.DESTRUCTIVE);
+                dlg.set_default_response('cancel');
+                dlg.set_close_response('cancel');
+                dlg.connect('response', (_, resp) => onResult(resp === 'confirm'));
+                dlg.present(window);
+                return;
+            }
+            const dlg = new Adw.MessageDialog({
+                transient_for: window,
+                modal: true,
+                heading,
+                body,
+            });
+            dlg.add_response('cancel', '保持安全模式');
+            dlg.add_response('confirm', '我已知晓风险，开启全自动');
+            dlg.set_response_appearance('confirm', Adw.ResponseAppearance.DESTRUCTIVE);
+            dlg.set_default_response('cancel');
+            dlg.set_close_response('cancel');
+            dlg.connect('response', (_, resp) => {
+                onResult(resp === 'confirm');
+                try { dlg.destroy(); } catch (_) {}
+            });
+            dlg.present();
+        };
+
         modeRow.connect('notify::selected', () => {
             if (syncingModeCombo) return;
-            setStr('agent-mode', modes[modeRow.selected] || 'readonly');
+            const prevMode = getStr('agent-mode', 'readonly') || 'readonly';
+            let chosenMode = modes[modeRow.selected] || 'readonly';
+
+            // Codex CLI has no true tool-disabling flag; never pretend prompt text is a sandbox!
+            if (chosenMode === 'chat' && getEffectiveBackend() === 'codex') {
+                chosenMode = 'readonly';
+                syncingModeCombo = true;
+                modeRow.selected = modes.indexOf('readonly');
+                syncingModeCombo = false;
+            }
+
+            if (chosenMode === 'full' && prevMode !== 'full') {
+                const revertIdx = Math.max(0, modes.indexOf(prevMode));
+                confirmEnableFullMode(confirmed => {
+                    if (confirmed) {
+                        setStr('agent-mode', 'full');
+                        syncBackendCapabilitiesUi(getEffectiveBackend());
+                    } else {
+                        syncingModeCombo = true;
+                        modeRow.selected = revertIdx;
+                        syncingModeCombo = false;
+                    }
+                });
+                return;
+            }
+
+            setStr('agent-mode', chosenMode);
+            syncBackendCapabilitiesUi(getEffectiveBackend());
         });
         agentGroup.add(modeRow);
 
@@ -503,8 +566,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         let syncingModeCombo = false;
 
         const syncBackendCapabilitiesUi = eff => {
-            const caps = getBackendCapabilities(eff);
-            const curModeIdx = Math.max(0, modes.indexOf(getStr('agent-mode', 'readonly')));
+            const rawMode = getStr('agent-mode', 'readonly') || 'readonly';
+            const modeInfo = normalizeEffectiveAgentMode(eff, rawMode);
+            const caps = getBackendCapabilities(eff, modeInfo.effectiveMode);
+            const displayMode = eff === 'codex' && rawMode === 'chat' ? 'readonly' : rawMode;
+            const curModeIdx = Math.max(0, modes.indexOf(displayMode));
             syncingModeCombo = true;
             modeComboModel.splice(0, modeComboModel.get_n_items(), caps.modeLabels);
             modeRow.selected = curModeIdx;
@@ -514,9 +580,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             if (eff === 'unconfigured') {
                 modeRow.subtitle = '尚未配置可用后端；请先安装 ZCode / Codex CLI 或配置自定义 OpenAI 兼容 API';
             } else if (!caps.supportsTools) {
-                modeRow.subtitle = '当前自定义 OpenAI API 仅使用标准 HTTP 对话流，不挂载本机工具或文件权限';
+                modeRow.subtitle = '当前自定义 OpenAI API 仅执行纯文本 HTTP 对话流，不挂载任何本机文件、命令或网络工具';
             } else if (caps.supportsApproval) {
-                modeRow.subtitle = '支持按命令/域名/文件粒度分级审批，高危破坏性命令禁止会话级一键放行';
+                modeRow.subtitle = '需审批 Agent 按完整命令/规范真实路径/来源逐项请求您授权（非系统级强制只读沙箱；Shell 命令默认仅单次放行）';
+            } else if (eff === 'codex') {
+                modeRow.subtitle = 'Codex CLI 无禁用全部工具的纯问答开关，已使用 CLI read-only 沙箱运行只读 Agent；如需严格无工具纯问答推荐使用 OpenAI API';
             } else {
                 modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 使用 CLI 沙箱策略控制权限，不支持会话内交互弹窗审批`;
             }
