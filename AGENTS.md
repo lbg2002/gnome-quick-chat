@@ -1,4 +1,148 @@
-# AGENTS.md — Quick Chat（随问）改进实施指南
+# AGENTS.md — Quick Chat（随问）开发与复审指南
+
+> 当前执行基线：main @ e4e27f53b29803a1bbdfd9c95555c8323b33e1c9（2026-11-15 UTC）。2026-11-16 复审。优先执行本页新增的 R1–R12，不要重新执行下方已经完成的 A–F 大重构。发现最新源码已修复时，补回归验证并说明依据。只保留 ZCode、Codex、OpenAI 三后端；Pi 只允许历史迁移。保持原生 GJS/St/Clutter、中文紧凑界面和彩色轨迹，不新增数据库、Electron、WebView 或常驻服务。
+
+## 最新复审：R 系列任务（待实施）
+
+### 基线及完成情况
+
+相较 56fb47f，新增 12 次提交，已实际删除 piClient.js 并拆分三个 adapter，新增会话引擎、权限策略、进程管理、SSE parser、增量 Markdown、渲染窗口、模型目录缓存、附件、路由及通知等模块。上一轮 A–F 已有实现，不应推倒重来；下方历史任务的勾选表示上一轮实现记录，不表示全部运行时验收完成。GitHub CI 在 e4e27f5 上显示 success（https://github.com/lbg2002/gnome-quick-chat/actions/runs/43695900245），但目前复审为源码静态检查，未独立运行测试或实际 GNOME 50 桌面。以下列出确定的源码问题和需实机验证的风险，按严重性修复。
+
+| 编号 | 优先级 | 目标 |
+| --- | --- | --- |
+| R1 | P0 | 修复交互式问题答案丢失及审批确认 |
+| R2 | P0 | 子进程组终止、回合取消和安全握手 |
+| R3 | P0 | 会话写失败、回退与远端同步一致性 |
+| R4 | P1 | 移除 GNOME Shell 同步 CLI 探测 |
+| R5 | P1 | 真正限制输入输出流字节数 |
+| R6 | P1 | 附件异步生命周期、隐私和预算 |
+| R7 | P1 | 工具事件状态与 watchdog |
+| R8 | P1 | 会话归档可访问性和长会话内存 |
+| R9 | P1 | OpenAI 模型发现、网络与重定向 |
+| R10 | P1 | 真实生产路径集成测试 |
+| R11 | P2 | 功能打磨（不增加后端） |
+| R12 | P2 | 性能测量及复杂度治理 |
+
+### R1. ZCode 交互式提问答案丢失与审批权威状态（P0）
+
+**已确认缺陷**：extension.js:1446–1456 提交问题回答时发送 decision='allow' 加 modifiedInput；backends/zcodeAdapter.js:304–317 仅支持 allow/deny；zcodeBridge.cjs:190–225 只有 decision='modify' 才读取 modifiedInput，allow + AskUserQuestion 则构建 answers={}。因此用户填写的真实答案在生产链路会被丢弃并被当作交由 AI 自行判断，即使 UI 显示已回答。现有 bridge 单测直接传 modify 并不能覆盖整条链路。
+
+- [ ] 明确协议 decision = allow | deny | modify。extension、adapter、bridge 保持一致，普通批准不可偷偷携带修改参数；仅允许当前已验证的交互问题使用 modify，校验 questions/answers 结构及问题 ID，拒绝其他工具的任意 modifiedInput。保留显式“交由 AI 判断”的空 answers 语义。
+- [ ] 验收：真实 adapter 序列化 → bridge stdin 接收 → broker resolution 逐层断言，自定义回答、多选、跳过、取消；确保用户选择不丢失。严格模式下缺失或不匹配 turnId 均拒绝（bridge:496–499 当前只在双方非空时比较）。
+- [ ] **审批确认仍未真正完成**：zcodeAdapter.js:320–332 在管道写完时就 leaveApproval、增加 approvedScopes；extension.js:1482–1505、1566–1599 又直接显示运行并提前放行其他同 scope 节点。bridge 已有 quickchat.permission_resolved（480–541），但 host 没有以它作为唯一确认。改为发送中 → 等待权威 ACK → resolved/拒绝/超时；仅在对应 bridge ACK 且 scopeKey 匹配后保存会话授权；收到已拒绝/超时 ACK 后，迟到的 write success 不得覆盖状态或扩大授权。所有审批请求按 turnId/requestId 跟踪、串行化 stdin 写入、明确 ack 超时、重试幂等；不能因管道写成功就解除 watchdog。多审批的自动放行只由 bridge 的各 requestId resolved 事件驱动。
+- [ ] 回归：模拟管道成功但请求已过期、拒绝 ACK 先于写回调、ACK 丢失、重复响应、并行审批、取消后 B 开始；断言 pendingApprovals、approvedScopes、UI 三者一致。不要真实执行危险命令。
+
+### R2. 进程树、取消和桥接安全（P0）
+
+**已确认缺陷**：runtime/processManager.js:61–94 仅根据直接子进程 exited 决定是否发送 group SIGKILL。若 CLI 收到 TERM 退出而其子进程忽略 TERM，宽限期结束不会杀剩余组成员。39–50 的 signalIsolatedProcessGroup 返回 true 只是成功启动 kill 命令，不代表信号成功发送。正常完成的 trySettleWhenComplete 也调用 terminate（421–429），需要防止对已退出/复用 PGID 的进程发信号。
+
+- [ ] 采用经过验证的独立 process group 或用户级 transient scope/cgroup，记录创建身份；确认组隔离成立后才能发组信号，检查 kill 退出状态，取消后独立检查剩余成员，不以 leader 退出作为组清空依据。考虑 PID/PGID 复用和成员主动 setsid 逃逸，无法保证时诚实提示降级；不允许误杀 GNOME Shell/其他任务。正常退出与强制终止路径分开。
+- [ ] 将 read/close/finish、wait、握手 timer、审批 timer、temp file cleanup 统一收口；runtime/processManager.js:544–549、469–472 有早返回未调用对应 finish 的路径，需审查 GIO 异步资源释放，确保取消不产生长生命周期引用。
+- [ ] 现有 ZCode bridge 仍依赖内部 DenyPermissionBroker monkey patch（zcodeBridge.cjs:657–709）。宿主收到 bridge_ready/首个事件后才检查不能等同于执行前沙箱；验证实际版本中所有敏感操作均经过该 broker，握手失败时不执行任务。自定义 CLI 包装器、NODE_OPTIONS、脚本名不含 zcode、延迟初始化均需测试；不能验证则仅允许已验证受限模式或禁止该任务。不要用提示词假装强制隔离。
+- [ ] 真正生产路径测试：假 CLI leader 退出但子进程忽略 TERM、fork 后 stdout 仍打开、正常结束、握手失败、锁屏/disable 时取消；确认无残留、无误杀，并报告不受控脱离组进程的边界。
+
+### R3. 会话可靠性、重新生成与远端同步（P0）
+
+**已确认缺陷一**：core/sessionEngine.js:889–933 写入重试耗尽后返回 {ok:false}，下一项成功即清空 lastWriteError（899），导致前一条永久丢失仍显示已保存。flush() 只是等待当前队列；backendClient.js:375–380 无条件返回 flushed:true；rewind 路径 386–398 忽略 writePromise 的 ok。不能把“队列已结束”当成“全部已落盘”。
+
+**已确认缺陷二**：extension.js:1270–1287 回退历史 rw.ok=false 时仍继续发送，且 rewind await 前未占用发送锁，存在连续点击/发送竞争。会话先在内存截断（sessionEngine.js:831–843），磁盘写失败也继续返回业务 ok，造成 UI 与磁盘分叉。
+
+**已确认缺陷三**：sessionEngine.js:699–707 每次本地 append 都推进 remoteSyncedRevision，即使 CLI 尚未启动、启动失败、取消或未接收完整问题。会话 ID 仍可能被复用，导致后端遗漏本地回合；remoteSyncedRevision 不能等同于本地 revision。
+
+- [ ] 独立保存 durableRevision / pending writes / failed writes，失败记录保持可恢复；重试写入使用幂等 messageId/revision。后续成功不能抹除未解决的失败；flush 返回真实结果及失败 revision。磁盘写失败时保持未保存提示，允许重试或导出内存历史。
+- [ ] 回退为可验证事务：先准备快照，确保会话/写入身份一致并提交，再改变 UI；失败明确停止后续请求，恢复旧内存或进入可恢复错误状态。新建/删除/切换/重试通过同一互斥操作锁，await 后再次验证 sessionId/generation/busy。对 rw.ok=false 直接报错返回。
+- [ ] remoteSyncedRevision 仅在后端协议证明确认对应回合后推进；启动失败、取消、截断、未知 exit、写错误时失效远端恢复或标记不确定。下次以预算内本地上下文恢复，不自动重试有副作用的任务；避免重复注入同一问题。
+- [ ] 检查同一 sessionId 两个已加载的 SessionStore 各自独立内存 revision：共享写队列并不等于共享最新状态。约束单写者，或增加版本检查/冲突重读；旧实例不可覆盖新数据。
+- [ ] 测试：写失败 A→成功 B→重启、flush 错误、rewind 写失败、重复点击旧回答重试、rewind 与新建/删除竞争、CLI spawn failure 后 resume、取消 partial 后 resume、两个已加载实例并发写。断言磁盘/内存/UI 一致，不能靠清除错误掩盖丢失。
+
+### R4. 冷启动仍在 Shell 主线程同步启动 CLI（P1，高优先性能）
+
+**已确认缺陷**：backendClient.js:55–237 resolveBackendRuntime 调用同步 detectBackendSelection、probeCliCapabilities（190、218）；core/backendDetect.js:163–195 的 runShortProbeCommandSync 在 GLib 主线程调用 proc.communicate_utf8，1400ms timeout 也注册在同一 main loop，阻塞时无法按期执行。真实冷启动可能冻结整个桌面，缓存命中不能消除首次和缓存失效问题。
+
+- [ ] 将实际 runtime resolution/start 变为 async，使用 detectBackendSelectionAsync、probeCliCapabilitiesAsync、异步 PATH/目录读取；ChatController.ensureConnected（183）必须 await client.startAsync 并进行 generation/lifecycle/cancellable 检查。
+- [ ] 修复 detectBackendSelectionAsync（606–611）回退到 readFileHeadSync/probeCliVersionSync 的路径，实际生产路径不得同步等待 CLI；保留同步纯解析工具仅用于测试/非 Shell 进程，明确区分。
+- [ ] 短探测应使用 bounded stream + deadline + cancellable，超时可靠杀自己创建的进程组；不要 communicate_utf8_async 无界收集全量输出。缓存 single-flight，按路径/mtime/版本/配置失效，冷缓存显示“正在检测”而非阻塞。
+- [ ] 验收：假 CLI --help 睡眠 5 秒，同时 GJS main loop 20ms heartbeat 持续运行；探测按超时结束；关闭/锁屏/切换后端时取消且不污染新连接。真实 GNOME 50 测冷/热打开 p95，不能仅报告纯 JS benchmark。
+
+### R5. 资源上限需在读取过程中执行（P1，防止 OOM）
+
+- [ ] runtime/processManager.js:335–336、469、544 使用 Gio.DataInputStream.read_line_async，CliTurnMonitor 在完整行读取后才检查 maxLineBytes（runtime/cliProcessRunner.js:199–210）。一条无换行巨型 JSON 仍会被完整缓冲进内存。改为固定 8–32KiB read_bytes_async + UTF-8 增量 decoder + 有界行组装，超限立即终止受控子进程；stderr 与 stdout 都限制。避免每 chunk 重新拼接全部历史。
+- [ ] backends/openaiAdapter.js:103–111 /models 使用 send_and_read_async 在响应整体进入内存后才 parse/cap；改有界流读取，检查 Content-Length 仅作提前拒绝而非唯一限制。prefs.js 的在线模型刷新同样检查。
+- [ ] core/paths.js:312–350 readFileBytesBoundedAsync 先 stat 再 load_contents_async，文件变化、特殊文件可绕过预先大小判断。拒绝非普通文件（FIFO、设备、socket），固定大小分块读取，最多 maxBytes+1；权限错误、取消、文件变化给明确结果。SessionStore.load 同样限制单行/总大小并分页读取，不无界读取已损坏文件。
+- [ ] 确认 TurnController 的 text/thinking segments、工具明细、historyWindow 数据层设置累计字节预算（不能只限制 Actor 或单条事件）；达到上限应明确截断/落盘，不能丢失最终状态。按需读取工具日志，不默认存储敏感完整输出。
+- [ ] 测试：假 CLI 输出 10MiB 无换行、巨大 stderr；mock HTTP chunked /models 超限；文件在 stat 后增长/特殊文件；验证内存峰值、提前取消与错误状态。
+
+### R6. 附件与上下文安全/生命周期（P1）
+
+现状：extension.js:526–601 只校验 lifecycleGeneration，读取期间用户新建会话或切换后端仍可能将旧附件加入新 composer；读请求未传 cancellable。1237–1381 在请求发送前清空附件，失败只恢复 draft 文本，附件可能丢失。attachmentManager.js:473–503 将内容嵌入固定三反引号，文件自身含围栏时边界可混淆。用户附件作为不可信数据，不应被当作权限指令。
+
+- [ ] 附件读取绑定 composerGeneration + sessionId + cancellable；新建、切换会话、清空、关闭/禁用时取消，避免旧读结果进入新会话。发送使用不可变 draft/attachment 快照，只有确认后端接受并持久化后才清空；失败恢复原草稿与附件，或提供重试快照，避免重复发送。
+- [ ] 附件总预算与实际后端上下文窗口联动，显示真实发送大小、模型端点与截断情况；路径模式对于纯 API 不代表模型可以读取本地文件，明确提示，避免误导。
+- [ ] 引用数据使用可靠结构化边界或动态 fence，区分用户指令、文件内容和工具授权；文件内指令不能触发自动执行或扩大权限。不要自动收集选区/窗口内容，云端转发明确用户确认。
+- [ ] 附件正文已进入持久化 user content 时应明确隐私策略，默认不把敏感附件无提示带入其他 API/CLI；跨端点/跨后端切换提示哪些历史将发送，提供不含附件的新上下文或明确确认。
+- [ ] 回归：读取过程中换会话、取消、失败恢复、附件含 Markdown fence/恶意指令、超预算、只提供路径的 OpenAI、切换远程端点。
+
+### R7. 工具轨迹与运行超时状态（P1）
+
+现状：runtime/processManager.js:586–597 用整数 activeRunningTools 计数；重复 started/updated 事件可重复加一（Codex protocol.js item.started/item.updated 均转换 start）；batch end 直接清零，可能忽略其他仍运行的工具。extension.js:1903–1919 无 IDs 的 batch end 将所有 running 节点标为 done，工具 end 未匹配 ID 时按同名工具猜测（1870–1883）。
+
+- [ ] 使用 Map<toolCallId, state> / Set 跟踪活动工具；start/update 幂等；仅对应 ID end/batch 修改状态，缺 ID 不将全部工具推断成功。明确协议中 batch 是否代表成功还是仅批次结束，未知状态使用 unknown/interrupted。
+- [ ] 审批等待、工具执行、流空闲、总超时四种状态单独计算。普通日志/无意义心跳不无限延长有效进度 watchdog；长工具允许合理时间但受总时长约束。多审批仍待确认时不得恢复流超时。
+- [ ] 修正结果早于 ACK、重复 tool end、无 tool start、并发同名工具、交叉批次、取消中间状态；断言圆点颜色及实际 timeout phase 准确。
+
+### R8. 历史归档与长会话数据层（P1）
+
+现状：sessionEngine.js:754–766 压缩到 archive.jsonl，_loadFromDiskInternal（458–530）只读 messages.jsonl；backendClient.js:372–374 get_messages、400–409 export_session 只访问 hot messages。旧历史实际保存在归档，却不能从当前恢复和导出路径访问。rewind 也将被删除的分支写入同一 archive（861–864），与正常历史压缩混在一起。
+
+- [ ] 区分正常归档和被替换/撤销的历史分支（字段或独立文件），明确“完整导出”是否包含旧分支，默认只导出当前逻辑会话的完整有效历史。提供分页加载旧归档/按 revision 索引，避免将撤销内容重新加入模型上下文。
+- [ ] archive append + hot replace 崩溃窗口应可幂等恢复，按 ID/revision 去重；避免损坏备份/归档无上限增长。清理前显示大小与保留策略，不能无提示删除用户记录。
+- [ ] ui/chatPanel.js HistoryWindow 已限制挂载 Actor，但 allMessages 仍增长；将数据层也做热缓存+分页索引，完成后释放 card/trace/timer 引用。不要为实现分页引入数据库。
+- [ ] 测试 1000+ 消息、压缩/重启/导出、被编辑旧分支、归档损坏、分页上下滚动和 Actor 上限；完整历史与上下文预算分离。
+
+### R9. OpenAI 网络与模型能力（P1）
+
+- [ ] 检查 backends/openaiAdapter.js:225–249 模型发现完成后预算重算是否仍保留当前问题；验证从存储内容构造的 messages 包含当前问题且不重复。上下文过长显式拒绝/裁剪历史，保留当前问题和输出预算；finish_reason=length 应显式 partial。
+- [ ] 除 R5 有界 /models 外，模型目录结果绑定端点/配置 generation；只更新对应适配器，切换 API 时取消旧请求。模型 metadata 缓存按端点和模型隔离，手动指定模型不被自动发现覆盖。
+- [ ] 审查 attachCrossOriginRedirectGuard（35–48）及 prefs 网络路径：只删除 Authorization 还不能保证 307/308 不会把带附件的 POST 正文转发到不同 origin；对于聊天 POST 默认拒绝跨 origin/HTTPS 降级重定向，确需允许时重新明确用户许可，GET 同样不能转发旧凭据。测试 localhost 两个 origin，捕获实际请求而不仅测试 URL 判断函数。
+- [ ] 兼容 API 能力不一致时仅给出明确诊断，不自动重复提交有副作用的操作；按实际支持显示 reasoning effort、usage、模型上下文、流式错误/完成状态。失败消息不注入后续正文。
+
+### R10. 生产路径集成测试（P1，所有阶段共同验收）
+
+CI 已增加 GJS smoke，tests/gjs_smoke.js 目前主要导入纯模块、验证 Gio SessionStore/文件权限等。它不是 GNOME 50 UI 或真实 ZCode/Codex/OpenAI 端到端测试。必须新增覆盖真实 adapter/host bridge 交互的测试；不能用复制逻辑代替生产函数。
+
+- [ ] npm test、GJS smoke、schema 严格编译、脚本语法/安装包验证继续保留。
+- [ ] GJS mock HTTP server：真实 Soup 流、跨域重定向、HTTP 状态、截断、取消、超限、模型刷新。
+- [ ] GJS 假 CLI：真实 spawnManagedCliTurn + ZCodeAdapter/CodexAdapter 的协议、交互答案、ACK 延迟、并行工具、进程树和退出状态。Node/GJS 使用同一 fixtures，避免仅测 helper。
+- [ ] 真实 GNOME 50/Wayland 人工验证：锁屏解锁、启禁 30 次、面板 100 次、与其他顶栏扩展共存、模型切换、Nautilus 文件引用、完整三后端问答及 ZCode 审批。若无法执行，明确列为 pending，不将 CI success 写成实机通过。
+- [ ] R1–R9 每项至少一个失败先行的回归用例；每个修复单独或按依赖小步提交。
+
+### R11. 功能优化：先打磨现有功能（P2）
+
+不再扩大功能面。现已具备快捷动作、附件、消息编辑/重试、上一会话、路由和通知，先解决真实 UX 问题：
+- [ ] 模型选择：近期/收藏、搜索及当前真实模型，快速切换不重置 composer；未安装/不支持能力明确显示。思考强度按模型能力隐藏或禁用。
+- [ ] 运行时状态：清晰区分发送中、等待审批、执行中、网络中断、保存失败；提供一个紧凑诊断入口，复制脱敏诊断。
+- [ ] 消息重试/继续：失败保留附件，重试同一原问题；历史编辑可能舍弃后续上下文，提示并允许撤销；不自动重跑曾执行的副作用操作。
+- [ ] 交互问题：支持键盘选项、多选、可访问焦点顺序，答案提交后准确回显；审批必须显示真实命令/cwd/路径及完整风险。
+- [ ] 文件随问：保留用户主动选择，必要时提供可选 Nautilus Send To/右键集成（不要求读取其他窗口，不增加常驻服务）；纯 API 对路径附件给可操作反馈。
+- [ ] 后台任务通知以状态为主，点击正确会话；锁屏/旧通知不暴露内容或打开错误任务。路由仅推荐，未经用户明确授权不改变权限。
+
+### R12. 性能测量与工程复杂度治理（P2）
+
+目前 extension.js 仍约 2500 行、prefs.js 约 1680 行，并新增大量核心模块；代码变多不必然性能更差，但避免二次大重构。优先消除已确认的同步阻塞与无界缓冲，再测量决定后续拆分。
+
+- [ ] 记录真实 GNOME 50 五种基线（禁用、空闲、冷/热面板、OpenAI 流式、CLI 多工具）。分别报告 Shell 和子进程 CPU/RSS、首字、UI p50/p95、Actor 数量、事件量、残留进程。前轮目标（热打开 p95≤100ms、UI update p95≤8ms、空闲 CPU 增量≤0.5百分点、短会话 RSS 增量≤20MiB）仅为建议目标。
+- [ ] 验证 Markdown parser 增量更新并非每 token 重排全量文本；工具大量事件不重复刷新所有节点；隐藏面板不创建/布局正文 Actor。用 30k/100k 字符与 100/1000 工具事件实测，记录尾延迟和内存。只在有 profiling 证据时优化。
+- [ ] 统一生产状态来源：TurnController / ChatController / UI card 的状态由事件派生，减少重复可变状态；权限确认只由 bridge 结果驱动。对现有模块边界做小步整理，不重写整个项目。
+- [ ] 检查同步/异步双实现和重复权限策略是否仍必要；核心共享逻辑使用同源实现或跨运行时一致性测试。对 prefs 逐步拆成配置/模型/隐私/诊断模块，不因行数强行重构。
+- [ ] 更新 README/AGENTS.md，将已实现与实测通过分别标注；发布版本号、变更、迁移与回滚一致。
+
+## 本轮交付要求
+
+优先 R1 → R2 → R3 → R4/R5，再 R6–R10，最后 R11/R12。每阶段提交代码和测试，记录真实执行命令及结果；修改后更新本节对应 checkbox，未验证不得标为完成。不要把所有优化一次性混入同一个 commit，不新增 Pi，不修改用户的外部 CLI 配置或真实文件。最终输出剩余风险及 GNOME 50 实测结果/待验收项。
+
+---
+
+## 上一轮 A–F 实施记录（历史参考，不作为本轮重新执行任务）
 
 > 本文是仓库维护者指定的下一轮开发任务清单，供 Codex、ZCode 等 Coding Agent 直接读取并执行。审查基线：main @ c0325fa0eb6f66a5648c93508400fc44a12d37d3（2026-11-15）。开始修改前先检查最新代码，若某项已经修复，补充回归测试并标记完成，不要重复重构。本文描述的是待实施方案，不代表当前已修复或已通过性能测试。
 
@@ -281,4 +425,4 @@
 - [x] 提供安全、性能与 UX 的剩余问题，不宣称未实测的效果。
 - [x] 小步提交，提交说明包含修复原因及验收结果。
 
-建议下一次 Coding Agent 从 A1/A2 开始，完成后依次处理 B1–B4 和 C1–C4。之后在真实 GNOME 50 环境验证性能，再进行 D/E/F。若最新代码与本审查基线不同，以当前源码为准，保留本指南的产品约束和验收目标。
+上一轮 A–F 已有实现记录；本轮请以顶部 R 系列复审任务为准。
