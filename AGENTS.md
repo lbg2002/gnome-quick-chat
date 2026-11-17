@@ -110,11 +110,11 @@
 
 CI 已增加 GJS smoke，tests/gjs_smoke.js 目前主要导入纯模块、验证 Gio SessionStore/文件权限等。它不是 GNOME 50 UI 或真实 ZCode/Codex/OpenAI 端到端测试。必须新增覆盖真实 adapter/host bridge 交互的测试；不能用复制逻辑代替生产函数。
 
-- [ ] npm test、GJS smoke、schema 严格编译、脚本语法/安装包验证继续保留。
-- [ ] GJS mock HTTP server：真实 Soup 流、跨域重定向、HTTP 状态、截断、取消、超限、模型刷新。
-- [ ] GJS 假 CLI：真实 spawnManagedCliTurn + ZCodeAdapter/CodexAdapter 的协议、交互答案、ACK 延迟、并行工具、进程树和退出状态。Node/GJS 使用同一 fixtures，避免仅测 helper。
-- [ ] 真实 GNOME 50/Wayland 人工验证：锁屏解锁、启禁 30 次、面板 100 次、与其他顶栏扩展共存、模型切换、Nautilus 文件引用、完整三后端问答及 ZCode 审批。若无法执行，明确列为 pending，不将 CI success 写成实机通过。
-- [ ] R1–R9 每项至少一个失败先行的回归用例；每个修复单独或按依赖小步提交。
+- [x] npm test、GJS smoke、schema 严格编译、脚本语法/安装包验证继续保留。
+- [x] GJS mock HTTP server：真实 Soup 流、跨域重定向、HTTP 状态、截断、取消、超限、模型刷新。
+- [x] GJS 假 CLI：真实 spawnManagedCliTurn + ZCodeAdapter/CodexAdapter 的协议、交互答案、ACK 延迟、并行工具、进程树和退出状态。Node/GJS 使用同一 fixtures，避免仅测 helper。
+- [ ] 真实 GNOME 50/Wayland 人工验证：锁屏解锁、启禁 30 次、面板 100 次、与其他顶栏扩展共存、模型切换、Nautilus 文件引用、完整三后端问答及 ZCode 审批。若无法执行，明确列为 pending，不将 CI success 写成实机通过。（Pending：待真实 GNOME 50/Wayland 桌面人工实机验收）
+- [x] R1–R9 每项至少一个失败先行的回归用例；每个修复单独或按依赖小步提交。
 
 ### R11. 功能优化：先打磨现有功能（P2）
 

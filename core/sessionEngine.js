@@ -632,6 +632,13 @@ export class SessionStoreEngine {
         return this._revision;
     }
 
+    get remoteSyncedRevision() {
+        if (!this._syncingCoord) {
+            this._syncFromCoordinator();
+        }
+        return Number(this.meta?.remoteSyncedRevision || 0);
+    }
+
     get durableRevision() {
         return this._durableRevision;
     }

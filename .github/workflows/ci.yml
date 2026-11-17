@@ -22,11 +22,11 @@ jobs:
       - name: Install GLib schema compiler & GJS runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libglib2.0-bin gjs
+          sudo apt-get install -y --no-install-recommends libglib2.0-bin gjs gir1.2-soup-3.0
 
       - name: Check JS / CJS syntax
         run: |
-          for f in extension.js prefs.js backendClient.js protocol.js zcodeBridge.cjs backends/*.js core/*.js runtime/*.js ui/*.js tests/*.js; do
+          for f in extension.js prefs.js backendClient.js protocol.js zcodeBridge.cjs backends/*.js core/*.js runtime/*.js ui/*.js tests/*.js tests/fixtures/*.js; do
             node --check "$f"
           done
 
