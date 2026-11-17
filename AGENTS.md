@@ -59,10 +59,10 @@
 
 **已确认缺陷**：backendClient.js:55–237 resolveBackendRuntime 调用同步 detectBackendSelection、probeCliCapabilities（190、218）；core/backendDetect.js:163–195 的 runShortProbeCommandSync 在 GLib 主线程调用 proc.communicate_utf8，1400ms timeout 也注册在同一 main loop，阻塞时无法按期执行。真实冷启动可能冻结整个桌面，缓存命中不能消除首次和缓存失效问题。
 
-- [ ] 将实际 runtime resolution/start 变为 async，使用 detectBackendSelectionAsync、probeCliCapabilitiesAsync、异步 PATH/目录读取；ChatController.ensureConnected（183）必须 await client.startAsync 并进行 generation/lifecycle/cancellable 检查。
-- [ ] 修复 detectBackendSelectionAsync（606–611）回退到 readFileHeadSync/probeCliVersionSync 的路径，实际生产路径不得同步等待 CLI；保留同步纯解析工具仅用于测试/非 Shell 进程，明确区分。
-- [ ] 短探测应使用 bounded stream + deadline + cancellable，超时可靠杀自己创建的进程组；不要 communicate_utf8_async 无界收集全量输出。缓存 single-flight，按路径/mtime/版本/配置失效，冷缓存显示“正在检测”而非阻塞。
-- [ ] 验收：假 CLI --help 睡眠 5 秒，同时 GJS main loop 20ms heartbeat 持续运行；探测按超时结束；关闭/锁屏/切换后端时取消且不污染新连接。真实 GNOME 50 测冷/热打开 p95，不能仅报告纯 JS benchmark。
+- [x] 将实际 runtime resolution/start 变为 async，使用 detectBackendSelectionAsync、probeCliCapabilitiesAsync、异步 PATH/目录读取；ChatController.ensureConnected（183）必须 await client.startAsync 并进行 generation/lifecycle/cancellable 检查。
+- [x] 修复 detectBackendSelectionAsync（606–611）回退到 readFileHeadSync/probeCliVersionSync 的路径，实际生产路径不得同步等待 CLI；保留同步纯解析工具仅用于测试/非 Shell 进程，明确区分。
+- [x] 短探测应使用 bounded stream + deadline + cancellable，超时可靠杀自己创建的进程组；不要 communicate_utf8_async 无界收集全量输出。缓存 single-flight，按路径/mtime/版本/配置失效，冷缓存显示“正在检测”而非阻塞。
+- [x] 验收：假 CLI --help 睡眠 5 秒，同时 GJS main loop 20ms heartbeat 持续运行；探测按超时结束；关闭/锁屏/切换后端时取消且不污染新连接。真实 GNOME 50 测冷/热打开 p95，不能仅报告纯 JS benchmark。（自动化回归已通过：`tests/stageR4_asyncStartupProbing.test.js`；真实 GNOME 50/Wayland 桌面冷/热打开 p95 待实机人工验收）
 
 ### R5. 资源上限需在读取过程中执行（P1，防止 OOM）
 

@@ -2,12 +2,41 @@
 // transactional config reconnects, security-context scope revocation, and turn identity isolation (Stage E).
 // Zero GNOME/GJS imports so Node unit tests exercise real connection & turn coordination directly.
 
+function createConnectionCancellable() {
+    let cancelled = false;
+    const listeners = [];
+    return {
+        is_cancelled() {
+            return cancelled;
+        },
+        cancel() {
+            if (cancelled) return;
+            cancelled = true;
+            while (listeners.length > 0) {
+                const fn = listeners.shift();
+                try { fn(); } catch (_) {}
+            }
+        },
+        connect(fn) {
+            if (typeof fn !== 'function') return 0;
+            if (cancelled) {
+                try { fn(); } catch (_) {}
+                return 0;
+            }
+            listeners.push(fn);
+            return listeners.length;
+        },
+        disconnect() {},
+    };
+}
+
 export class ChatController {
     constructor({
         registry,
         createClient,
         loadRuntimeEnvironment,
         onEvent = () => {},
+        onConnecting = () => {},
         onStateChanged = () => {},
         onConnectionError = () => {},
         scheduleDelay = (ms, cb) => {
@@ -19,6 +48,7 @@ export class ChatController {
         this._createClient = createClient;
         this._loadRuntimeEnvironment = loadRuntimeEnvironment;
         this._onEvent = onEvent;
+        this._onConnecting = onConnecting;
         this._onStateChanged = onStateChanged;
         this._onConnectionError = onConnectionError;
         this._scheduleDelay = scheduleDelay;
@@ -31,6 +61,7 @@ export class ChatController {
         this._busy = false;
         this._needsReconnect = false;
         this._ensurePromise = null;
+        this._connectCancellable = null;
         this._cancelReconnectTimer = null;
         this._lastSecurityContextKey = '';
         this._activeTurnState = null;
@@ -150,11 +181,25 @@ export class ChatController {
         const lifeGen = this._lifecycleGeneration;
         const generation = ++this._clientGeneration;
         this._ready = false;
+        try { this._connectCancellable?.cancel?.(); } catch (_) {}
+        const connectCancellable = createConnectionCancellable();
+        this._connectCancellable = connectCancellable;
+        try {
+            this._onConnecting({generation, lifecycleGeneration: lifeGen, reason: '正在检测…'});
+        } catch (_) {}
+
+        const isStale = () => (
+            this._disposed ||
+            this._lifecycleGeneration !== lifeGen ||
+            generation !== this._clientGeneration ||
+            connectCancellable.is_cancelled() ||
+            !canConnect()
+        );
 
         const task = (async () => {
             try {
-                const env = await this._loadRuntimeEnvironment();
-                if (this._disposed || this._lifecycleGeneration !== lifeGen || generation !== this._clientGeneration || !canConnect()) {
+                const env = await this._loadRuntimeEnvironment({cancellable: connectCancellable});
+                if (isStale()) {
                     return null;
                 }
 
@@ -180,12 +225,30 @@ export class ChatController {
                 );
 
                 this._client = client;
-                client.start(config, workspace, sessionsDir, sessionId, {clientGeneration: generation});
+                if (typeof client.startAsync === 'function') {
+                    await client.startAsync(config, workspace, sessionsDir, sessionId, {
+                        clientGeneration: generation,
+                        cancellable: connectCancellable,
+                    });
+                } else {
+                    client.start(config, workspace, sessionsDir, sessionId, {clientGeneration: generation});
+                }
+                if (isStale()) {
+                    try { client.close?.(); } catch (_) {}
+                    if (this._client === client) this._client = null;
+                    return null;
+                }
 
                 const state = await client.request('get_state');
-                const data = await client.request('get_messages');
-                if (this._disposed || this._lifecycleGeneration !== lifeGen || generation !== this._clientGeneration || !canConnect()) {
+                if (isStale()) {
                     try { client.close?.(); } catch (_) {}
+                    if (this._client === client) this._client = null;
+                    return null;
+                }
+                const data = await client.request('get_messages');
+                if (isStale()) {
+                    try { client.close?.(); } catch (_) {}
+                    if (this._client === client) this._client = null;
                     return null;
                 }
 
@@ -207,7 +270,7 @@ export class ChatController {
                 });
                 return {state, messages: data?.messages || [], reused: false};
             } catch (err) {
-                if (!this._disposed && this._lifecycleGeneration === lifeGen && generation === this._clientGeneration) {
+                if (!this._disposed && this._lifecycleGeneration === lifeGen && generation === this._clientGeneration && !connectCancellable.is_cancelled()) {
                     this.stopClient();
                     this._onConnectionError(err);
                 }
@@ -215,6 +278,9 @@ export class ChatController {
             } finally {
                 if (this._ensurePromise === task) {
                     this._ensurePromise = null;
+                }
+                if (this._connectCancellable === connectCancellable) {
+                    this._connectCancellable = null;
                 }
             }
         })();
@@ -225,6 +291,8 @@ export class ChatController {
 
     stopClient() {
         ++this._clientGeneration;
+        try { this._connectCancellable?.cancel?.(); } catch (_) {}
+        this._connectCancellable = null;
         this._ensurePromise = null;
         this._activeTurnState = null;
         this._ready = false;

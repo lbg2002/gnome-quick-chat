@@ -29,6 +29,7 @@ import {
     detectEffectiveBackend,
     invalidateBackendDetectionCaches,
     migrateGSettingsIfNeeded,
+    peekEffectiveBackend,
 } from './core/backendDetect.js';
 import {sanitizeDiagnosticSnapshot} from './core/diagnosticsReport.js';
 import {
@@ -932,11 +933,18 @@ export default class QuickChat extends Extension {
         this._dateIntegration?.nudgeLayout();
     }
 
-    async _loadRuntimeEnvironment() {
+    async _loadRuntimeEnvironment({cancellable = null} = {}) {
         migrateGSettingsIfNeeded(this._settings);
         const openaiBaseUrl = this._getSettingString('openai-base-url', '').trim();
         const apiKey = await loadOpenAIApiKey(this._settings, openaiBaseUrl);
-        const eff = this._getEffectiveBackend();
+        const selection = await detectBackendSelectionAsync({
+            configuredBackend: this._getSettingString('backend', 'auto'),
+            zcodePath: this._getSettingString('zcode-path', ''),
+            codexPath: this._getSettingString('codex-path', ''),
+            openaiBaseUrl,
+            cancellable,
+        });
+        const eff = selection?.effectiveBackend || 'unconfigured';
         const config = this._registry.buildRuntimeConfig(eff, {apiKey});
 
         if (config.workspace && config.workspace.endsWith('/gnome-quick-chat/workspace')) {

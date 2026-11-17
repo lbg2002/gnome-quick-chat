@@ -12,11 +12,14 @@ import {
 } from './protocol.js';
 import {
     buildSearchPath,
+    buildSearchPathAsync,
     createGioCliEnv,
     detectBackendSelection,
+    detectBackendSelectionAsync,
     findExecutableInDirs,
     peekCachedBackendCatalog,
     probeCliCapabilities,
+    probeCliCapabilitiesAsync,
 } from './core/backendDetect.js';
 import {UNCONFIGURED_BACKEND_MESSAGE} from './core/configMigration.js';
 import {
@@ -47,6 +50,7 @@ import {
 export {
     attachCrossOriginRedirectGuard,
     buildSearchPath,
+    buildSearchPathAsync,
     createIsolatedZCodeConfigOverride,
     createIsolatedZCodeConfigOverrideAsync,
     findExecutableInDirs,
@@ -240,6 +244,228 @@ export function resolveBackendRuntime(config = {}) {
     throw new Error(UNCONFIGURED_BACKEND_MESSAGE);
 }
 
+export async function resolveBackendRuntimeAsync(config = {}, {
+    cancellable = null,
+    forceRefresh = false,
+    timeoutMs = 1400,
+} = {}) {
+    if (cancellable?.is_cancelled?.()) {
+        throw new Error('连接已取消');
+    }
+    const rawZCodePath = String(config.zcodePath || '').trim();
+    const rawCodexPath = String(config.codexPath || '').trim();
+    const rawBaseUrl = String(config.openaiBaseUrl || '').trim();
+    const requestedMode = String(config.mode || 'readonly').trim();
+
+    const selection = await detectBackendSelectionAsync({
+        configuredBackend: config.backend || 'auto',
+        zcodePath: rawZCodePath,
+        codexPath: rawCodexPath,
+        openaiBaseUrl: rawBaseUrl,
+        forceRefresh,
+        cancellable,
+        timeoutMs,
+    });
+    if (cancellable?.is_cancelled?.()) {
+        throw new Error('连接已取消');
+    }
+
+    const effective = selection.effectiveBackend;
+    if (effective === 'unconfigured') {
+        return {
+            backend: 'unconfigured',
+            available: false,
+            reason: selection.reason || UNCONFIGURED_BACKEND_MESSAGE,
+            label: '未配置后端',
+            resolvedProvider: '',
+            resolvedModel: '',
+            capabilities: getBackendCapabilities('unconfigured', requestedMode),
+            effectiveModeInfo: {effectiveMode: 'chat', downgradedFromChat: false, notice: ''},
+        };
+    }
+
+    if (!selection.available) {
+        throw new Error(selection.reason || UNCONFIGURED_BACKEND_MESSAGE);
+    }
+
+    if (effective === 'openai') {
+        const modelId = String(config.openaiModel || config.model || '').trim();
+        const effectiveModeInfo = normalizeEffectiveAgentMode('openai', requestedMode);
+        return {
+            backend: 'openai',
+            available: true,
+            baseUrl: rawBaseUrl,
+            chatUrl: normalizeOpenAIEndpoint(rawBaseUrl, '/chat/completions'),
+            modelsUrl: normalizeOpenAIEndpoint(rawBaseUrl, '/models'),
+            apiKey: String(config.openaiApiKey || '').trim(),
+            modelId,
+            resolvedProvider: 'openai',
+            resolvedModel: modelId,
+            systemPrompt: String(config.systemPrompt || '').trim(),
+            reasoningEffort: mapReasoningEffort(config.reasoningEffort),
+            label: modelId || 'OpenAI API',
+            capabilities: getBackendCapabilities('openai', effectiveModeInfo.effectiveMode),
+            effectiveModeInfo,
+        };
+    }
+
+    if (effective === 'zcode') {
+        const pathDirs = await buildSearchPathAsync(rawZCodePath);
+        if (cancellable?.is_cancelled?.()) {
+            throw new Error('连接已取消');
+        }
+        const cliEnv = createGioCliEnv(rawZCodePath, pathDirs);
+        const resolvedCustom = rawZCodePath ? cliEnv.resolveCandidate(rawZCodePath) : '';
+
+        const builtinCfg = '/opt/ZCode/resources/config/provider/zcode-builtin.json';
+        const baseEnv = GLib.file_test(builtinCfg, GLib.FileTest.EXISTS)
+            ? {
+                ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtinCfg,
+                ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: builtinCfg,
+            }
+            : {};
+
+        const cachedCat = peekCachedBackendCatalog('zcode');
+        const resolvedProvider = String(config.provider || cachedCat.defaultProviderId || '').trim();
+        const effectiveModel = String(config.model || cachedCat.defaultModelId || '').trim();
+        const label = effectiveModel || 'ZCode';
+
+        let bridgePath = '';
+        let bridgeArgs = [];
+        try {
+            const selfFile = Gio.File.new_for_uri(import.meta.url);
+            const selfDir = selfFile.get_parent()?.get_path();
+            if (selfDir) {
+                const candidateBridge = GLib.build_filenamev([selfDir, 'zcodeBridge.cjs']);
+                if (GLib.file_test(candidateBridge, GLib.FileTest.EXISTS)) {
+                    bridgePath = candidateBridge;
+                    bridgeArgs = ['--require', candidateBridge];
+                }
+            }
+        } catch (_) {}
+
+        const defaultBundledCjs = '/opt/ZCode/resources/glm/zcode.cjs';
+        const cjsTarget = resolvedCustom && resolvedCustom.endsWith('.cjs')
+            ? resolvedCustom
+            : ((!resolvedCustom || resolvedCustom === '/opt/ZCode/zcode') &&
+               GLib.file_test(defaultBundledCjs, GLib.FileTest.EXISTS)
+                ? defaultBundledCjs
+                : '');
+
+        const setsidPath = resolveSetsidExecutable(pathDirs);
+        const nodeExe = findExecutableInDirs('node', pathDirs);
+
+        let executable = '';
+        let commandPrefix = [];
+        let extraEnv = {...baseEnv};
+        let pathEnv = '';
+        let probePrefix = [];
+        let probeEnv = {...baseEnv};
+
+        if (cjsTarget) {
+            if (nodeExe) {
+                executable = nodeExe;
+                commandPrefix = [nodeExe, ...bridgeArgs, cjsTarget];
+                probePrefix = [nodeExe, cjsTarget];
+                pathEnv = (await buildSearchPathAsync(nodeExe)).join(':');
+            } else {
+                const electronExe = '/opt/ZCode/zcode';
+                if (!GLib.file_test(electronExe, GLib.FileTest.IS_EXECUTABLE)) {
+                    throw new Error('找到 ZCode 脚本但缺少 Node 或 Electron 运行时');
+                }
+                executable = electronExe;
+                commandPrefix = [electronExe, ...bridgeArgs, cjsTarget];
+                probePrefix = [electronExe, cjsTarget];
+                extraEnv = {...baseEnv, ELECTRON_RUN_AS_NODE: '1'};
+                probeEnv = {...baseEnv, ELECTRON_RUN_AS_NODE: '1'};
+                pathEnv = pathDirs.join(':');
+            }
+        } else {
+            const zcodeExe = resolvedCustom || findExecutableInDirs('zcode', pathDirs);
+            if (!zcodeExe) {
+                throw new Error('未检测到本机 ZCode CLI，请安装 ZCode 或在设置中检查路径');
+            }
+            executable = zcodeExe;
+            commandPrefix = [zcodeExe];
+            probePrefix = [zcodeExe];
+            pathEnv = (await buildSearchPathAsync(zcodeExe)).join(':');
+            if (bridgePath && !bridgePath.includes('"')) {
+                const existingNodeOpts = GLib.getenv('NODE_OPTIONS') || '';
+                extraEnv.NODE_OPTIONS = `${existingNodeOpts} --require "${bridgePath}"`.trim();
+                extraEnv.QUICK_CHAT_FORCE_BRIDGE = '1';
+            }
+        }
+        if (bridgePath) {
+            extraEnv.QUICK_CHAT_FORCE_BRIDGE = '1';
+        }
+
+        const cliCapabilities = await probeCliCapabilitiesAsync('zcode', probePrefix, probeEnv, {
+            cancellable,
+            timeoutMs,
+            forceRefresh,
+        });
+        if (cancellable?.is_cancelled?.()) {
+            throw new Error('连接已取消');
+        }
+        const effectiveModeInfo = normalizeEffectiveAgentMode('zcode', requestedMode, cliCapabilities);
+        return {
+            backend: 'zcode',
+            available: true,
+            executable,
+            commandPrefix,
+            bridgePath,
+            setsidPath,
+            extraEnv,
+            pathEnv,
+            resolvedProvider,
+            resolvedModel: effectiveModel,
+            label,
+            cliCapabilities,
+            effectiveModeInfo,
+            capabilities: getBackendCapabilities('zcode', effectiveModeInfo.effectiveMode, cliCapabilities),
+        };
+    }
+
+    if (effective === 'codex') {
+        const pathDirs = await buildSearchPathAsync(rawCodexPath);
+        if (cancellable?.is_cancelled?.()) {
+            throw new Error('连接已取消');
+        }
+        const cliEnv = createGioCliEnv(rawCodexPath, pathDirs);
+        const codexExe = (rawCodexPath ? cliEnv.resolveCandidate(rawCodexPath) : '')
+            || findExecutableInDirs('codex', cliEnv.pathDirs);
+        if (!codexExe) {
+            throw new Error('未检测到本机 Codex CLI 可执行文件');
+        }
+        const setsidPath = resolveSetsidExecutable(cliEnv.pathDirs);
+        const cliCapabilities = await probeCliCapabilitiesAsync('codex', [codexExe], {}, {
+            cancellable,
+            timeoutMs,
+            forceRefresh,
+        });
+        if (cancellable?.is_cancelled?.()) {
+            throw new Error('连接已取消');
+        }
+        const effectiveModeInfo = normalizeEffectiveAgentMode('codex', requestedMode, cliCapabilities);
+        const resolvedModel = String(config.model || '').trim();
+        return {
+            backend: 'codex',
+            available: true,
+            executable: codexExe,
+            setsidPath,
+            pathEnv: (await buildSearchPathAsync(codexExe)).join(':'),
+            resolvedProvider: String(config.provider || 'openai').trim(),
+            resolvedModel,
+            label: resolvedModel || 'Codex',
+            cliCapabilities,
+            effectiveModeInfo,
+            capabilities: getBackendCapabilities('codex', effectiveModeInfo.effectiveMode, cliCapabilities),
+        };
+    }
+
+    throw new Error(UNCONFIGURED_BACKEND_MESSAGE);
+}
+
 export class BackendClient {
     constructor(onEvent, onExit) {
         this._event = onEvent;
@@ -252,13 +478,14 @@ export class BackendClient {
         });
         this._store = null;
         this._adapter = null;
+        this._startupCancellable = null;
     }
 
     get adapter() {
         return this._adapter;
     }
 
-    start(config, workspace, sessionDir, sessionId, options = {}) {
+    _initWithRuntime(runtime, config, workspace, sessionDir, sessionId, options = {}) {
         this._config = config;
         this._workspace = workspace;
         this._sessionDir = sessionDir;
@@ -266,8 +493,7 @@ export class BackendClient {
         this._clientGeneration = Number(options.clientGeneration || 0);
         this._specialDirs = getUserSpecialDirs();
         this._timeouts = resolveSplitTimeouts(config);
-        cleanupStaleRuntimeFiles();
-        this._runtime = resolveBackendRuntime(config);
+        this._runtime = runtime;
         this._backend = this._runtime.backend;
 
         this._store = new SessionStore(sessionId, {
@@ -304,6 +530,37 @@ export class BackendClient {
             });
         } else {
             this._adapter = new BaseBackendAdapter('unconfigured', sharedDeps).initialize(this._runtime, config);
+        }
+    }
+
+    start(config, workspace, sessionDir, sessionId, options = {}) {
+        cleanupStaleRuntimeFiles();
+        const runtime = resolveBackendRuntime(config);
+        this._initWithRuntime(runtime, config, workspace, sessionDir, sessionId, options);
+    }
+
+    async startAsync(config, workspace, sessionDir, sessionId, options = {}) {
+        if (this._closed) {
+            throw new Error('服务已关闭');
+        }
+        try { this._startupCancellable?.cancel?.(); } catch (_) {}
+        const startupCancellable = options.cancellable || new Gio.Cancellable();
+        this._startupCancellable = startupCancellable;
+        cleanupStaleRuntimeFiles();
+        try {
+            const runtime = await resolveBackendRuntimeAsync(config, {
+                cancellable: startupCancellable,
+                forceRefresh: Boolean(options.forceRefresh),
+                timeoutMs: Number(options.probeTimeoutMs || 1400),
+            });
+            if (this._closed || startupCancellable?.is_cancelled?.()) {
+                throw new Error('连接已取消');
+            }
+            this._initWithRuntime(runtime, config, workspace, sessionDir, sessionId, options);
+        } finally {
+            if (this._startupCancellable === startupCancellable) {
+                this._startupCancellable = null;
+            }
         }
     }
 
@@ -505,6 +762,8 @@ export class BackendClient {
     close() {
         if (this._closed) return;
         this._closed = true;
+        try { this._startupCancellable?.cancel?.(); } catch (_) {}
+        this._startupCancellable = null;
         const active = this._turns.activeTurn;
         this._turns.dispose(
             proc => terminateTurnProcess(active, proc),

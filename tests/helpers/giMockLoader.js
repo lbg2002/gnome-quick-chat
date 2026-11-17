@@ -38,6 +38,9 @@ export function createMockGLib() {
             get_size() {
                 return this._buf.length;
             }
+            get_data() {
+                return new Uint8Array(this._buf);
+            }
             toArray() {
                 return new Uint8Array(this._buf);
             }
@@ -350,11 +353,18 @@ class MockInputStream {
 
     read_bytes_async(count, _prio, cancellable, callback) {
         const GLib = createMockGLib();
+        let cancelId = 0;
+        if (cancellable?.connect) {
+            cancelId = cancellable.connect(() => this._drainWaiters());
+        }
         this._waiters.push({
             type: 'bytes',
             count,
             cancellable,
             cb: result => {
+                if (cancelId && cancellable?.disconnect) {
+                    try { cancellable.disconnect(cancelId); } catch (_) {}
+                }
                 queueMicrotask(() => {
                     if (result.err) {
                         callback(this, {_err: result.err});
@@ -403,10 +413,17 @@ class MockDataInputStream extends MockInputStream {
         this._base = baseStream;
         if (baseStream instanceof MockInputStream) {
             baseStream.read_line_async = function (_prio, cancellable, callback) {
+                let cancelId = 0;
+                if (cancellable?.connect) {
+                    cancelId = cancellable.connect(() => this._drainWaiters());
+                }
                 this._waiters.push({
                     type: 'line',
                     cancellable,
                     cb: result => {
+                        if (cancelId && cancellable?.disconnect) {
+                            try { cancellable.disconnect(cancelId); } catch (_) {}
+                        }
                         queueMicrotask(() => {
                             if (result.err) {
                                 callback(this, {_err: result.err});
@@ -536,6 +553,11 @@ class MockSubprocess {
         try {
             process.kill(this._child.pid, 'SIGKILL');
         } catch (_) {}
+    }
+
+    communicate_utf8() {
+        globalThis.__qcSyncCommunicateCount = (globalThis.__qcSyncCommunicateCount || 0) + 1;
+        return [true, '', ''];
     }
 }
 
@@ -706,6 +728,7 @@ export function createMockGio() {
                 return this._mockProc?.force_exit();
             }
             communicate_utf8(_input, _cancellable) {
+                globalThis.__qcSyncCommunicateCount = (globalThis.__qcSyncCommunicateCount || 0) + 1;
                 const res = spawnSync(this._cmd, this._args, {encoding: 'utf8', timeout: 5000});
                 this._mockProc = {
                     get_successful: () => res.status === 0 && !res.signal,
@@ -744,10 +767,16 @@ export function createMockGio() {
             }
         },
         File: {
+            new_for_uri(uri) {
+                const clean = String(uri || '').replace(/^file:\/\//, '');
+                return this.new_for_path(clean);
+            },
             new_for_path(filePath) {
                 const p = String(filePath || '');
+                const fileApi = this;
                 return {
                     get_path: () => p,
+                    get_parent: () => fileApi.new_for_path(path.dirname(p)),
                     query_exists: () => fs.existsSync(p),
                     set_attribute_uint32: (attr, val) => {
                         if (attr === 'unix::mode') {
@@ -784,6 +813,40 @@ export function createMockGio() {
                     query_info_finish(res) {
                         if (res?._err) throw res._err;
                         return res._info;
+                    },
+                    enumerate_children_async(_attrs, _flags, _prio, _cancellable, cb) {
+                        fs.readdir(p, {withFileTypes: true}, (err, dirents) => {
+                            if (err) {
+                                cb(this, {_err: err});
+                                return;
+                            }
+                            let idx = 0;
+                            const enumerator = {
+                                next_files_async(count, _p, _c, nextCb) {
+                                    const batch = dirents.slice(idx, idx + count).map(d => ({
+                                        get_name: () => d.name,
+                                        get_file_type: () => (d.isDirectory() ? 2 : 1),
+                                    }));
+                                    idx += count;
+                                    queueMicrotask(() => nextCb(enumerator, {_infos: batch}));
+                                },
+                                next_files_finish(res) {
+                                    if (res?._err) throw res._err;
+                                    return res._infos || [];
+                                },
+                                close_async(_p, _c, closeCb) {
+                                    queueMicrotask(() => closeCb?.(enumerator, {}));
+                                },
+                                close_finish() {
+                                    return true;
+                                },
+                            };
+                            cb(this, {_enum: enumerator});
+                        });
+                    },
+                    enumerate_children_finish(res) {
+                        if (res?._err) throw res._err;
+                        return res._enum;
                     },
                     load_contents_async(_cancellable, cb) {
                         fs.readFile(p, (err, buf) => {
