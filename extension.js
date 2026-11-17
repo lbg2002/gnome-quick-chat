@@ -20,6 +20,7 @@ import {
 import {
     AttachmentManager,
     MAX_ATTACHMENT_FILE_BYTES,
+    describePathOnlyPureApiActions,
     extractCopiedFilePaths,
 } from './core/attachmentManager.js';
 import {BackendRegistry} from './core/backendRegistry.js';
@@ -31,7 +32,11 @@ import {
     migrateGSettingsIfNeeded,
     peekEffectiveBackend,
 } from './core/backendDetect.js';
-import {sanitizeDiagnosticSnapshot} from './core/diagnosticsReport.js';
+import {
+    deriveRuntimeStatusIndicator,
+    formatDiagnosticReportText,
+    sanitizeDiagnosticSnapshot,
+} from './core/diagnosticsReport.js';
 import {
     clampSafeRecommendedMode,
     recommendRouteLocally,
@@ -100,6 +105,8 @@ export default class QuickChat extends Extension {
         this._notifGate = new BackgroundNotificationGate();
         this._dismissedRouteKeys = new Set();
         this._editingTurnInfo = null;
+        this._lastConfirmedSideEffectRetryCardId = '';
+        this._canUndoLastRewind = false;
         this._cachedAvailableBackends = new Set();
         this._diagState = {
             bridgeHandshake: '',
@@ -174,6 +181,8 @@ export default class QuickChat extends Extension {
                 isExtensionAlive: () => this._isSessionUnlockedAndAlive(lifeGen),
                 onNudgeLayout: () => this._dateIntegration?.nudgeLayout(),
                 onOpenPreferences: () => this._openExtensionPreferences(),
+                getCurrentResolvedModel: () => this._modelLabel || '',
+                getAvailableBackends: () => this._cachedAvailableBackends,
             });
 
             this._panel = new ChatPanelView({
@@ -215,6 +224,10 @@ export default class QuickChat extends Extension {
                 onEntryTextChanged: text => this._onEntryTextChanged(text),
                 onDismissMigrationNotice: () => this._modelPicker?.dismissMigrationNotice(),
                 onLoadOlderArchivePage: pageSize => this._loadOlderArchivePage(pageSize),
+                onCopyDiagnosticsReport: () => this._copyDiagnosticsReport(),
+                onRetrySaveSession: () => this._retrySaveSession(),
+                onUndoLastRewind: () => this._undoLastRewind(),
+                onSwitchToAgentBackendForPath: () => this._switchToAgentBackendForPath(),
             });
 
             const wrapper = this._panel.build({showNotificationTab: true});
@@ -298,6 +311,7 @@ export default class QuickChat extends Extension {
                 if (!this._enabled || this._lifecycleGeneration !== lifeGen) return;
                 // Never expose transcript, pending attachments, or approved session scopes across lock screen / greeter.
                 if (Main.sessionMode.isLocked || Main.sessionMode.isGreeter) {
+                    this._notifGate?.onLockScreenEntered?.();
                     if (this._modelPicker?.isOpen) this._modelPicker.toggle(false);
                     this._panel?.toggleSessionMenu(false);
                     this._panel?.toggleFileAttachBar(false);
@@ -511,7 +525,8 @@ export default class QuickChat extends Extension {
             modelLabel: this._modelLabel || '',
             draftText,
         });
-        this._panel.renderAttachments(this._attachments.items, notice);
+        const pureApiActionDesc = describePathOnlyPureApiActions(this._attachments.items, eff);
+        this._panel.renderAttachments(this._attachments.items, notice, {pureApiActionDesc});
         this._updateLocalRouteSuggestion(draftText);
     }
 
@@ -527,16 +542,69 @@ export default class QuickChat extends Extension {
         this._refreshAttachmentBarUi();
     }
 
-    _toggleAttachmentFileMode(id) {
+    async _toggleAttachmentFileMode(id) {
         if (!this._attachments) return;
+        const eff = this._getEffectiveBackend();
         const res = this._attachments.toggleFileMode(id, {
-            effectiveBackend: this._getEffectiveBackend(),
+            effectiveBackend: eff,
         });
+        if (!res.ok && res.needsAsyncContentRead && res.filePath) {
+            const lifeGen = this._lifecycleGeneration;
+            const initialSessionId = this._chatController?.currentSessionId || this._getSettingString('session-id', '');
+            const cancellable = new Gio.Cancellable();
+            const readGuard = this._attachments.beginReadGuard({
+                sessionId: initialSessionId,
+                cancellable,
+            });
+            try {
+                const readRes = await readFileBytesBoundedAsync(res.filePath, MAX_ATTACHMENT_FILE_BYTES, cancellable);
+                const nowSessionId = this._chatController?.currentSessionId || this._getSettingString('session-id', '');
+                if (
+                    !this._isSessionUnlockedAndAlive(lifeGen) ||
+                    !this._attachments ||
+                    !readGuard.isValid({currentSessionId: nowSessionId}) ||
+                    readRes.cancelled
+                ) {
+                    return;
+                }
+                const upgraded = this._attachments.upgradePathAttachmentToContent(id, {
+                    bytes: readRes.bytes,
+                    fileSize: readRes.byteLength,
+                    tooLarge: readRes.tooLarge,
+                    nonRegular: readRes.nonRegular,
+                    effectiveBackend: this._getEffectiveBackend(),
+                });
+                if (!upgraded.ok && upgraded.error) {
+                    this._panel?.setStatusIndicator('error', `⚠️ ${upgraded.error}`);
+                } else if (!this._chatController?.busy) {
+                    this._panel?.setStatusIndicator('ready', '✓ 已读取本地文件正文作为引用');
+                }
+                this._refreshAttachmentBarUi();
+            } finally {
+                readGuard.finish();
+            }
+            return;
+        }
         if (!res.ok && res.error) {
             this._panel?.setStatusIndicator('error', `⚠️ ${res.error}`);
         } else if (res.warning && !this._chatController?.busy) {
             this._panel?.setStatusIndicator('ready', `ℹ️ ${res.warning}`);
         }
+        this._refreshAttachmentBarUi();
+    }
+
+    _switchToAgentBackendForPath() {
+        if (!this._registry || this._chatController?.busy) return;
+        const avail = this._cachedAvailableBackends || new Set();
+        const targetBackend = avail.has('zcode')
+            ? 'zcode'
+            : avail.has('codex')
+                ? 'codex'
+                : 'zcode';
+        const curProfile = this._registry.getBackendProfile(targetBackend);
+        const safeMode = clampSafeRecommendedMode(targetBackend, curProfile.mode || 'readonly');
+        this._registry.updateBackendProfile(targetBackend, {mode: safeMode});
+        this._registry.selectBackend(targetBackend);
         this._refreshAttachmentBarUi();
     }
 
@@ -1158,6 +1226,8 @@ export default class QuickChat extends Extension {
         } else {
             this._panel?.setStatusIndicator('ready', this._idleStatus);
         }
+        this._canUndoLastRewind = Boolean(state.canUndoLastRewind);
+        this._modelPicker?.refreshResultsOnly();
         this._setBusy(false);
         this._panel?.scrollBottom(true);
     }
@@ -1177,9 +1247,19 @@ export default class QuickChat extends Extension {
     }
 
     _retryForAssistantCard(assistantCard) {
-        if (this._isBusyOrMutating() || !this._panel?.historyWindow) return;
+        if (this._isBusyOrMutating() || !this._panel?.historyWindow || !assistantCard) return;
         const retryInfo = this._panel.historyWindow.findRetryTurnInfoForCard(assistantCard);
         if (!retryInfo?.promptText) return;
+        const cardKey = String(assistantCard.messageId || retryInfo.userMessageId || 'card');
+        if (retryInfo.hadSideEffectTools && this._lastConfirmedSideEffectRetryCardId !== cardKey) {
+            this._lastConfirmedSideEffectRetryCardId = cardKey;
+            this._panel?.setStatusIndicator(
+                'ready',
+                '⚠️ 该回答曾执行写入或命令操作，为防重复副作用未自动重跑；再次点击「↻ 重试」确认重新生成'
+            );
+            return;
+        }
+        this._lastConfirmedSideEffectRetryCardId = '';
         this._executePromptTurn({
             promptText: retryInfo.promptText,
             displayUserText: retryInfo.displayText || retryInfo.promptText,
@@ -1210,8 +1290,13 @@ export default class QuickChat extends Extension {
         const info = this._panel.historyWindow.findRetryTurnInfoForCard(userCard);
         if (!info?.promptText) return;
         this._editingTurnInfo = info;
-        this._panel.setEditQuestionBanner(true, info.displayText || info.promptText);
-        this._panel.setEntryTextProgrammatically(info.promptText, {focus: true, cursorAtEnd: true});
+        const editableQuestion = info.editableQuestionText || info.displayText || info.promptText;
+        this._panel.setEditQuestionBanner(true, editableQuestion, {
+            discardedCount: Number(info.discardedSubsequentCount || 0),
+            hasPreservedAttachments: Boolean(info.hasPreservedAttachments),
+            hadSideEffectTools: Boolean(info.hadSideEffectTools),
+        });
+        this._panel.setEntryTextProgrammatically(editableQuestion, {focus: true, cursorAtEnd: true});
     }
 
     _cancelEditQuestion({keepEntry = false} = {}) {
@@ -1318,15 +1403,29 @@ export default class QuickChat extends Extension {
         if (!entry || !this._chatController || this._isBusyOrMutating()) return;
         const rawDraft = entry.get_text().trim();
         const hasAttachments = Boolean(this._attachments?.count > 0);
-        if (!rawDraft && !hasAttachments) return;
+        const editTarget = this._editingTurnInfo;
+        const hasEditAttachments = Boolean(!hasAttachments && editTarget?.hasPreservedAttachments);
+        if (!rawDraft && !hasAttachments && !hasEditAttachments) return;
 
         const effectiveBackend = this._getEffectiveBackend();
         const attachmentSnapshot = this._attachments
             ? this._attachments.createSnapshot(rawDraft)
             : null;
-        const payload = this._attachments
-            ? this._attachments.composeTurnPayload(rawDraft, {backend: effectiveBackend})
-            : {hasAttachments: false, promptForModel: rawDraft, displayUserText: rawDraft, overBudget: false};
+        let payload;
+        if (!hasAttachments && hasEditAttachments && typeof editTarget?.recomposePrompt === 'function') {
+            payload = {
+                hasAttachments: true,
+                promptForModel: editTarget.recomposePrompt(rawDraft),
+                displayUserText: typeof editTarget.recomposeDisplayText === 'function'
+                    ? editTarget.recomposeDisplayText(rawDraft)
+                    : rawDraft,
+                overBudget: false,
+            };
+        } else {
+            payload = this._attachments
+                ? this._attachments.composeTurnPayload(rawDraft, {backend: effectiveBackend})
+                : {hasAttachments: false, promptForModel: rawDraft, displayUserText: rawDraft, overBudget: false};
+        }
 
         if (payload.overBudget) {
             this._panel?.setStatusIndicator(
@@ -1335,8 +1434,6 @@ export default class QuickChat extends Extension {
             );
             return;
         }
-
-        const editTarget = this._editingTurnInfo;
 
         await this._executePromptTurn({
             promptText: payload.promptForModel,
@@ -1419,6 +1516,7 @@ export default class QuickChat extends Extension {
                     this._panel?.setStatusIndicator('error', `回退历史失败：${rw?.error || '磁盘写入失败'}`);
                     return;
                 }
+                this._canUndoLastRewind = Boolean(rw.canUndo);
                 this._panel.truncateMessagesFromId(rewindUserMessageId, {
                     keepStartMessage: Boolean(reuseExistingUserCard),
                 });
@@ -1472,7 +1570,7 @@ export default class QuickChat extends Extension {
 
             this._live = null;
             this._setBusy(true);
-            this._panel.setStatusIndicator('busy', '思考与生成中…');
+            this._panel.setStatusIndicator('busy', '正在发送请求…');
         } finally {
             this._sessionMutationLock = false;
         }
@@ -1583,6 +1681,9 @@ export default class QuickChat extends Extension {
         const answerSummary = formatAskUserAnswerSummary(target.questions, modifiedInput);
 
         target.status = 'sending_approval';
+        target.approvalPhase = 'sending';
+        target.pendingApprovalAction = skipAll ? 'skipped' : 'answered';
+        target.pendingUserAnswerSummary = answerSummary;
         target.deliveryError = '';
         card.dirtyToolNodeIds?.add(target.id);
         card.dirty.tools = true;
@@ -1592,19 +1693,21 @@ export default class QuickChat extends Extension {
         this._panel?.setStatusIndicator('busy', skipAll ? '正在通知 AI 自行判断…' : '正在提交您的回答…');
 
         let sent = false;
+        let phase = '';
         try {
             const res = await this._chatController.client?.request('permission_response', {
                 turnId: expectedTurnId,
                 requestId: target.requestId,
-                decision: 'allow',
+                decision: skipAll ? 'allow' : 'modify',
                 alwaysAllow: false,
                 allowSessionRule: false,
                 scopeKey: '',
                 toolName: target.toolName,
-                modifiedInput,
+                modifiedInput: skipAll ? undefined : modifiedInput,
                 reason: skipAll ? '用户选择交由 AI 自行判断' : '用户在随问中提交了问题回答',
             });
             sent = Boolean(res?.sent);
+            phase = String(res?.phase || '');
         } catch (_) {
             sent = false;
         }
@@ -1619,6 +1722,7 @@ export default class QuickChat extends Extension {
 
         if (!sent) {
             target.status = 'pending_approval';
+            target.approvalPhase = '';
             target.deliveryError = '回答未送达后端进程，请点击重试';
             card.selectedNodeId = target.id;
             card.dirtyToolNodeIds?.add(target.id);
@@ -1629,31 +1733,16 @@ export default class QuickChat extends Extension {
             return;
         }
 
-        target.status = 'running';
-        target.approvalState = skipAll ? 'skipped' : 'answered';
-        target.userAnswerSummary = answerSummary;
-        card.dirtyToolNodeIds?.add(target.id);
-
-        const nextPending = card.toolNodes.find(n => n.status === 'pending_approval');
-        card.selectedNodeId = nextPending ? nextPending.id : null;
-        card.activeTool = true;
-        if (this._chatController.activeTurnState) {
-            this._chatController.activeTurnState.state = nextPending ? 'awaiting_approval' : 'streaming';
+        // R1 & R11.4: Do NOT transition to 'running' until authoritative bridge `permission_resolved` ACK arrives!
+        // If `permission_resolved` already arrived before pipe callback settled, `target.status` is already updated.
+        if (target.status === 'sending_approval') {
+            target.approvalPhase = phase || 'awaiting_ack';
+            card.dirtyToolNodeIds?.add(target.id);
+            card.dirty.tools = true;
+            card.dirty.toolsUrgent = true;
+            card.scheduleRender();
+            this._panel?.setStatusIndicator('busy', '已发送回答，等待桥接确认…');
         }
-        card.dirty.tools = true;
-        card.dirty.toolsUrgent = true;
-        if (!card.text) card.dirty.text = true;
-        card.scheduleRender();
-        this._updateAiTabBadge();
-
-        this._panel?.setStatusIndicator(
-            'busy',
-            nextPending
-                ? (nextPending.isQuestion
-                    ? '💬 请继续回答下一个问题…'
-                    : `⚠️ 等待您审批工具：${nextPending.toolName}`)
-                : '已收到您的回答，正在继续执行…'
-        );
     }
 
     async _submitActiveToolDecision(card, decision, alwaysAllow = false) {
@@ -1669,6 +1758,8 @@ export default class QuickChat extends Extension {
         const effectiveAlwaysAllow = Boolean(allow && alwaysAllow && target.allowSessionRule === true && target.scopeKey);
 
         target.status = 'sending_approval';
+        target.approvalPhase = 'sending';
+        target.pendingApprovalAction = allow ? (effectiveAlwaysAllow ? 'always' : 'allowed') : 'denied';
         target.deliveryError = '';
         card.dirtyToolNodeIds?.add(target.id);
         card.dirty.tools = true;
@@ -1678,6 +1769,7 @@ export default class QuickChat extends Extension {
         this._panel?.setStatusIndicator('busy', `正在发送 ${target.toolName} 授权指令…`);
 
         let sent = false;
+        let phase = '';
         try {
             const res = await this._chatController.client?.request('permission_response', {
                 turnId: expectedTurnId,
@@ -1689,6 +1781,7 @@ export default class QuickChat extends Extension {
                 toolName: target.toolName,
             });
             sent = Boolean(res?.sent);
+            phase = String(res?.phase || '');
         } catch (_) {
             sent = false;
         }
@@ -1703,6 +1796,7 @@ export default class QuickChat extends Extension {
 
         if (!sent) {
             target.status = 'pending_approval';
+            target.approvalPhase = '';
             target.deliveryError = '授权指令未送达后端进程，请点击按钮重试';
             card.selectedNodeId = target.id;
             card.dirtyToolNodeIds?.add(target.id);
@@ -1713,40 +1807,15 @@ export default class QuickChat extends Extension {
             return;
         }
 
-        target.status = allow ? 'running' : 'denied';
-        target.approvalState = allow ? (effectiveAlwaysAllow ? 'always' : 'allowed') : 'denied';
-        card.dirtyToolNodeIds?.add(target.id);
-
-        if (effectiveAlwaysAllow && target.scopeKey) {
-            for (const other of card.toolNodes) {
-                if (other.status === 'pending_approval' && other.scopeKey === target.scopeKey) {
-                    other.status = 'running';
-                    other.approvalState = 'always';
-                    card.dirtyToolNodeIds?.add(other.id);
-                }
-            }
+        // R1: Wait for authoritative bridge `permission_resolved` ACK before leaving approval or releasing same-scope nodes!
+        if (target.status === 'sending_approval') {
+            target.approvalPhase = phase || 'awaiting_ack';
+            card.dirtyToolNodeIds?.add(target.id);
+            card.dirty.tools = true;
+            card.dirty.toolsUrgent = true;
+            card.scheduleRender();
+            this._panel?.setStatusIndicator('busy', `已发送 ${target.toolName} 授权，等待桥接确认…`);
         }
-
-        const nextPending = card.toolNodes.find(n => n.status === 'pending_approval');
-        card.selectedNodeId = nextPending ? nextPending.id : null;
-        card.activeTool = allow || Boolean(nextPending);
-        if (this._chatController.activeTurnState) {
-            this._chatController.activeTurnState.state = nextPending ? 'awaiting_approval' : 'streaming';
-        }
-        card.dirty.tools = true;
-        card.dirty.toolsUrgent = true;
-        if (!card.text) card.dirty.text = true;
-        card.scheduleRender();
-        this._updateAiTabBadge();
-
-        this._panel?.setStatusIndicator(
-            'busy',
-            nextPending
-                ? `⚠️ 等待您审批工具：${nextPending.toolName}`
-                : allow
-                    ? `已授权 ${target.toolName}，正在执行…`
-                    : `已拒绝 ${target.toolName}，正在继续…`
-        );
     }
 
     _onEvent(event) {
@@ -2292,6 +2361,10 @@ export default class QuickChat extends Extension {
         const currentSessionId = this._getSettingString('session-id', '');
         const mountedTurnIds = (this._panel?.mountedCards || []).map(c => c.turnId).filter(Boolean);
         const storedTurnIds = (this._panel?.historyWindow?.allMessages || []).map(m => m.turnId).filter(Boolean);
+        const pendingRequestIds = (this._live?.toolNodes || [])
+            .filter(n => n.status === 'pending_approval' || n.status === 'sending_approval')
+            .map(n => n.requestId)
+            .filter(Boolean);
 
         let existingSessionIds = [];
         if (target.sessionId && target.sessionId !== currentSessionId) {
@@ -2311,6 +2384,8 @@ export default class QuickChat extends Extension {
             mountedTurnIds,
             storedTurnIds,
             existingSessionIds,
+            currentLockEpoch: this._notifGate?.lockEpoch ?? 0,
+            pendingRequestIds,
         });
         if (resolved.action === 'ignore') return;
 
@@ -2322,6 +2397,9 @@ export default class QuickChat extends Extension {
 
         if (resolved.action === 'switch_session_and_focus' && resolved.sessionId) {
             await this._restoreSessionById(resolved.sessionId);
+            if (this._isSessionUnlockedAndAlive(lifeGen)) {
+                this._panel?.scrollBottom(true, true);
+            }
             return;
         }
 
@@ -2351,6 +2429,77 @@ export default class QuickChat extends Extension {
                     this._panel?.entry?.grab_key_focus();
                 }
             });
+        }
+    }
+
+    _copyDiagnosticsReport() {
+        if (!this._isSessionUnlockedAndAlive()) return;
+        const lifeGen = this._lifecycleGeneration;
+        const snap = sanitizeDiagnosticSnapshot(this._diagState || {}, {
+            homeDir: GLib.get_home_dir() || '',
+        });
+        const reportText = formatDiagnosticReportText(snap);
+        try {
+            St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, reportText);
+        } catch (_) {}
+        this._panel?.setStatusIndicator('ready', '✓ 已复制脱敏诊断摘要（不含 API Key 与对话正文）');
+        this._scheduleTimeout(3000, () => {
+            if (this._isSessionUnlockedAndAlive(lifeGen) && !this._chatController?.busy) {
+                this._panel?.setStatusIndicator('ready', this._idleStatus || '随问');
+            }
+        });
+    }
+
+    async _retrySaveSession() {
+        if (!this._isSessionUnlockedAndAlive() || !this._chatController?.client) return;
+        const lifeGen = this._lifecycleGeneration;
+        try {
+            const res = await this._chatController.client.request('retry_save_session');
+            if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
+            if (res?.ok && !res?.hasUnsavedChanges) {
+                this._syncDiagnosticsSnapshot({
+                    sessionSaveStatus: '正常',
+                    sessionSaveWarning: '',
+                });
+                this._panel?.setStatusIndicator('ready', '✓ 历史消息已成功保存到本地磁盘');
+            } else {
+                const msg = res?.error || '历史保存仍失败';
+                this._syncDiagnosticsSnapshot({
+                    sessionSaveStatus: `⚠️ ${msg}`,
+                    sessionSaveWarning: msg,
+                });
+                this._panel?.setStatusIndicator('error', `⚠️ 历史未保存：${msg}`);
+            }
+        } catch (err) {
+            this._panel?.setStatusIndicator('error', `⚠️ 重试保存失败：${err?.message || err}`);
+        }
+    }
+
+    async _undoLastRewind() {
+        if (!this._isSessionUnlockedAndAlive() || !this._chatController?.client || this._isBusyOrMutating()) {
+            return;
+        }
+        this._sessionMutationLock = true;
+        const lifeGen = this._lifecycleGeneration;
+        try {
+            const res = await this._chatController.client.request('undo_last_rewind');
+            if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
+            if (!res?.ok) {
+                this._panel?.setStatusIndicator('error', `⚠️ ${res?.error || '撤销回退失败'}`);
+                return;
+            }
+            this._canUndoLastRewind = false;
+            this._panel?.renderInitialHistory(
+                detailedMessages(res.messages || []),
+                userText => this._recordPromptHistory(userText),
+                {externalArchivedCount: Number(res.archivedCount || 0)}
+            );
+            this._panel?.scrollBottom(true, true);
+            this._panel?.setStatusIndicator('ready', `✓ 已恢复此前回退舍弃的 ${res.restoredCount || 0} 条记录`);
+        } catch (err) {
+            this._panel?.setStatusIndicator('error', `⚠️ 撤销回退失败：${err?.message || err}`);
+        } finally {
+            this._sessionMutationLock = false;
         }
     }
 
@@ -2391,6 +2540,7 @@ export default class QuickChat extends Extension {
                 previousPreview: prevObj?.preview || '',
                 cleanupPlan,
                 saveWarning: this._diagState?.sessionSaveWarning || '',
+                canUndoLastRewind: Boolean(this._canUndoLastRewind),
             });
         } catch (_) {}
     }

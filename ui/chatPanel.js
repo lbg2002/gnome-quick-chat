@@ -63,6 +63,10 @@ export class ChatPanelView {
         onEntryTextChanged,
         onDismissMigrationNotice,
         onLoadOlderArchivePage = null,
+        onCopyDiagnosticsReport = null,
+        onRetrySaveSession = null,
+        onUndoLastRewind = null,
+        onSwitchToAgentBackendForPath = null,
     }) {
         this._cardFactory = cardFactory;
         this._modelPicker = modelPicker;
@@ -103,6 +107,10 @@ export class ChatPanelView {
         this._onEntryTextChanged = onEntryTextChanged;
         this._onDismissMigrationNotice = onDismissMigrationNotice;
         this._onLoadOlderArchivePage = onLoadOlderArchivePage;
+        this._onCopyDiagnosticsReport = onCopyDiagnosticsReport;
+        this._onRetrySaveSession = onRetrySaveSession;
+        this._onUndoLastRewind = onUndoLastRewind;
+        this._onSwitchToAgentBackendForPath = onSwitchToAgentBackendForPath;
         this._archivePageLoading = false;
 
         this.historyWindow = new HistoryWindowController({
@@ -676,16 +684,25 @@ export class ChatPanelView {
         }
     }
 
-    setEditQuestionBanner(active, previewQuestion = '') {
+    setEditQuestionBanner(active, previewQuestion = '', {
+        discardedCount = 0,
+        hasPreservedAttachments = false,
+        hadSideEffectTools = false,
+    } = {}) {
         if (!this._editBanner || !this._editBannerLabel) return;
         if (!active) {
             this._editBanner.visible = false;
             return;
         }
-        const shortQ = String(previewQuestion || '').replace(/\s+/g, ' ').trim().slice(0, 26);
+        const shortQ = String(previewQuestion || '').replace(/\s+/g, ' ').trim().slice(0, 22);
+        const attachNote = hasPreservedAttachments ? ' · 已保留原附件' : '';
+        const discardNote = discardedCount > 0
+            ? ` · 发送后将舍弃后续 ${discardedCount} 条消息（可在会话菜单 ↶ 撤销回退）`
+            : '（发送后从此处重新生成）';
+        const sideEffectNote = hadSideEffectTools ? ' · ⚠️ 原回答曾执行写入/高风险工具，请留意不会自动回滚外部文件' : '';
         this._editBannerLabel.text = shortQ
-            ? `✎ 编辑历史问题「${shortQ}${previewQuestion.length > 26 ? '…' : ''}」（发送后从此处重新生成）`
-            : '✎ 正在编辑历史问题（发送后将从该位置重新生成）';
+            ? `✎ 编辑历史问题「${shortQ}${previewQuestion.length > 22 ? '…' : ''}」${attachNote}${discardNote}${sideEffectNote}`
+            : `✎ 正在编辑历史问题${attachNote}${discardNote}${sideEffectNote}`;
         this._editBanner.visible = true;
     }
 
@@ -700,7 +717,7 @@ export class ChatPanelView {
         this._routeBanner.visible = true;
     }
 
-    renderAttachments(items = [], scopeNotice = '') {
+    renderAttachments(items = [], scopeNotice = '', {pureApiActionDesc = null} = {}) {
         if (!this._attachmentBar) return;
         this._attachmentBar.destroy_all_children();
 
@@ -760,6 +777,38 @@ export class ChatPanelView {
             this._attachmentBar.add_child(itemBox);
         }
 
+        if (pureApiActionDesc?.hasPathWarning) {
+            const actionRow = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-attachment-row',
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: true,
+            });
+            actionRow.add_child(createWrapLabel(pureApiActionDesc.warningText, 'qc-scope-notice'));
+            for (const act of pureApiActionDesc.actions || []) {
+                if (act.action === 'upgrade_to_content' && act.itemIds?.length) {
+                    actionRow.add_child(createStButton(
+                        act.label,
+                        () => {
+                            for (const id of act.itemIds) {
+                                this._onToggleAttachmentFileMode?.(id);
+                            }
+                        },
+                        'qc-copy-btn',
+                        act.description
+                    ));
+                } else if (act.action === 'switch_to_agent_backend') {
+                    actionRow.add_child(createStButton(
+                        act.label,
+                        () => this._onSwitchToAgentBackendForPath?.(),
+                        'qc-copy-btn',
+                        act.description
+                    ));
+                }
+            }
+            this._attachmentBar.add_child(actionRow);
+        }
+
         if (scopeNotice) {
             this._attachmentBar.add_child(createWrapLabel(scopeNotice, 'qc-scope-notice'));
         }
@@ -786,8 +835,8 @@ export class ChatPanelView {
     }
 
     /**
-     * Renders the compact 5-action session recovery bar (Stage F4):
-     * Current Session Info / New / Restore Previous / Export / Delete (+ explicit consent retention cleanup).
+     * Renders the compact session recovery & diagnostics bar (Stage F4 & R11.2/R11.3):
+     * Current Session Info / New / Restore Previous / Export / Copy Diagnostics / Retry Save / Undo Rewind / Delete.
      */
     renderSessionMenuState({
         currentSessionId = '',
@@ -797,6 +846,7 @@ export class ChatPanelView {
         previousPreview = '',
         cleanupPlan = null,
         saveWarning = '',
+        canUndoLastRewind = false,
     } = {}) {
         if (!this._sessionMenuBox || !this._sessionMenuBox.visible) return;
         this._sessionMenuBox.destroy_all_children();
@@ -840,6 +890,32 @@ export class ChatPanelView {
         prevBtn.reactive = Boolean(previousSessionId && !this._isBusy?.());
         actionsRow.add_child(prevBtn);
 
+        if (canUndoLastRewind) {
+            const undoBtn = createStButton(
+                '↶ 撤销回退',
+                () => {
+                    this.toggleSessionMenu(false);
+                    this._onUndoLastRewind?.();
+                },
+                'qc-copy-btn',
+                '恢复上一次编辑或重试时舍弃的后续对话记录'
+            );
+            undoBtn.reactive = !this._isBusy?.();
+            actionsRow.add_child(undoBtn);
+        }
+
+        if (saveWarning) {
+            actionsRow.add_child(createStButton(
+                '↻ 重试保存',
+                () => {
+                    this.toggleSessionMenu(false);
+                    this._onRetrySaveSession?.();
+                },
+                'qc-copy-btn',
+                '重试将未落盘的会话消息写入本地磁盘'
+            ));
+        }
+
         const exportBtn = createStButton(
             '⇩ 导出对话',
             () => {
@@ -851,6 +927,16 @@ export class ChatPanelView {
         );
         exportBtn.reactive = messageCount > 0;
         actionsRow.add_child(exportBtn);
+
+        actionsRow.add_child(createStButton(
+            '📋 复制诊断',
+            () => {
+                this.toggleSessionMenu(false);
+                this._onCopyDiagnosticsReport?.();
+            },
+            'qc-copy-btn',
+            '复制不含密钥与对话正文的脱敏运行时诊断摘要'
+        ));
 
         if (!this._sessionDeleteConfirming) {
             const delBtn = createStButton(
@@ -865,6 +951,7 @@ export class ChatPanelView {
                         previousPreview,
                         cleanupPlan,
                         saveWarning,
+                        canUndoLastRewind,
                     });
                 },
                 'qc-copy-btn',
@@ -895,6 +982,7 @@ export class ChatPanelView {
                         previousPreview,
                         cleanupPlan,
                         saveWarning,
+                        canUndoLastRewind,
                     });
                 },
                 'qc-copy-btn',

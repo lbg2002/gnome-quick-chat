@@ -2,6 +2,8 @@
  * Pure-JS Unified Render Scheduler, Tool Dot Differ/Folder, UI Buffer Capper,
  * and Windowed History Actor Controller (Stage D2 & D3, zero GJS dependencies).
  */
+import {formatAskUserAnswerSummary, isSideEffectingToolExecution} from '../protocol.js';
+import {extractUserQuestionAndAttachmentsFromPrompt} from './attachmentManager.js';
 
 const UTF8_ENCODER = new TextEncoder();
 
@@ -453,6 +455,17 @@ export function applyToolTraceEventToCard(card, event, {
                     node.approvalState = hasAns
                         ? 'answered'
                         : (node.pendingApprovalAction || 'skipped');
+                    if (hasAns) {
+                        node.userAnswerSummary = formatAskUserAnswerSummary(
+                            node.questions || [],
+                            {answers: event.answers}
+                        ) || node.pendingUserAnswerSummary || '';
+                    } else if (node.pendingUserAnswerSummary) {
+                        node.userAnswerSummary = node.pendingUserAnswerSummary;
+                    } else {
+                        node.userAnswerSummary = formatAskUserAnswerSummary(node.questions || [], {answers: {}});
+                    }
+                    node.pendingUserAnswerSummary = '';
                 } else {
                     node.approvalState = (event.sessionScopeSaved || node.pendingApprovalAction === 'always')
                         ? 'always'
@@ -699,6 +712,125 @@ export function appendBoundedInMemoryText(existingText, deltaText, maxChars = UI
     const next = String(existingText || '') + String(deltaText || '');
     if (next.length <= maxChars) return next;
     return `${next.slice(0, maxChars)}\n… [内存缓冲已达安全上限]`;
+}
+
+/**
+ * Formats complete, un-hidden security inspector details for a tool trace node (R11.4).
+ * During `pending_approval` / `sending_approval` (`isAwaiting`), NEVER truncates `fullCommand` at 260 chars
+ * and always surfaces the real command, real working directory, normalized target path, and all risk warnings.
+ */
+export function formatToolApprovalInspectorDetails(node, {expanded = false} = {}) {
+    if (!node || typeof node !== 'object') {
+        return {
+            summaryText: '',
+            summaryVisible: false,
+            bodyText: '',
+            bodyVisible: false,
+            showExpandBtn: false,
+            isAwaiting: false,
+        };
+    }
+
+    const isAwaiting = node.status === 'pending_approval' || node.status === 'sending_approval';
+    const primaryTargetText = String(
+        node.fullCommand ||
+        node.displayPath ||
+        node.networkOrigin ||
+        (node.summary && node.summary !== node.toolName ? node.summary : '')
+    ).trim();
+
+    let summaryText = '';
+    let isSummaryTruncated = false;
+    const isLongPrimary = primaryTargetText.length > 260 || primaryTargetText.split('\n').length > 6;
+
+    if (primaryTargetText) {
+        if (!isAwaiting && isLongPrimary && !expanded) {
+            const lines = primaryTargetText.split('\n');
+            const preview = lines.length > 6
+                ? `${lines.slice(0, 6).join('\n')}…`
+                : `${primaryTargetText.slice(0, 260)}…`;
+            summaryText = `${preview}（共 ${primaryTargetText.length} 字符，可展开查看完整内容）`;
+            isSummaryTruncated = true;
+        } else {
+            const cappedPrimary = formatDisplayBufferWithCap(primaryTargetText, {
+                maxDisplayBytes: UI_BUFFER_CAPS.maxToolDetailDisplayBytes,
+                expanded: Boolean(expanded),
+            });
+            summaryText = cappedPrimary.displayText;
+            isSummaryTruncated = cappedPrimary.isTruncatedForUi;
+        }
+    }
+
+    const extraLines = [];
+    if (node.deliveryError) extraLines.push(`⚠️ ${node.deliveryError}`);
+    if (node.operationLabel && node.toolName) {
+        extraLines.push(`工具与操作：${node.toolName}（${node.operationLabel}${node.riskLabel ? ` · ${node.riskLabel}` : ''}）`);
+    } else if (node.riskLabel) {
+        extraLines.push(`风险等级：${node.riskLabel}`);
+    }
+    if (isAwaiting && node.fullCommand && primaryTargetText !== node.fullCommand) {
+        extraLines.push(`真实命令：${node.fullCommand}`);
+    }
+    const effectiveCwd = node.realCwd || node.cwd;
+    if (effectiveCwd) {
+        extraLines.push(
+            node.cwd && node.realCwd && node.cwd !== node.realCwd
+                ? `真实工作目录：${node.realCwd}（请求路径：${node.cwd}）`
+                : `工作目录：${effectiveCwd}`
+        );
+    }
+    if (node.realPath) {
+        extraLines.push(
+            node.displayPath && node.displayPath !== node.realPath
+                ? `规范化真实路径：${node.realPath}（原始参数：${node.displayPath}）`
+                : `目标真实路径：${node.realPath}`
+        );
+    } else if (node.displayPath && primaryTargetText !== node.displayPath) {
+        extraLines.push(`目标路径：${node.displayPath}`);
+    }
+    if (node.networkOrigin && primaryTargetText !== node.networkOrigin) {
+        extraLines.push(`网络目标来源：${node.networkOrigin}`);
+    }
+    if (Array.isArray(node.riskWarnings) && node.riskWarnings.length > 0) {
+        for (const w of node.riskWarnings) {
+            extraLines.push(`⚠️ 风险提示：${w}`);
+        }
+    }
+    if (isAwaiting) {
+        if (node.reason && node.reason !== primaryTargetText) {
+            extraLines.push(`说明：${node.reason}`);
+        }
+    } else if (node.detail && node.detail !== primaryTargetText) {
+        extraLines.push(node.detail);
+    }
+
+    let bodyText = '';
+    let isExtraTruncated = false;
+    if (extraLines.length > 0) {
+        const cappedExtra = formatDisplayBufferWithCap(extraLines.join('\n'), {
+            maxDisplayBytes: UI_BUFFER_CAPS.maxToolDetailDisplayBytes,
+            expanded: Boolean(expanded || isAwaiting),
+        });
+        bodyText = cappedExtra.displayText;
+        isExtraTruncated = cappedExtra.isTruncatedForUi;
+    } else if (!summaryText) {
+        bodyText = `工具名称：${node.toolName || '工具'}`;
+    }
+
+    const showExpandBtn = Boolean(
+        isSummaryTruncated ||
+        isExtraTruncated ||
+        (Boolean(expanded) && ((!isAwaiting && isLongPrimary) || extraLines.join('\n').length > 260))
+    );
+
+    return {
+        summaryText,
+        summaryVisible: Boolean(summaryText),
+        bodyText,
+        bodyVisible: Boolean(bodyText),
+        showExpandBtn,
+        isAwaiting,
+    };
 }
 
 /**
@@ -1183,24 +1315,78 @@ export class HistoryWindowController {
     /**
      * Resolves the exact user message record `{userMessageId, promptText, displayText, createdAt, ts, userIndex}`
      * paired with an assistant card (or user card) so in-place Regenerate / Edit Question can rewind
-     * without appending a duplicate user message!
+     * without appending a duplicate user message, while preserving attachment envelopes and detecting
+     * discarded subsequent turns or side-effecting tool executions (R11.3)!
      */
     findRetryTurnInfoForCard(card) {
         if (!card) return null;
+
+        const buildEnrichedTurnInfo = ({
+            userMessageId = '',
+            promptText = '',
+            displayText = '',
+            createdAt = '',
+            ts = 0,
+            userIndex = -1,
+        } = {}) => {
+            const parsedPrompt = extractUserQuestionAndAttachmentsFromPrompt(promptText, displayText);
+            const discardedSubsequentCount = userIndex >= 0
+                ? Math.max(0, this.allMessages.length - 1 - userIndex)
+                : 0;
+
+            let hadSideEffectTools = false;
+            if (Array.isArray(card.toolNodes) && card.toolNodes.some(n => isSideEffectingToolExecution(n))) {
+                hadSideEffectTools = true;
+            }
+            if (!hadSideEffectTools && userIndex >= 0) {
+                for (let i = userIndex + 1; i < this.allMessages.length; i++) {
+                    const msg = this.allMessages[i];
+                    if (Array.isArray(msg?.toolNodes) && msg.toolNodes.some(n => isSideEffectingToolExecution(n))) {
+                        hadSideEffectTools = true;
+                        break;
+                    }
+                }
+                for (const mc of this.mountedCards) {
+                    if (!mc || mc.role !== 'assistant' || !Array.isArray(mc.toolNodes)) continue;
+                    const mcIdx = mc.messageId
+                        ? this.allMessages.findIndex(m => m && m.id === mc.messageId)
+                        : -1;
+                    if (mcIdx > userIndex && mc.toolNodes.some(n => isSideEffectingToolExecution(n))) {
+                        hadSideEffectTools = true;
+                        break;
+                    }
+                }
+            }
+
+            return {
+                userMessageId,
+                promptText,
+                displayText,
+                editableQuestionText: parsedPrompt.questionText || displayText || promptText,
+                hasPreservedAttachments: parsedPrompt.hasPreservedAttachments,
+                recomposePrompt: parsedPrompt.recomposePrompt,
+                recomposeDisplayText: parsedPrompt.recomposeDisplayText,
+                discardedSubsequentCount,
+                hadSideEffectTools,
+                createdAt,
+                ts,
+                userIndex,
+            };
+        };
 
         if (card.role === 'user') {
             const exactIdx = card.messageId
                 ? this.allMessages.findIndex(m => m && m.id === card.messageId && m.role === 'user')
                 : -1;
             const stored = exactIdx >= 0 ? this.allMessages[exactIdx] : null;
-            return {
+            return buildEnrichedTurnInfo({
                 userMessageId: String(stored?.id || card.messageId || ''),
                 promptText: String(stored?.text || card.rawPromptText || card.text || '').trim(),
                 displayText: String(stored?.displayText || card.text || '').trim(),
                 createdAt: stored?.createdAt || card.createdAt || '',
                 ts: stored?.ts || card.effectiveTs || 0,
                 userIndex: exactIdx,
-            };
+            });
         }
 
         const replyToId = String(card.replyTo || '').trim();
@@ -1208,14 +1394,14 @@ export class HistoryWindowController {
             const exactIdx = this.allMessages.findIndex(m => m && m.id === replyToId && m.role === 'user');
             if (exactIdx >= 0) {
                 const stored = this.allMessages[exactIdx];
-                return {
+                return buildEnrichedTurnInfo({
                     userMessageId: stored.id,
                     promptText: String(stored.text || '').trim(),
                     displayText: String(stored.displayText || stored.text || '').trim(),
                     createdAt: stored.createdAt || '',
                     ts: stored.ts || 0,
                     userIndex: exactIdx,
-                };
+                });
             }
         }
 
@@ -1229,14 +1415,14 @@ export class HistoryWindowController {
         for (let i = searchStart; i >= 0; i--) {
             const m = this.allMessages[i];
             if (m?.role === 'user' && m.text?.trim()) {
-                return {
+                return buildEnrichedTurnInfo({
                     userMessageId: String(m.id || ''),
                     promptText: m.text.trim(),
                     displayText: String(m.displayText || m.text || '').trim(),
                     createdAt: m.createdAt || '',
                     ts: m.ts || 0,
                     userIndex: i,
-                };
+                });
             }
         }
         return null;

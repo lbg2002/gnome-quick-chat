@@ -1726,6 +1726,17 @@ export class SessionStoreEngine {
         let archiveTruncatedWritten = splitInArchiveIdx < 0;
         let jsonlWritten = false;
 
+        const rewindBackup = {
+            prevMessagesSnapshot: prevMessagesSnapshot.map(cloneDeepJson),
+            prevArchiveIndexSnapshot: prevArchiveIndexSnapshot.map(cloneDeepJson),
+            removedMessages: removedMessages.map(cloneDeepJson),
+            targetUserMessage: cloneDeepJson(targetUserMessage),
+            splitInArchiveIdx,
+            rewindRevision: rev,
+            createdAtMs: Date.now(),
+        };
+        this._lastRewindBackup = rewindBackup;
+
         const writePromise = this._enqueueWrite('rewind_from_user_turn', async () => {
             if (hadPriorCorruptLines) {
                 await this._ensureBoundedCorruptBackup(corruptOriginalSnapshot);
@@ -1790,6 +1801,9 @@ export class SessionStoreEngine {
             isFullSnapshot: true,
             dontRecordFailedWriteOnRollback: true,
             onRollback: () => {
+                if (this._lastRewindBackup === rewindBackup) {
+                    this._lastRewindBackup = null;
+                }
                 this.messages = prevMessagesSnapshot.map(cloneDeepJson);
                 this._archiveIndex = prevArchiveIndexSnapshot.map(cloneDeepJson);
                 this.meta = cloneDeepJson(prevMetaSnapshot);
@@ -1805,6 +1819,82 @@ export class SessionStoreEngine {
             removedMessages,
             retainedCount: this._archiveIndex.length + this.messages.length,
             remoteSessionReset: hadRemoteSession,
+            canUndo: true,
+            writePromise,
+        };
+    }
+
+    get canUndoLastRewind() {
+        return Boolean(
+            this._lastRewindBackup &&
+            Array.isArray(this._lastRewindBackup.prevMessagesSnapshot) &&
+            this._lastRewindBackup.prevMessagesSnapshot.length > 0
+        );
+    }
+
+    /**
+     * Restores the conversation branch discarded by the most recent `rewindFromUserMessage` (R11.3).
+     * Never auto-reruns side-effecting operations; simply restores the logical history snapshot to disk & memory.
+     */
+    undoLastRewind() {
+        this._syncFromCoordinator();
+        const backup = this._lastRewindBackup;
+        if (!backup || !Array.isArray(backup.prevMessagesSnapshot)) {
+            return {
+                ok: false,
+                error: '暂无可撤销的历史回退记录',
+                restoredCount: 0,
+                writePromise: Promise.resolve({ok: false, error: new Error('暂无可撤销的历史回退记录')}),
+            };
+        }
+
+        const prevMessagesOnUndoFail = this.messages.map(cloneDeepJson);
+        const prevArchiveIndexOnUndoFail = this._archiveIndex.map(cloneDeepJson);
+        const prevMetaOnUndoFail = cloneDeepJson(this.meta);
+        const prevRevOnUndoFail = this._revision;
+
+        const restoredMessages = backup.prevMessagesSnapshot.map(cloneDeepJson);
+        const restoredArchiveIndex = backup.prevArchiveIndexSnapshot.map(cloneDeepJson);
+        const restoredCount = backup.removedMessages?.length || 0;
+
+        this.messages = restoredMessages.map(cloneDeepJson);
+        this._archiveIndex = restoredArchiveIndex.map(cloneDeepJson);
+        const rev = ++this._revision;
+        this.meta.remoteSessionId = '';
+        this.meta.remoteSyncedRevision = 0;
+        this.meta.lastRemoteResetReason = 'undo_rewind';
+        this.meta.committedRevision = rev;
+        this.meta.archivedMessageCount = this._archiveIndex.length;
+        this.meta.updatedAt = Date.now();
+        this._lastRewindBackup = null;
+        this._needsLeadingNewlineOnAppend = false;
+
+        this._publishToCoordinator('undo_last_rewind', {forceOverwrite: true});
+        const metaSnapshot = cloneDeepJson(this.meta);
+
+        const writePromise = this._enqueueWrite('undo_last_rewind', async () => {
+            const jsonlBody = restoredMessages.map(m => JSON.stringify(m)).join('\n')
+                + (restoredMessages.length ? '\n' : '');
+            await this._io.replaceFile(this.jsonlPath, jsonlBody);
+            await this._io.replaceFile(this.metaPath, JSON.stringify(metaSnapshot, null, 2));
+        }, {
+            revision: rev,
+            isFullSnapshot: true,
+            dontRecordFailedWriteOnRollback: true,
+            onRollback: () => {
+                this._lastRewindBackup = backup;
+                this.messages = prevMessagesOnUndoFail;
+                this._archiveIndex = prevArchiveIndexOnUndoFail;
+                this.meta = prevMetaOnUndoFail;
+                this._revision = prevRevOnUndoFail;
+                this._publishToCoordinator('undo_rewind_rollback', {forceOverwrite: true});
+            },
+        });
+
+        return {
+            ok: true,
+            restoredCount,
+            messages: this.messages.map(cloneDeepJson),
             writePromise,
         };
     }

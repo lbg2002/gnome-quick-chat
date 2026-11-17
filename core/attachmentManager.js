@@ -576,7 +576,9 @@ export class AttachmentManager {
                 previewText: warning ? `${cleanPath}\n（${warning}）` : cleanPath,
                 previewExpanded: false,
                 isBinary: binaryCheck.isBinary,
-                canToggleContent: Boolean(!binaryCheck.isBinary && !exceedsFileCap && bytes),
+                isDirectory: false,
+                canToggleContent: Boolean(!binaryCheck.isBinary && !exceedsFileCap),
+                needsAsyncContentRead: Boolean(!binaryCheck.isBinary && !exceedsFileCap && !bytes),
                 _cachedText: (!binaryCheck.isBinary && !exceedsFileCap && binaryCheck.decodedText) ? binaryCheck.decodedText : '',
                 warning,
             };
@@ -610,7 +612,9 @@ export class AttachmentManager {
             previewText: buildAttachmentPreview(decodedText),
             previewExpanded: false,
             isBinary: false,
+            isDirectory: false,
             canToggleContent: true,
+            needsAsyncContentRead: false,
             _cachedText: decodedText,
             warning: '',
         };
@@ -639,6 +643,16 @@ export class AttachmentManager {
             return {ok: true, mode: 'file_path', warning: item.warning};
         }
 
+        if (!item._cachedText && item.needsAsyncContentRead) {
+            return {
+                ok: false,
+                needsAsyncRead: true,
+                needsAsyncContentRead: true,
+                itemId: item.id,
+                filePath: item.filePath,
+            };
+        }
+
         const text = item._cachedText || '';
         const textBytes = UTF8_ENCODER.encode(text).byteLength;
         const otherBytes = this.totalBytes - item.payloadBytes;
@@ -650,12 +664,57 @@ export class AttachmentManager {
         }
         item.kind = 'file_content';
         item.content = text;
+        item.text = text;
         item.payloadBytes = textBytes;
         item.sourceLabel = '文件引用（正文）';
         item.sizeLabel = `${formatByteSize(textBytes)} · ${text.split('\n').length} 行`;
         item.warning = '';
         item.previewText = buildAttachmentPreview(text);
-        return {ok: true, mode: 'file_content', warning: ''};
+        return {ok: true, mode: 'file_content', warning: '', item};
+    }
+
+    /**
+     * Upgrades a `file_path` attachment that was originally added with `preferPathOnly: true`
+     * into `file_content` once bounded file bytes have been read asynchronously (Stage R11.5).
+     */
+    upgradePathAttachmentToContent(id, bytesOrOptions, maybeOptions = {}) {
+        const item = this._items.find(it => it.id === id);
+        if (!item || !item.filePath) {
+            return {ok: false, error: '未找到对应的路径附件'};
+        }
+        const isFirstUint8 = bytesOrOptions instanceof Uint8Array;
+        const bytes = isFirstUint8
+            ? bytesOrOptions
+            : (bytesOrOptions && bytesOrOptions.bytes instanceof Uint8Array ? bytesOrOptions.bytes : null);
+        const opts = isFirstUint8 ? (maybeOptions || {}) : (bytesOrOptions || {});
+        const {effectiveBackend = '', contextWindowTokens = 0} = opts;
+
+        if (!(bytes instanceof Uint8Array)) {
+            return {ok: false, error: '未读取到有效的文件内容'};
+        }
+        if (bytes.byteLength > this._maxFileBytes) {
+            item.canToggleContent = false;
+            item.needsAsyncContentRead = false;
+            return {
+                ok: false,
+                error: `文件超过 ${formatByteSize(this._maxFileBytes)} 正文内联上限，无法切换为正文模式`,
+            };
+        }
+        const binaryCheck = detectBinaryFile(bytes, item.filePath);
+        if (binaryCheck.isBinary) {
+            item.isBinary = true;
+            item.canToggleContent = false;
+            item.needsAsyncContentRead = false;
+            item.warning = `检测到${binaryCheck.reason}，无法作为 UTF-8 文本内联`;
+            return {ok: false, error: item.warning};
+        }
+
+        const decodedText = binaryCheck.decodedText ?? new TextDecoder('utf-8').decode(bytes);
+        item._cachedText = decodedText;
+        item.byteLength = UTF8_ENCODER.encode(decodedText).byteLength;
+        item.needsAsyncContentRead = false;
+        item.canToggleContent = true;
+        return this.toggleFileMode(id, {effectiveBackend, contextWindowTokens});
     }
 
     /**
@@ -825,3 +884,198 @@ export class AttachmentManager {
         };
     }
 }
+
+const USER_INSTRUCTION_HEADER = '[用户提问 / USER_INSTRUCTION]\n';
+const UNTRUSTED_BOUNDARY_MARKER = '\n\n---\n[不可信引用数据边界说明 / UNTRUSTED_ATTACHMENT_BOUNDARY]\n';
+
+/**
+ * Splits a persisted outbound user prompt (`rawPromptText`) into the editable user question
+ * and any preserved structured attachment blocks (Stage R11.3).
+ * Ensures:
+ *  - Editing a historical question puts only the clean user question into the single-line input box
+ *    while preserving its attached context blocks on re-send.
+ *  - Retrying a failed turn keeps the full `promptForModel` with all attachments intact.
+ */
+export function extractUserQuestionAndAttachmentsFromPrompt(rawPromptText = '', displayText = '') {
+    const raw = String(rawPromptText || '').trim();
+    const disp = String(displayText || '').trim();
+    const boundaryIdx = raw.indexOf(UNTRUSTED_BOUNDARY_MARKER);
+
+    if (boundaryIdx >= 0 && raw.startsWith(USER_INSTRUCTION_HEADER)) {
+        const userQuestionOnly = raw.slice(USER_INSTRUCTION_HEADER.length, boundaryIdx).trim();
+        const preservedAttachmentSuffix = raw.slice(boundaryIdx);
+        const badgeLines = disp
+            .split('\n')
+            .filter(line => line.trim().startsWith('📎 '))
+            .join('\n');
+        return {
+            hasPreservedAttachments: true,
+            editableQuestionText: userQuestionOnly,
+            questionText: userQuestionOnly,
+            preservedAttachmentSuffix,
+            badgeSummary: badgeLines,
+            recomposePrompt(nextQuestion = '') {
+                const q = String(nextQuestion || '').trim() || '请帮我分析、解释或处理所附带的上下文内容。';
+                return `${USER_INSTRUCTION_HEADER}${q}${preservedAttachmentSuffix}`;
+            },
+            recomposeDisplayText(nextQuestion = '') {
+                const q = String(nextQuestion || '').trim() || '请帮我分析、解释或处理所附带的上下文内容。';
+                return badgeLines ? `${badgeLines}\n\n${q}` : q;
+            },
+        };
+    }
+
+    return {
+        hasPreservedAttachments: false,
+        editableQuestionText: raw || disp,
+        questionText: raw || disp,
+        preservedAttachmentSuffix: '',
+        badgeSummary: '',
+        recomposePrompt(nextQuestion = '') {
+            return String(nextQuestion || '').trim();
+        },
+        recomposeDisplayText(nextQuestion = '') {
+            return String(nextQuestion || '').trim();
+        },
+    };
+}
+
+/**
+ * Computes actionable feedback & one-click remedies when a path-only attachment (`kind === 'file_path'`)
+ * is attached while `effectiveBackend === 'openai'` (Stage R11.5).
+ * Supports both a single attachment item (for per-row UI buttons) and an array of items (for batch summary).
+ */
+export function describePathOnlyPureApiActions(itemOrItems, backendOrOptions = {}) {
+    const isStringArg = typeof backendOrOptions === 'string';
+    const {
+        effectiveBackend = isStringArg ? backendOrOptions : 'openai',
+        availableBackends = ['zcode', 'codex'],
+    } = isStringArg ? {} : (backendOrOptions || {});
+
+    if (Array.isArray(itemOrItems)) {
+        const pathItems = itemOrItems.filter(it => it && it.kind === 'file_path');
+        if (effectiveBackend !== 'openai' || pathItems.length === 0) {
+            return {
+                hasPathWarning: false,
+                pathItemCount: 0,
+                upgradableItemIds: [],
+                actions: [],
+                actionableFeedback: '',
+            };
+        }
+        const upgradableItemIds = pathItems
+            .filter(it => it.canToggleContent && !it.isBinary && !it.isDirectory && (!it.byteLength || it.byteLength <= MAX_ATTACHMENT_FILE_BYTES))
+            .map(it => it.id);
+        const actions = [];
+        if (upgradableItemIds.length > 0) {
+            actions.push({
+                action: 'upgrade_to_content',
+                label: '转为读取文件正文',
+                itemIds: upgradableItemIds,
+            });
+        }
+        actions.push({
+            action: 'switch_to_agent_backend',
+            label: '切换至 CLI 后端读取路径',
+            recommendedBackend: 'zcode',
+        });
+        return {
+            hasPathWarning: true,
+            pathItemCount: pathItems.length,
+            upgradableItemIds,
+            actions,
+            actionableFeedback: `⚠️ 当前含 ${pathItems.length} 项「仅路径」附件，纯 OpenAI API 无法读取本地路径；可点击「转为读取文件正文」或「切换至 CLI 后端读取路径」`,
+        };
+    }
+
+    const item = itemOrItems;
+    if (!item || item.kind !== 'file_path' || effectiveBackend !== 'openai') {
+        return {
+            isPureApiPathOnly: false,
+            hasPathWarning: false,
+            canConvertInline: false,
+            convertInlineLabel: '',
+            recommendedAgentBackend: '',
+            switchAgentLabel: '',
+            actionableFeedback: '',
+        };
+    }
+
+    const availSet = availableBackends instanceof Set
+        ? availableBackends
+        : new Set(Array.isArray(availableBackends) ? availableBackends : []);
+    const canConvertInline = Boolean(
+        item.canToggleContent &&
+        !item.isBinary &&
+        !item.isDirectory &&
+        (!item.byteLength || item.byteLength <= MAX_ATTACHMENT_FILE_BYTES)
+    );
+    const convertInlineLabel = item._cachedText ? '转为附带正文' : '读取并附带正文';
+    const recommendedAgentBackend = availSet.has('zcode')
+        ? 'zcode'
+        : (availSet.has('codex') ? 'codex' : '');
+    const switchAgentLabel = recommendedAgentBackend === 'zcode'
+        ? '切换至 ZCode 读取'
+        : (recommendedAgentBackend === 'codex' ? '切换至 Codex 读取' : '');
+
+    const remedies = [];
+    if (canConvertInline) {
+        remedies.push(`点击「${convertInlineLabel}」直接上传文本内容`);
+    }
+    if (switchAgentLabel) {
+        remedies.push(`点击「${switchAgentLabel}」使用本地 Agent 读取该路径`);
+    }
+    const remedySuffix = remedies.length > 0
+        ? `；可操作建议：${remedies.join('，或')}`
+        : '；请在设置中配置 ZCode / Codex CLI，或改用可内联的 UTF-8 文本文件';
+
+    return {
+        isPureApiPathOnly: true,
+        hasPathWarning: true,
+        canConvertInline,
+        convertInlineLabel,
+        recommendedAgentBackend,
+        switchAgentLabel,
+        actionableFeedback: `⚠️ 纯 OpenAI API 模式无法访问本机路径「${item.title || item.filePath}」${remedySuffix}`,
+    };
+}
+
+/**
+ * Generates an optional, zero-daemon Nautilus right-click ("Scripts -> 发送到随问 (Quick Chat)")
+ * integration script (Stage R11.5).
+ * Never reads other windows or starts background services: simply copies the user-selected file paths
+ * in Nautilus and triggers the Quick Chat clipboard-ask shortcut / notification hint.
+ */
+export function buildNautilusSendToScript({
+    schemaDir = '$HOME/.local/share/gnome-shell/extensions/quick-chat@lbg2002.github.io/schemas',
+} = {}) {
+    return [
+        '#!/usr/bin/env bash',
+        '# Quick Chat（随问）Nautilus 右键「发送到随问」可选集成脚本（零常驻服务、仅处理用户主动选中的文件）',
+        'set -euo pipefail',
+        '',
+        'PATHS_INPUT="${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}"',
+        'if [ -z "$PATHS_INPUT" ] && [ "$#" -gt 0 ]; then',
+        '    PATHS_INPUT="$(printf \'%s\\n\' "$@")"',
+        'fi',
+        'if [ -z "$PATHS_INPUT" ]; then',
+        '    exit 0',
+        'fi',
+        '',
+        '# 将用户主动选中的本地文件路径写入系统剪贴板，供随问剪贴板随问快捷键直接识别为文件附件',
+        'if command -v wl-copy >/dev/null 2>&1; then',
+        '    printf \'%s\' "$PATHS_INPUT" | wl-copy',
+        'elif command -v xclip >/dev/null 2>&1; then',
+        '    printf \'%s\' "$PATHS_INPUT" | xclip -selection clipboard',
+        'elif command -v xsel >/dev/null 2>&1; then',
+        '    printf \'%s\' "$PATHS_INPUT" | xsel --clipboard --input',
+        'fi',
+        '',
+        'if command -v notify-send >/dev/null 2>&1; then',
+        '    notify-send "随问 (Quick Chat)" "已准备所选文件，按 Super+Shift+Y 或点击随问面板 📋 即可附加" --icon=mail-attachment-symbolic || true',
+        'fi',
+        `# Optional schema path hint: ${schemaDir}`,
+        '',
+    ].join('\n');
+}
+

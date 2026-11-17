@@ -629,6 +629,7 @@ export class BackendClient {
                 failedRevisions: this._store?.failedRevisions || [],
                 archivedMessageCount: this._store?.archivedMessageCount || 0,
                 totalLogicalMessageCount: this._store?.totalLogicalMessageCount || (this._store?.messages?.length || 0),
+                canUndoLastRewind: Boolean(this._store?.canUndoLastRewind),
             };
         }
         if (type === 'get_models') {
@@ -748,6 +749,32 @@ export class BackendClient {
                 removedCount: rewound.removedMessages?.length || 0,
                 retainedCount: rewound.retainedCount,
                 remoteSessionReset: Boolean(rewound.remoteSessionReset),
+                canUndo: Boolean(rewound.canUndo),
+                committedRevision: this._store.revision,
+                durableRevision: this._store.durableRevision,
+            };
+        }
+        if (type === 'undo_last_rewind') {
+            if (!this._store) {
+                return {ok: false, error: '当前会话尚未初始化'};
+            }
+            const undone = this._store.undoLastRewind();
+            if (!undone.ok) {
+                return {ok: false, error: undone.error || '暂无可撤销的历史回退记录'};
+            }
+            const writeRes = await undone.writePromise;
+            if (!writeRes || !writeRes.ok) {
+                return {
+                    ok: false,
+                    error: writeRes?.error?.message || '撤销回退写入磁盘失败',
+                };
+            }
+            this.revokeApprovedScopes();
+            return {
+                ok: true,
+                restoredCount: undone.restoredCount || 0,
+                messages: undone.messages || [...this._store.messages],
+                archivedCount: this._store.archivedMessageCount || 0,
                 committedRevision: this._store.revision,
                 durableRevision: this._store.durableRevision,
             };

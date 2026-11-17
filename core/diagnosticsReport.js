@@ -117,6 +117,7 @@ export function formatRedactedDiagnosticsText(rawOrSanitized = {}, {
         `桥接握手: ${snap.bridgeHandshake}`,
         `面板挂载: ${snap.mountMode}`,
         `连接错误: ${snap.lastConnectionError}`,
+        `会话保存状态: ${snap.sessionSaveStatus}`,
         `会话存储: ${snap.sessionSaveStatus}`,
     ];
     if (snap.endpointSecurityNote) {
@@ -124,3 +125,155 @@ export function formatRedactedDiagnosticsText(rawOrSanitized = {}, {
     }
     return lines.join('\n');
 }
+
+export const formatDiagnosticReportText = formatRedactedDiagnosticsText;
+
+/**
+ * Derives a clear, non-overlapping runtime status presentation (Stage R11.2):
+ * Explicitly distinguishes:
+ *  - `'sending'` (`发送中`)
+ *  - `'waiting_approval'` (`等待审批 / 等待回答`)
+ *  - `'executing'` (`执行中 / 生成中`)
+ *  - `'network_interrupted'` (`网络或流中断`)
+ *  - `'save_failed'` (`会话保存失败`)
+ *  - `'ready'` (`就绪`)
+ */
+export function deriveRuntimeStatusIndicator({
+    phase = '',
+    busy = false,
+    turnState = '',
+    hasPendingApproval = false,
+    toolName = '',
+    pendingToolName = '',
+    activeToolName = '',
+    isQuestion = false,
+    pendingIsQuestion = false,
+    questionHint = '',
+    idleLabel = '随问',
+    errorMessage = '',
+    connectionError = '',
+    saveWarning = '',
+    isNetworkInterrupted = false,
+    usage = null,
+    finishReason = '',
+} = {}) {
+    const cleanErr = String(errorMessage || connectionError || '').trim();
+    const cleanSaveWarn = String(saveWarning || '').trim();
+    const effectiveToolName = String(toolName || pendingToolName || activeToolName || '').trim();
+    const effectiveIsQuestion = Boolean(isQuestion || pendingIsQuestion);
+    const networkInterrupted = Boolean(
+        isNetworkInterrupted ||
+        /network|timeout|connection|reset|stream|eof|broken pipe|网络|连接|中断|超时/i.test(cleanErr)
+    );
+
+    let cleanPhase = String(phase || '').trim();
+    if (!cleanPhase) {
+        if (hasPendingApproval) {
+            cleanPhase = 'waiting_approval';
+        } else if (busy) {
+            cleanPhase = (turnState === 'starting' || turnState === 'sending') ? 'sending' : 'executing';
+        } else if (cleanSaveWarn && !cleanErr) {
+            cleanPhase = 'save_failed';
+        } else if (cleanErr && networkInterrupted) {
+            cleanPhase = 'network_interrupted';
+        } else if (cleanErr) {
+            cleanPhase = 'error';
+        } else {
+            cleanPhase = 'ready';
+        }
+    }
+
+    if (cleanPhase === 'sending') {
+        return {
+            state: 'busy',
+            dotState: 'busy',
+            phase: 'sending',
+            text: '⏳ 正在发送请求…',
+            showReconnect: false,
+            showRetrySave: false,
+        };
+    }
+
+    if (cleanPhase === 'waiting_approval') {
+        const text = effectiveIsQuestion
+            ? (questionHint ? `💬 等待回答：${questionHint}` : '💬 等待您回答问题…')
+            : `⚠️ 等待您审批工具：${effectiveToolName || '工具'}`;
+        return {
+            state: 'approval',
+            dotState: 'approval',
+            phase: 'waiting_approval',
+            text,
+            showReconnect: false,
+            showRetrySave: false,
+        };
+    }
+
+    if (cleanPhase === 'executing') {
+        const text = effectiveToolName
+            ? (effectiveIsQuestion ? '💬 正在准备交互式提问…' : `🔧 正在执行工具：${effectiveToolName}`)
+            : '正在生成回答…';
+        return {
+            state: 'busy',
+            dotState: 'busy',
+            phase: 'executing',
+            text,
+            showReconnect: false,
+            showRetrySave: false,
+        };
+    }
+
+    if (cleanPhase === 'save_failed' || (cleanPhase === 'ready' && cleanSaveWarn)) {
+        return {
+            state: 'error',
+            dotState: 'error',
+            phase: 'save_failed',
+            text: `💾 会话保存失败：${cleanSaveWarn || cleanErr || '历史尚未落盘，可点击重试保存'}`,
+            showReconnect: false,
+            showRetrySave: true,
+        };
+    }
+
+    if (cleanPhase === 'network_interrupted' || (cleanErr && networkInterrupted)) {
+        return {
+            state: 'error',
+            dotState: 'error',
+            phase: 'network_interrupted',
+            text: `🌐 网络中断或流中断：${cleanErr || '回答可能不完整，可点击重试或继续生成'}`,
+            showReconnect: true,
+            showRetrySave: false,
+        };
+    }
+
+    if (cleanPhase === 'error' || (cleanErr && cleanPhase !== 'ready')) {
+        return {
+            state: 'error',
+            dotState: 'error',
+            phase: 'error',
+            text: cleanErr.startsWith('错误：') ? cleanErr : `错误：${cleanErr || '执行失败'}`,
+            showReconnect: true,
+            showRetrySave: false,
+        };
+    }
+
+    const usageHint = usage?.totalTokens ? ` · ${usage.totalTokens} tokens` : '';
+    if (finishReason === 'length') {
+        return {
+            state: 'ready',
+            dotState: 'ready',
+            phase: 'ready',
+            text: `⚠️ 输出达长度上限 (length)${usageHint} · 可点击继续生成`,
+            showReconnect: false,
+            showRetrySave: false,
+        };
+    }
+
+    return {
+        state: 'ready',
+        dotState: 'ready',
+        phase: 'ready',
+        text: `${idleLabel || '随问'}${usageHint}`,
+        showReconnect: false,
+        showRetrySave: false,
+    };
+}
+

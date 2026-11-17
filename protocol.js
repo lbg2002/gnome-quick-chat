@@ -1255,6 +1255,123 @@ export function isMeaningfulProgressEvent(event) {
     return MEANINGFUL_PROGRESS_EVENT_TYPES.has(type);
 }
 
+const SIDE_EFFECTING_TOOL_NAMES = new Set([
+    'write',
+    'edit',
+    'multiedit',
+    'notebookedit',
+    'filechange',
+    'apply_patch',
+    'create_file',
+    'delete_file',
+]);
+
+/**
+ * Identifies whether a tool node or execution record had potential side effects (file writes, mutations, or high-risk commands)
+ * so retry/edit never auto-reruns side-effecting operations without explicit user confirmation (R11.3).
+ */
+export function isSideEffectingToolExecution(toolNodeOrEntry) {
+    if (!toolNodeOrEntry || typeof toolNodeOrEntry !== 'object') return false;
+    const status = String(toolNodeOrEntry.status || 'done').trim().toLowerCase();
+    if (status === 'denied' || status === 'pending_approval') {
+        return false;
+    }
+    const rawName = String(toolNodeOrEntry.toolName || toolNodeOrEntry.name || '').trim().toLowerCase();
+    if (SIDE_EFFECTING_TOOL_NAMES.has(rawName)) {
+        return true;
+    }
+    const riskLevel = String(toolNodeOrEntry.riskLevel || '').trim().toLowerCase();
+    if (riskLevel === 'high') {
+        return true;
+    }
+    const opLabel = String(toolNodeOrEntry.operationLabel || '').trim();
+    if (/写入|修改|删除|执行命令|网络请求/u.test(opLabel) && rawName !== 'read' && rawName !== 'glob' && rawName !== 'grep') {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Pure keyboard shortcut & accessible focus handler for AskUserQuestion options (R11.4).
+ * Supports digit keys ('1'..'9'), 'Space' / 'Enter' option toggle, 'ArrowUp' / 'ArrowDown' focus movement,
+ * and 'Escape' cancellation.
+ */
+export function applyQuestionKeyboardShortcut(draft, questionSpec, keyName, {
+    focusedOptionIndex = -1,
+} = {}) {
+    const safeDraft = {
+        selectedLabels: Array.isArray(draft?.selectedLabels) ? [...draft.selectedLabels] : [],
+        customText: String(draft?.customText ?? ''),
+    };
+    const options = Array.isArray(questionSpec?.options) ? questionSpec.options : [];
+    const multiSelect = Boolean(questionSpec?.multiSelect);
+    const key = String(keyName || '').trim();
+    const count = options.length;
+
+    const toggleIndex = idx => {
+        if (idx < 0 || idx >= count) {
+            return {handled: false, draft: safeDraft, nextFocusIndex: focusedOptionIndex, action: 'none'};
+        }
+        const label = String(options[idx]?.label || '').trim();
+        if (!label) {
+            return {handled: false, draft: safeDraft, nextFocusIndex: idx, action: 'none'};
+        }
+        if (multiSelect) {
+            const existingIdx = safeDraft.selectedLabels.indexOf(label);
+            if (existingIdx >= 0) safeDraft.selectedLabels.splice(existingIdx, 1);
+            else safeDraft.selectedLabels.push(label);
+        } else if (safeDraft.selectedLabels[0] === label) {
+            safeDraft.selectedLabels = [];
+        } else {
+            safeDraft.selectedLabels = [label];
+        }
+        return {
+            handled: true,
+            draft: safeDraft,
+            nextFocusIndex: idx,
+            action: 'toggled',
+            toggledLabel: label,
+        };
+    };
+
+    if (/^[1-9]$/.test(key)) {
+        const digitIdx = Number(key) - 1;
+        if (digitIdx < count) {
+            return toggleIndex(digitIdx);
+        }
+        return {handled: false, draft: safeDraft, nextFocusIndex: focusedOptionIndex, action: 'none'};
+    }
+
+    if (key === 'space' || key === ' ' || key === 'Space' || key === 'Return' || key === 'KP_Enter' || key === 'Enter') {
+        if (focusedOptionIndex >= 0 && focusedOptionIndex < count) {
+            return toggleIndex(focusedOptionIndex);
+        }
+        return {handled: false, draft: safeDraft, nextFocusIndex: focusedOptionIndex, action: 'none'};
+    }
+
+    if (key === 'Up' || key === 'ArrowUp' || key === 'KP_Up') {
+        if (count === 0) {
+            return {handled: false, draft: safeDraft, nextFocusIndex: -1, action: 'none'};
+        }
+        const nextIdx = focusedOptionIndex <= 0 ? count - 1 : focusedOptionIndex - 1;
+        return {handled: true, draft: safeDraft, nextFocusIndex: nextIdx, action: 'focus_option'};
+    }
+
+    if (key === 'Down' || key === 'ArrowDown' || key === 'KP_Down') {
+        if (count === 0) {
+            return {handled: false, draft: safeDraft, nextFocusIndex: -1, action: 'none'};
+        }
+        const nextIdx = focusedOptionIndex < 0 || focusedOptionIndex >= count - 1 ? 0 : focusedOptionIndex + 1;
+        return {handled: true, draft: safeDraft, nextFocusIndex: nextIdx, action: 'focus_option'};
+    }
+
+    if (key === 'Escape') {
+        return {handled: true, draft: safeDraft, nextFocusIndex: focusedOptionIndex, action: 'cancel'};
+    }
+
+    return {handled: false, draft: safeDraft, nextFocusIndex: focusedOptionIndex, action: 'none'};
+}
+
 export {
     escapePango,
     inlineMarkdownToPango,

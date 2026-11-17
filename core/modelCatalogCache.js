@@ -393,3 +393,243 @@ export class EndpointModelMetadataCache {
 
 export const defaultEndpointModelMetadataCache = new EndpointModelMetadataCache();
 
+const KNOWN_NON_REASONING_OPENAI_MODEL_RE =
+    /^(?:gpt-3\.5|gpt-4-turbo|gpt-4-0613|gpt-4o(?:-mini)?(?:-\d{4}-\d{2}-\d{2})?|chatgpt-4o-latest|text-embedding|whisper|tts|dall-e)/i;
+const KNOWN_NON_REASONING_ANTHROPIC_MODEL_RE =
+    /^(?:claude-3-haiku|claude-3-5-haiku|claude-2|claude-instant)/i;
+
+/**
+ * Determines whether the currently active backend + model supports reasoning effort (`思考强度`),
+ * allowing the UI to hide or disable thinking chips when unsupported (Stage R11.1).
+ */
+export function resolveModelThinkingCapability(backendOrOptions = {}, maybeModelId = '', maybeOptions = {}) {
+    const isFirstObj = backendOrOptions && typeof backendOrOptions === 'object';
+    const {
+        effectiveBackend = isFirstObj ? 'unconfigured' : String(backendOrOptions || 'unconfigured'),
+        modelId = isFirstObj ? '' : String(maybeModelId || ''),
+        endpointUrl = '',
+        runtimeCapabilities = null,
+        metadataCache = defaultEndpointModelMetadataCache,
+    } = isFirstObj ? backendOrOptions : (maybeOptions || {});
+
+    const cleanBackend = String(effectiveBackend || 'unconfigured').trim();
+    const cleanModel = String(modelId || '').trim();
+    if (!cleanBackend || cleanBackend === 'unconfigured') {
+        return {
+            supported: false,
+            reason: '未配置可用后端，不支持思考强度调节',
+        };
+    }
+    if (
+        runtimeCapabilities &&
+        typeof runtimeCapabilities === 'object' &&
+        (runtimeCapabilities.supportsThinking === false || runtimeCapabilities.supportsReasoningEffort === false)
+    ) {
+        return {
+            supported: false,
+            reason: '当前后端版本不支持思考强度调节',
+        };
+    }
+
+    if (cleanBackend === 'openai') {
+        const meta = metadataCache?.get?.(endpointUrl, cleanModel) || null;
+        if (meta && meta.supportsReasoningEffort === false) {
+            return {
+                supported: false,
+                reason: `模型 ${cleanModel || '当前模型'} 不支持思考强度参数`,
+            };
+        }
+        if (cleanModel && KNOWN_NON_REASONING_OPENAI_MODEL_RE.test(cleanModel) && meta?.supportsReasoningEffort !== true) {
+            return {
+                supported: false,
+                reason: `模型 ${cleanModel} 为非推理模型，不支持思考强度调节`,
+            };
+        }
+    }
+
+    if (cleanModel && KNOWN_NON_REASONING_ANTHROPIC_MODEL_RE.test(cleanModel)) {
+        return {
+            supported: false,
+            reason: `模型 ${cleanModel} 不支持思考强度调节`,
+        };
+    }
+
+    return {
+        supported: true,
+        reason: '',
+    };
+}
+
+/**
+ * Computes the complete model picker presentation state (Stage R11.1):
+ * - Current real resolved model (`activeModelId` / `realActiveModel` even when `profile.model` is empty)
+ * - Per-backend installation/configuration badges (`未安装` / `未配置`)
+ * - Explicit unsupported capability summary
+ * - Model-aware thinking effort availability (`thinkingSupport` / `thinkingSupported`)
+ * - Favorites -> Recent -> Active -> Catalog ranked model page
+ */
+export function resolveModelPickerState({
+    configuredBackend = 'auto',
+    effectiveBackend = 'unconfigured',
+    profile = {},
+    configuredModel = '',
+    currentResolvedModel = '',
+    configuredEffort = '',
+    backendAvailable = undefined,
+    unavailableReason = '',
+    catalog = null,
+    cachedOpenAiModels = [],
+    favoriteKeys = [],
+    recentKeys = [],
+    query = '',
+    page = 0,
+    pageSize = DEFAULT_PICKER_PAGE_SIZE,
+    availableBackends = null,
+    runtimeModelId = '',
+    runtimeProviderId = '',
+    runtimeCapabilities = null,
+    endpointUrl = '',
+    metadataCache = defaultEndpointModelMetadataCache,
+} = {}) {
+    const configured = String(configuredBackend || 'auto').trim() || 'auto';
+    const eff = String(effectiveBackend || 'unconfigured').trim() || 'unconfigured';
+    const explicitModelId = String(profile?.model || configuredModel || '').trim();
+    const explicitProviderId = String(profile?.provider || '').trim();
+
+    const activeModelId =
+        explicitModelId ||
+        String(runtimeModelId || currentResolvedModel || '').trim() ||
+        String(catalog?.defaultModelId || '').trim();
+    const activeProviderId =
+        explicitProviderId ||
+        String(runtimeProviderId || '').trim() ||
+        String(catalog?.defaultProviderId || '').trim();
+    const isUsingDefaultModel = !explicitModelId && Boolean(activeModelId);
+
+    const hasAvailabilityInfo =
+        availableBackends instanceof Set || Array.isArray(availableBackends);
+    const availSet = availableBackends instanceof Set
+        ? availableBackends
+        : new Set(Array.isArray(availableBackends) ? availableBackends : []);
+    if (eff !== 'unconfigured' && backendAvailable !== false) {
+        availSet.add(eff);
+    }
+
+    const isBackendAvailable = backendAvailable !== undefined
+        ? Boolean(backendAvailable)
+        : (eff !== 'unconfigured' && (!hasAvailabilityInfo || availSet.has(eff)));
+
+    const backendChips = [
+        {id: 'auto', label: '自动'},
+        {id: 'zcode', label: 'ZCode'},
+        {id: 'codex', label: 'Codex'},
+        {id: 'openai', label: 'OpenAI'},
+    ].map(item => {
+        const active = configured === item.id;
+        let installed = true;
+        let statusTag = '';
+        if (item.id !== 'auto') {
+            if (backendAvailable === false && (item.id === eff || item.id === configured)) {
+                installed = false;
+            } else if (hasAvailabilityInfo) {
+                installed = availSet.has(item.id);
+            }
+            if (!installed) {
+                statusTag = item.id === 'openai' ? '未配置' : '未安装';
+            }
+        }
+        return {
+            id: item.id,
+            label: item.label,
+            displayLabel: statusTag ? `${item.label} (${statusTag})` : item.label,
+            active,
+            installed,
+            statusTag,
+        };
+    });
+
+    const extraModels = [];
+    if (eff === 'openai' && Array.isArray(cachedOpenAiModels)) {
+        for (const m of cachedOpenAiModels) {
+            if (m) extraModels.push({providerId: '', modelId: String(m).trim()});
+        }
+    }
+    if (activeModelId) {
+        extraModels.push({providerId: activeProviderId, modelId: activeModelId});
+    }
+
+    const allEntries = flattenCatalogModelEntries(catalog, {
+        backend: eff,
+        extraModels,
+    });
+    const ranked = filterAndRankModels(allEntries, {
+        query,
+        favoriteKeys,
+        recentKeys,
+        selectedProviderId: activeProviderId,
+        selectedModelId: activeModelId,
+        page,
+        pageSize,
+    });
+
+    const thinkingSupport = isBackendAvailable
+        ? resolveModelThinkingCapability({
+            effectiveBackend: eff,
+            modelId: activeModelId,
+            endpointUrl,
+            runtimeCapabilities,
+            metadataCache,
+        })
+        : {supported: false, reason: unavailableReason || '当前后端未安装或未配置'};
+
+    let capabilityNotice = '';
+    if (!isBackendAvailable) {
+        capabilityNotice = unavailableReason
+            ? (unavailableReason.includes('未安装') || unavailableReason.includes('未配置')
+                ? `⚠️ ${unavailableReason}`
+                : `⚠️ 未安装/不可用：${unavailableReason}`)
+            : '⚠️ 未检测到已安装或已配置的后端（ZCode / Codex 未安装，OpenAI 未配置）';
+    } else if (configured !== 'auto' && hasAvailabilityInfo && !availSet.has(configured)) {
+        capabilityNotice = configured === 'openai'
+            ? '⚠️ OpenAI API 尚未配置 Base URL，请点击「更多设置…」配置'
+            : `⚠️ 所选 ${configured === 'zcode' ? 'ZCode' : 'Codex'} CLI 未安装或路径无效`;
+    } else if (eff === 'openai') {
+        capabilityNotice = '能力: 纯对话 API（不支持本地工具执行与会话内审批）';
+    } else if (eff === 'codex') {
+        capabilityNotice = '能力: 只读沙箱工具调用（不支持会话内交互式审批提问）';
+    } else if (eff === 'zcode') {
+        const supportsTools = runtimeCapabilities?.supportsTools !== false;
+        const supportsApproval = runtimeCapabilities?.supportsApproval !== false;
+        capabilityNotice = supportsTools
+            ? `能力: 工具调用 · ${supportsApproval ? '支持交互审批与提问' : '仅只读（不支持交互审批）'}`
+            : '能力: 纯对话模式（已禁用工具执行）';
+    }
+
+    const rawEffort = String(configuredEffort || profile?.effort || 'default').trim() || 'default';
+    const effectiveEffort = thinkingSupport.supported ? rawEffort : 'default';
+    const activeModelSummary = activeModelId
+        ? `当前真实模型：${activeModelId}${activeProviderId ? ` (${activeProviderId})` : ''}${isUsingDefaultModel ? ' [默认]' : ''}`
+        : (eff === 'unconfigured' || !isBackendAvailable ? '当前真实模型：未配置' : '当前真实模型：自动默认');
+
+    return {
+        configuredBackend: configured,
+        effectiveBackend: eff,
+        backendAvailable: isBackendAvailable,
+        activeModelId,
+        realActiveModel: activeModelId,
+        activeProviderId,
+        isUsingDefaultModel,
+        currentModelSummary: activeModelId
+            ? `当前模型: ${activeModelId}${activeProviderId ? ` (${activeProviderId})` : ''}${isUsingDefaultModel ? ' [默认]' : ''}`
+            : (eff === 'unconfigured' || !isBackendAvailable ? '当前模型: 未配置' : '当前模型: 自动默认'),
+        activeModelSummary,
+        backendChips,
+        capabilityNotice,
+        statusBanner: capabilityNotice,
+        thinkingSupport,
+        thinkingSupported: thinkingSupport.supported,
+        effectiveEffort,
+        ranked,
+    };
+}
+

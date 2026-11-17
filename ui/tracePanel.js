@@ -1,11 +1,15 @@
 import Clutter from 'gi://Clutter';
 import Pango from 'gi://Pango';
 import St from 'gi://St';
-import {computePermissionScope} from '../protocol.js';
+import {
+    applyQuestionKeyboardShortcut,
+    computePermissionScope,
+} from '../protocol.js';
 import {
     UI_BUFFER_CAPS,
     computeToolDotVisualState,
     formatDisplayBufferWithCap,
+    formatToolApprovalInspectorDetails,
     partitionToolDotsForLayout,
 } from '../core/renderScheduler.js';
 
@@ -398,13 +402,14 @@ export class TracePanelController {
         const interactive = node.status === 'pending_approval';
         for (const w of card.renderedQuestionWidgets || []) {
             const draft = node.questionDrafts?.[w.question] || {selectedLabels: [], customText: ''};
-            for (const oRef of w.optionRefs) {
+            w.optionRefs.forEach((oRef, idx) => {
                 const selected = draft.selectedLabels.includes(oRef.label);
                 oRef.indLbl.text = w.multiSelect ? (selected ? '☑' : '☐') : (selected ? '●' : '○');
                 if (selected) oRef.btn.add_style_class_name('qc-question-opt-selected');
                 else oRef.btn.remove_style_class_name('qc-question-opt-selected');
                 oRef.btn.reactive = interactive;
-            }
+                oRef.btn.accessible_name = `选项 ${idx + 1}（${selected ? '已选' : '未选'}）：${oRef.label}`;
+            });
             if (w.customEntry) {
                 w.customEntry.reactive = interactive;
                 if (w.multiSelect) {
@@ -470,7 +475,7 @@ export class TracePanelController {
                 }));
             }
             metaRow.add_child(new St.Label({
-                text: q.multiSelect ? '可多选' : '单选',
+                text: `${q.multiSelect ? '可多选' : '单选'} · 数字键 1-9 / ↑↓ / Space 选择`,
                 style_class: 'qc-question-mode',
                 y_align: Clutter.ActorAlign.CENTER,
             }));
@@ -483,14 +488,15 @@ export class TracePanelController {
                 x_expand: true,
             });
             const optionRefs = [];
-            for (const opt of q.options || []) {
+            (q.options || []).forEach((opt, optIdx) => {
+                const shortcutPrefix = optIdx < 9 ? `${optIdx + 1}. ` : '';
                 const optBtn = new St.Button({
                     style_class: 'qc-question-opt',
                     x_expand: true,
                     can_focus: true,
                     reactive: true,
                     track_hover: true,
-                    accessible_name: opt.label,
+                    accessible_name: `选项 ${optIdx + 1}：${opt.label}`,
                 });
                 const optRow = new St.BoxLayout({
                     orientation: H,
@@ -507,7 +513,7 @@ export class TracePanelController {
                     style_class: 'qc-question-opt-text',
                     x_expand: true,
                 });
-                txtCol.add_child(createWrapLabel(opt.label, 'qc-question-opt-label'));
+                txtCol.add_child(createWrapLabel(`${shortcutPrefix}${opt.label}`, 'qc-question-opt-label'));
                 if (opt.description) {
                     txtCol.add_child(createWrapLabel(opt.description, 'qc-question-opt-desc'));
                 }
@@ -518,21 +524,60 @@ export class TracePanelController {
                 optBtn.connect('clicked', () => {
                     if (node.status !== 'pending_approval') return;
                     node.validationHint = '';
-                    if (q.multiSelect) {
-                        const idx = draft.selectedLabels.indexOf(opt.label);
-                        if (idx >= 0) draft.selectedLabels.splice(idx, 1);
-                        else draft.selectedLabels.push(opt.label);
-                    } else if (draft.selectedLabels[0] === opt.label) {
-                        draft.selectedLabels = [];
-                    } else {
-                        draft.selectedLabels = [opt.label];
+                    const res = applyQuestionKeyboardShortcut(draft, q, 'Space', {focusedOptionIndex: optIdx});
+                    if (res.handled) {
+                        draft.selectedLabels = res.draft.selectedLabels;
+                        this.syncQuestionFormState(card, node);
                     }
-                    this.syncQuestionFormState(card, node);
+                });
+
+                optBtn.connect('key-press-event', (_, event) => {
+                    if (node.status !== 'pending_approval') return Clutter.EVENT_PROPAGATE;
+                    const sym = event.get_key_symbol();
+                    let keyName = '';
+                    if (sym >= Clutter.KEY_1 && sym <= Clutter.KEY_9) {
+                        keyName = String(sym - Clutter.KEY_1 + 1);
+                    } else if (sym === Clutter.KEY_Up || sym === Clutter.KEY_KP_Up) {
+                        keyName = 'Up';
+                    } else if (sym === Clutter.KEY_Down || sym === Clutter.KEY_KP_Down) {
+                        keyName = 'Down';
+                    } else if (sym === Clutter.KEY_space) {
+                        keyName = 'Space';
+                    } else if (sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) {
+                        keyName = 'Return';
+                    } else if (sym === Clutter.KEY_Escape) {
+                        keyName = 'Escape';
+                    }
+                    if (!keyName) return Clutter.EVENT_PROPAGATE;
+
+                    const res = applyQuestionKeyboardShortcut(draft, q, keyName, {focusedOptionIndex: optIdx});
+                    if (!res.handled) return Clutter.EVENT_PROPAGATE;
+
+                    node.validationHint = '';
+                    if (res.action === 'toggled') {
+                        draft.selectedLabels = res.draft.selectedLabels;
+                        this.syncQuestionFormState(card, node);
+                        if (res.nextFocusIndex >= 0 && optionRefs[res.nextFocusIndex]?.btn) {
+                            optionRefs[res.nextFocusIndex].btn.grab_key_focus?.();
+                        }
+                        return Clutter.EVENT_STOP;
+                    }
+                    if (res.action === 'focus_option') {
+                        if (res.nextFocusIndex >= 0 && optionRefs[res.nextFocusIndex]?.btn) {
+                            optionRefs[res.nextFocusIndex].btn.grab_key_focus?.();
+                        }
+                        return Clutter.EVENT_STOP;
+                    }
+                    if (res.action === 'cancel') {
+                        this._onSubmitQuestionDecision(card, 'deny');
+                        return Clutter.EVENT_STOP;
+                    }
+                    return Clutter.EVENT_PROPAGATE;
                 });
 
                 optsBox.add_child(optBtn);
                 optionRefs.push({label: opt.label, btn: optBtn, indLbl});
-            }
+            });
             if (optionRefs.length > 0) {
                 itemBox.add_child(optsBox);
             }
@@ -542,6 +587,7 @@ export class TracePanelController {
                 hint_text: '或直接在此输入自定义回答（回车提交）…',
                 can_focus: true,
                 x_expand: true,
+                accessible_name: `自定义回答输入：${q.question}`,
             });
             if (draft.customText) customEntry.set_text(draft.customText);
             const ct = customEntry.clutter_text;
@@ -779,85 +825,17 @@ export class TracePanelController {
         else statusTitle = `✓ 已执行工具：${node.toolName}${durSuffix}`;
         card.drawerTitle.text = statusTitle;
 
-        const primaryTargetText = String(
-            node.fullCommand ||
-            node.displayPath ||
-            node.networkOrigin ||
-            (node.summary && node.summary !== node.toolName ? node.summary : '')
-        ).trim();
-
-        const isLongPrimary = primaryTargetText.length > 260 || primaryTargetText.split('\n').length > 6;
-        if (primaryTargetText) {
-            if (isLongPrimary && !node.detailsExpanded) {
-                const lines = primaryTargetText.split('\n');
-                const preview = lines.length > 6
-                    ? `${lines.slice(0, 6).join('\n')}…`
-                    : `${primaryTargetText.slice(0, 260)}…`;
-                card.drawerSummary.text = `${preview}（共 ${primaryTargetText.length} 字符，可展开查看完整内容）`;
-            } else {
-                const cappedPrimary = formatDisplayBufferWithCap(primaryTargetText, {
-                    maxDisplayBytes: UI_BUFFER_CAPS.maxToolDetailDisplayBytes,
-                    expanded: Boolean(node.detailsExpanded),
-                });
-                card.drawerSummary.text = cappedPrimary.displayText;
-            }
-            card.drawerSummary.visible = true;
-        } else {
-            card.drawerSummary.visible = false;
-        }
-
-        const extraLines = [];
-        if (node.deliveryError) extraLines.push(`⚠️ ${node.deliveryError}`);
-        if (node.operationLabel && node.toolName) {
-            extraLines.push(`工具与操作：${node.toolName}（${node.operationLabel}${node.riskLabel ? ` · ${node.riskLabel}` : ''}）`);
-        }
-        const effectiveCwd = node.realCwd || node.cwd;
-        if (effectiveCwd) {
-            extraLines.push(
-                node.cwd && node.realCwd && node.cwd !== node.realCwd
-                    ? `真实工作目录：${node.realCwd}（请求路径：${node.cwd}）`
-                    : `工作目录：${effectiveCwd}`
-            );
-        }
-        if (node.realPath) {
-            extraLines.push(
-                node.displayPath && node.displayPath !== node.realPath
-                    ? `规范化真实路径：${node.realPath}（原始参数：${node.displayPath}）`
-                    : `目标真实路径：${node.realPath}`
-            );
-        }
-        if (node.networkOrigin && primaryTargetText !== node.networkOrigin) {
-            extraLines.push(`网络目标来源：${node.networkOrigin}`);
-        }
-        if (Array.isArray(node.riskWarnings) && node.riskWarnings.length > 0) {
-            for (const w of node.riskWarnings) extraLines.push(`⚠️ 风险提示：${w}`);
-        }
-        if (isAwaiting) {
-            if (node.reason && node.reason !== primaryTargetText) extraLines.push(`说明：${node.reason}`);
-        } else if (node.detail && node.detail !== primaryTargetText) {
-            extraLines.push(node.detail);
-        }
-
-        let isExtraTruncated = false;
-        if (extraLines.length > 0) {
-            const cappedExtra = formatDisplayBufferWithCap(extraLines.join('\n'), {
-                maxDisplayBytes: UI_BUFFER_CAPS.maxToolDetailDisplayBytes,
-                expanded: Boolean(node.detailsExpanded),
-            });
-            isExtraTruncated = cappedExtra.isTruncatedForUi;
-            card.drawerBody.text = cappedExtra.displayText;
-            card.drawerBody.visible = true;
-        } else if (!card.drawerSummary.visible) {
-            card.drawerBody.text = `工具名称：${node.toolName}`;
-            card.drawerBody.visible = true;
-        } else {
-            card.drawerBody.visible = false;
-        }
+        const inspector = formatToolApprovalInspectorDetails(node, {
+            expanded: Boolean(node.detailsExpanded),
+        });
+        card.drawerSummary.text = inspector.summaryText;
+        card.drawerSummary.visible = inspector.summaryVisible;
+        card.drawerBody.text = inspector.bodyText;
+        card.drawerBody.visible = inspector.bodyVisible;
 
         if (card.drawerExpandBtn) {
-            const showExpand = isLongPrimary || isExtraTruncated || (Boolean(node.detailsExpanded) && extraLines.join('\n').length > 260);
-            card.drawerExpandBtn.visible = showExpand;
-            if (showExpand) {
+            card.drawerExpandBtn.visible = inspector.showExpandBtn;
+            if (inspector.showExpandBtn) {
                 card.drawerExpandBtn.label = node.detailsExpanded ? '▲ 收起长文本' : '▼ 展开完整内容';
             }
         }

@@ -17,11 +17,24 @@ export class BackgroundNotificationGate {
         this._maxRememberedKeys = Math.max(32, Number(maxRememberedKeys) || 256);
         this._seenKeys = new Set();
         this._lastSentByKindMs = new Map();
+        this._lockEpoch = 0;
+    }
+
+    get lockEpoch() {
+        return this._lockEpoch;
+    }
+
+    onLockScreenEntered() {
+        this._lockEpoch++;
+        this._seenKeys.clear();
+        this._lastSentByKindMs.clear();
+        return this._lockEpoch;
     }
 
     reset() {
         this._seenKeys.clear();
         this._lastSentByKindMs.clear();
+        this._lockEpoch = 0;
     }
 
     _rememberKey(key) {
@@ -113,6 +126,8 @@ export class BackgroundNotificationGate {
                 sessionId: String(sessionId || ''),
                 turnId: String(turnId || ''),
                 requestId: String(requestId || ''),
+                lockEpoch: this._lockEpoch,
+                createdAtMs: nowMs,
             },
         };
     }
@@ -130,13 +145,28 @@ export function resolveNotificationClickTarget(target, {
     mountedTurnIds = [],
     storedTurnIds = [],
     existingSessionIds = [],
+    currentLockEpoch = null,
+    pendingRequestIds = null,
 } = {}) {
     if (isLocked || isGreeter || !target) {
         return {action: 'ignore'};
     }
 
+    if (
+        currentLockEpoch !== null &&
+        currentLockEpoch !== undefined &&
+        target.lockEpoch !== undefined &&
+        Number(target.lockEpoch) !== Number(currentLockEpoch)
+    ) {
+        return {
+            action: 'open_stale_after_lock',
+            statusHint: '锁屏前的后台通知已过期，当前后台任务已安全中止',
+        };
+    }
+
     const targetSessionId = String(target.sessionId || '');
     const targetTurnId = String(target.turnId || '');
+    const targetRequestId = String(target.requestId || '');
 
     if (!targetSessionId || targetSessionId === currentSessionId) {
         if (targetTurnId) {
@@ -151,11 +181,24 @@ export function resolveNotificationClickTarget(target, {
                 };
             }
         }
+        if (
+            target.kind === 'approval_needed' &&
+            targetRequestId &&
+            Array.isArray(pendingRequestIds) &&
+            !pendingRequestIds.includes(targetRequestId)
+        ) {
+            return {
+                action: 'open_resolved_approval',
+                sessionId: currentSessionId,
+                turnId: targetTurnId,
+                statusHint: '该审批或交互提问已处理完成',
+            };
+        }
         return {
             action: 'focus_current_turn',
             sessionId: currentSessionId,
             turnId: targetTurnId,
-            requestId: String(target.requestId || ''),
+            requestId: targetRequestId,
         };
     }
 
@@ -178,6 +221,6 @@ export function resolveNotificationClickTarget(target, {
         action: 'switch_session_and_focus',
         sessionId: targetSessionId,
         turnId: targetTurnId,
-        requestId: String(target.requestId || ''),
+        requestId: targetRequestId,
     };
 }
