@@ -139,7 +139,13 @@ const sseFinal = sse.finish();
 assert(sseEvents.some(e => e.type === 'delta' && e.textDelta === '你好🚀') && sseFinal.completedCleanly, 'SSE split UTF-8 delta');
 assert(getBackendCapabilities('codex', 'readonly').supportsApproval === false, 'Codex capability honesty');
 assert(typeof BaseBackendAdapter === 'function' && typeof computeAdaptiveRenderDelayMs === 'function', 'Adapter & scheduler helpers');
-assert(buildBudgetedContextMessages([{role: 'user', content: 'hi'}], {currentPrompt: 'next'}).length === 1, 'Budgeted context');
+// Unanswered prior user prompts must not be replayed: a retry may carry side effects.
+assert(buildBudgetedContextMessages([{role: 'user', content: 'hi'}], {currentPrompt: 'next'}).length === 0, 'Unanswered prior context is excluded');
+const completedContext = buildBudgetedContextMessages([
+    {role: 'user', content: 'hi'},
+    {role: 'assistant', content: 'hello'},
+], {currentPrompt: 'next'});
+assert(completedContext.length === 2 && completedContext[0].content === 'hi' && completedContext[1].content === 'hello', 'Complete prior turn is preserved');
 
 // 4. Stage F modules (`/` commands, Nautilus file URI attachments, notifications, router, diagnostics)
 const slash = matchSlashCommands('/translate Hello');
