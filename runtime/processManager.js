@@ -7,6 +7,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {findExecutableInDirs} from '../core/backendDetect.js';
 import {removeFileQuietly, writeAllBytesAsync} from '../core/paths.js';
+import {isMeaningfulProgressEvent} from '../protocol.js';
 import {
     BRIDGE_EXPECTED_PROTOCOL_VERSION,
     CliTurnMonitor,
@@ -233,7 +234,7 @@ export function buildXdgEnvVars(specialDirs = {}) {
 
 /**
  * Phase-aware watchdog supporting separated connect / first-byte / stream-idle / tool-execution
- * timeouts plus an independent total turn ceiling.
+ * timeouts plus an independent total turn ceiling (R7).
  */
 export function attachTurnWatchdog({
     turns,
@@ -244,11 +245,14 @@ export function attachTurnWatchdog({
     initialTimeoutSec,
     initialMessage,
     totalTurnTimeoutSec = 0,
+    initialPhase = 'stream_idle',
 }) {
     let phaseTimerId = 0;
     let totalTimerId = 0;
-    let currentTimeoutSec = Math.max(5, Number(initialTimeoutSec) || 60);
+    let currentTimeoutSec = Math.max(1, Number(initialTimeoutSec) || 60);
     let currentMessage = String(initialMessage || '请求响应超时');
+    let currentPhaseName = String(initialPhase || 'stream_idle');
+    turn.totalTurnTimeoutSec = totalTurnTimeoutSec > 0 ? Number(totalTurnTimeoutSec) : 0;
 
     const clearPhase = () => {
         if (phaseTimerId) {
@@ -264,10 +268,12 @@ export function attachTurnWatchdog({
         }
     };
 
-    const fireTimeout = msgText => {
+    const fireTimeout = (msgText, timedOutPhase = '') => {
         clearAll();
         if (turns.isCurrent(turn)) {
             turn.timedOut = true;
+            turn.timedOutPhase = String(timedOutPhase || currentPhaseName || 'stream_idle');
+            turn.watchdogPhase = 'settled';
             try { turn.cancellable?.cancel?.(); } catch (_) {}
             const ctxCfg = getSessionContextConfig();
             turns.finalizeTurn(turn, {
@@ -283,33 +289,55 @@ export function attachTurnWatchdog({
         }
     };
 
+    const isWaitingApproval = () => Boolean(
+        turn.state === 'awaiting_approval' ||
+        (turn.pendingApprovals && turn.pendingApprovals.size > 0)
+    );
+
     const reset = () => {
         clearPhase();
         if (!turns.isCurrent(turn)) return;
+        if (isWaitingApproval()) {
+            turn.watchdogPhase = 'approval_wait';
+            return;
+        }
+        turn.watchdogPhase = currentPhaseName;
+        turn.activeTimeoutSec = currentTimeoutSec;
         phaseTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, currentTimeoutSec, () => {
             phaseTimerId = 0;
-            fireTimeout(currentMessage);
+            fireTimeout(currentMessage, currentPhaseName);
             return GLib.SOURCE_REMOVE;
         });
     };
 
-    const setWatchdogPhase = (nextTimeoutSec, nextMessage) => {
-        currentTimeoutSec = Math.max(5, Number(nextTimeoutSec) || currentTimeoutSec);
+    const pauseWatchdog = () => {
+        clearPhase();
+        if (isWaitingApproval()) {
+            turn.watchdogPhase = 'approval_wait';
+        }
+    };
+
+    const setWatchdogPhase = (nextTimeoutSec, nextMessage, nextPhaseName = '') => {
+        currentTimeoutSec = Math.max(1, Number(nextTimeoutSec) || currentTimeoutSec);
         if (nextMessage) currentMessage = String(nextMessage);
-        if (turn.state !== 'awaiting_approval') {
+        if (nextPhaseName) currentPhaseName = String(nextPhaseName);
+        if (!isWaitingApproval()) {
             reset();
+        } else {
+            clearPhase();
+            turn.watchdogPhase = 'approval_wait';
         }
     };
 
     if (totalTurnTimeoutSec > 0) {
         totalTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, totalTurnTimeoutSec, () => {
             totalTimerId = 0;
-            fireTimeout(`单轮任务总时长超出安全上限（${totalTurnTimeoutSec}s）`);
+            fireTimeout(`单轮任务总时长超出安全上限（${totalTurnTimeoutSec}s）`, 'total_turn');
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    turn.pauseWatchdog = clearPhase;
+    turn.pauseWatchdog = pauseWatchdog;
     turn.resetWatchdog = reset;
     turn.setWatchdogPhase = setWatchdogPhase;
     turn.cleanupWatchdog = clearAll;
@@ -334,10 +362,14 @@ export function attachApprovalWatchdog({
     const startApproval = () => {
         clearApproval();
         if (!turns.isCurrent(turn) || timeoutSec <= 0) return;
+        turn.watchdogPhase = 'approval_wait';
+        turn.activeTimeoutSec = timeoutSec;
         approvalTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutSec, () => {
             approvalTimerId = 0;
             if (turns.isCurrent(turn)) {
                 turn.timedOut = true;
+                turn.timedOutPhase = 'approval_wait';
+                turn.watchdogPhase = 'settled';
                 try { turn.cancellable?.cancel?.(); } catch (_) {}
                 const ctxCfg = getSessionContextConfig();
                 turns.finalizeTurn(turn, {
@@ -521,7 +553,6 @@ export function spawnManagedCliTurn({
     let exitCode = null;
     let termSignal = null;
     let streamsClosed = false;
-    let activeRunningTools = 0;
 
     const closeIoPipes = () => {
         if (streamsClosed) return;
@@ -724,6 +755,7 @@ export function spawnManagedCliTurn({
         initialTimeoutSec: resolvedTimeouts.streamIdleTimeoutSec,
         initialMessage: `CLI 响应空闲超时（${resolvedTimeouts.streamIdleTimeoutSec}s 无输出）`,
         totalTurnTimeoutSec: resolvedTimeouts.totalTurnTimeoutSec,
+        initialPhase: 'stream_idle',
     });
     attachApprovalWatchdog({
         turns,
@@ -746,15 +778,18 @@ export function spawnManagedCliTurn({
 
     const seenPermissionIds = new Set();
     const syncCliToolTimeoutPhase = () => {
-        if (activeRunningTools > 0) {
+        const activeCount = turn.activeToolIds instanceof Set ? turn.activeToolIds.size : 0;
+        if (activeCount > 0) {
             turn.setWatchdogPhase?.(
                 resolvedTimeouts.toolExecutionTimeoutSec,
-                `工具执行超时（${resolvedTimeouts.toolExecutionTimeoutSec}s 无状态更新）`
+                `工具执行超时（${resolvedTimeouts.toolExecutionTimeoutSec}s 无状态更新）`,
+                'tool_execution'
             );
         } else {
             turn.setWatchdogPhase?.(
                 resolvedTimeouts.streamIdleTimeoutSec,
-                `CLI 响应空闲超时（${resolvedTimeouts.streamIdleTimeoutSec}s 无输出）`
+                `CLI 响应空闲超时（${resolvedTimeouts.streamIdleTimeoutSec}s 无输出）`,
+                'stream_idle'
             );
         }
     };
@@ -772,6 +807,21 @@ export function spawnManagedCliTurn({
             const norm = checked.normalized;
             if (!norm) continue;
 
+            // R7: Only meaningful semantic progress events extend the phase watchdog;
+            // ordinary logs, pings, heartbeats, or empty lines do not extend it.
+            // Moreover, while any approval is pending, the phase watchdog stays paused in approval_wait.
+            if (
+                isMeaningfulProgressEvent(norm) &&
+                norm.type !== 'permission_request' &&
+                norm.type !== 'permission_resolved' &&
+                norm.type !== 'tool_execution_start' &&
+                norm.type !== 'tool_execution_update' &&
+                norm.type !== 'tool_execution_end' &&
+                norm.type !== 'tool_batch_end'
+            ) {
+                turn.resetWatchdog?.();
+            }
+
             const segCfg = getSessionContextConfig();
             if (norm.type === 'bridge_ready') {
                 turns.emitForTurn(turn, norm);
@@ -788,6 +838,7 @@ export function spawnManagedCliTurn({
                     } else {
                         turns.leaveApproval(turn, norm.requestId);
                     }
+                    syncCliToolTimeoutPhase();
                 }
                 turns.emitForTurn(turn, norm);
             } else if (norm.type === 'permission_response_rejected') {
@@ -796,15 +847,19 @@ export function spawnManagedCliTurn({
                 }
                 turns.emitForTurn(turn, norm);
             } else if (norm.type === 'tool_execution_start') {
-                activeRunningTools++;
+                turns.recordToolStart?.(turn, norm);
+                syncCliToolTimeoutPhase();
+                turns.emitForTurn(turn, norm);
+            } else if (norm.type === 'tool_execution_update') {
+                turns.recordToolUpdate?.(turn, norm);
                 syncCliToolTimeoutPhase();
                 turns.emitForTurn(turn, norm);
             } else if (norm.type === 'tool_execution_end') {
-                activeRunningTools = Math.max(0, activeRunningTools - 1);
+                turns.recordToolEnd?.(turn, norm);
                 syncCliToolTimeoutPhase();
                 turns.emitForTurn(turn, norm);
             } else if (norm.type === 'tool_batch_end') {
-                activeRunningTools = 0;
+                turns.recordToolBatchEnd?.(turn, norm);
                 syncCliToolTimeoutPhase();
                 turns.emitForTurn(turn, norm);
             } else if (norm.type === 'session_bound' && norm.sessionId) {
@@ -910,9 +965,6 @@ export function spawnManagedCliTurn({
                     stdoutDone = true;
                     trySettleWhenComplete();
                     return;
-                }
-                if (turn.state !== 'awaiting_approval') {
-                    turn.resetWatchdog?.();
                 }
 
                 const chunkRes = monitor.pushStdoutChunk(turn.id, chunk);

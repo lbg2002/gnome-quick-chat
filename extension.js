@@ -45,7 +45,10 @@ import {
     readFileBytesBoundedAsync,
     resolveWorkspacePath,
 } from './core/paths.js';
-import {appendBoundedInMemoryText} from './core/renderScheduler.js';
+import {
+    appendBoundedInMemoryText,
+    applyToolTraceEventToCard,
+} from './core/renderScheduler.js';
 import {loadOpenAIApiKey} from './core/secretStore.js';
 import {
     buildContinuationPrompt,
@@ -1852,29 +1855,19 @@ export default class QuickChat extends Extension {
             }
         }
 
-        if (event.type === 'tool_execution_start') {
+        if (event.type === 'tool_execution_start' || event.type === 'tool_execution_update') {
             const card = this._ensureLiveCard(event);
-            const node = this._tracePanel.findOrCreateToolNode(card, {
-                toolCallId: event.toolCallId || '',
-                toolName: event.toolName || '工具',
-                summary: event.summary || '',
-                isQuestion: Boolean(event.isQuestion),
-                questions: event.questions,
-                rawInput: event.rawInput,
+            const {node, stillWaiting} = applyToolTraceEventToCard(card, event, {
+                findOrCreateNode: (targetCard, info) => this._tracePanel.findOrCreateToolNode(targetCard, info),
+                activeTurn,
             });
-            if (node && node.status !== 'pending_approval' && node.status !== 'sending_approval' && node.status !== 'denied') {
-                node.status = 'running';
-                card.dirtyToolNodeIds?.add(node.id);
-            }
-            card.activeTool = true;
-            card.dirty.tools = true;
             if (!card.text) card.dirty.text = true;
-            if (!this._tracePanel.hasPendingApprovalNodes(card)) {
+            if (!stillWaiting && node) {
                 this._panel.setStatusIndicator(
                     'busy',
-                    node?.isQuestion
+                    node.isQuestion
                         ? '💬 正在准备交互式提问…'
-                        : `正在执行工具：${node?.toolName || event.toolName || '工具'}`
+                        : `正在执行工具：${node.toolName || event.toolName || '工具'}`
                 );
             }
             card.scheduleRender();
@@ -1882,50 +1875,10 @@ export default class QuickChat extends Extension {
 
         if (event.type === 'permission_request') {
             const card = this._ensureLiveCard(event);
-            const node = this._tracePanel.findOrCreateToolNode(card, {
-                requestId: event.requestId || '',
-                toolCallId: event.toolCallId || '',
-                toolName: event.toolName || '工具',
-                operationLabel: event.operationLabel || '',
-                riskLevel: event.riskLevel || '',
-                riskLabel: event.riskLabel || '',
-                riskWarnings: event.riskWarnings,
-                fullCommand: event.fullCommand || '',
-                cwd: event.cwd || '',
-                realCwd: event.realCwd || '',
-                displayPath: event.displayPath || '',
-                realPath: event.realPath || '',
-                networkOrigin: event.networkOrigin || '',
-                targetMismatch: Boolean(event.targetMismatch),
-                symlinkEscape: Boolean(event.symlinkEscape),
-                summary: event.summary || '',
-                reason: event.reason || '',
-                scopeKey: event.scopeKey || '',
-                allowSessionRule: event.allowSessionRule,
-                sessionRuleLabel: event.sessionRuleLabel || '',
-                isQuestion: Boolean(event.isQuestion),
-                questions: event.questions,
-                rawInput: event.rawInput,
+            const {node} = applyToolTraceEventToCard(card, event, {
+                findOrCreateNode: (targetCard, info) => this._tracePanel.findOrCreateToolNode(targetCard, info),
+                activeTurn,
             });
-            if (node) {
-                node.status = 'pending_approval';
-                node.approvalState = 'pending';
-                card.dirtyToolNodeIds?.add(node.id);
-                if (!this._tracePanel.hasPendingApprovalNodes(card) || !card.selectedNodeId) {
-                    card.selectedNodeId = node.id;
-                } else {
-                    const selNode = card.toolNodes.find(n => n.id === card.selectedNodeId);
-                    if (!selNode || selNode.status !== 'pending_approval') {
-                        card.selectedNodeId = node.id;
-                    }
-                }
-            }
-            if (activeTurn) {
-                activeTurn.state = 'awaiting_approval';
-            }
-            card.activeTool = true;
-            card.dirty.tools = true;
-            card.dirty.toolsUrgent = true;
             if (!card.text) card.dirty.text = true;
             if (node?.isQuestion) {
                 const brief = this._tracePanel.formatShortHint(node.summary, 20);
@@ -1948,61 +1901,10 @@ export default class QuickChat extends Extension {
         if (event.type === 'permission_resolved') {
             const card = this._live || (event.autoApproved ? this._ensureLiveCard(event) : null);
             if (card?.toolNodes) {
-                let node = card.toolNodes.find(
-                    n => (event.requestId && n.requestId === event.requestId) ||
-                         (event.toolCallId && n.toolCallId === event.toolCallId)
-                );
-                if (!node && event.autoApproved && event.requestId) {
-                    node = this._tracePanel.findOrCreateToolNode(card, {
-                        requestId: event.requestId,
-                        toolCallId: event.toolCallId || '',
-                        toolName: event.toolName || '工具',
-                        scopeKey: event.scopeKey || '',
-                    });
-                }
-                const allow = event.decision === 'allow' || event.decision === 'modify';
-                if (node && (node.status === 'pending_approval' || node.status === 'sending_approval' || event.autoApproved)) {
-                    node.deliveryError = '';
-                    node.approvalPhase = 'resolved';
-                    if (node.status !== 'done' && node.status !== 'error') {
-                        node.status = allow ? 'running' : 'denied';
-                    }
-                    if (!allow) {
-                        node.approvalState = event.timedOut ? 'timed_out' : 'denied';
-                    } else if (event.autoApproved) {
-                        node.approvalState = 'always';
-                    } else if (node.isQuestion) {
-                        const hasAns = Boolean(
-                            event.answers &&
-                            typeof event.answers === 'object' &&
-                            Object.keys(event.answers).length > 0
-                        );
-                        node.approvalState = hasAns
-                            ? 'answered'
-                            : (node.pendingApprovalAction || 'skipped');
-                    } else {
-                        node.approvalState = (event.sessionScopeSaved || node.pendingApprovalAction === 'always')
-                            ? 'always'
-                            : 'allowed';
-                    }
-                    card.dirtyToolNodeIds?.add(node.id);
-                    if (card.selectedNodeId === node.id) {
-                        const nextPending = card.toolNodes.find(
-                            n => n.status === 'pending_approval' || n.status === 'sending_approval'
-                        );
-                        card.selectedNodeId = nextPending ? nextPending.id : null;
-                    }
-                }
-                const nextPending = card.toolNodes.find(
-                    n => n.status === 'pending_approval' || n.status === 'sending_approval'
-                );
-                const stillWaiting = Boolean(nextPending);
-                if (activeTurn) {
-                    activeTurn.state = stillWaiting ? 'awaiting_approval' : 'streaming';
-                }
-                card.activeTool = allow || stillWaiting;
-                card.dirty.tools = true;
-                card.dirty.toolsUrgent = true;
+                const {node, nextPending, allow} = applyToolTraceEventToCard(card, event, {
+                    findOrCreateNode: (targetCard, info) => this._tracePanel.findOrCreateToolNode(targetCard, info),
+                    activeTurn,
+                });
                 if (!card.text) card.dirty.text = true;
                 this._updateAiTabBadge();
                 card.scheduleRender();
@@ -2062,53 +1964,23 @@ export default class QuickChat extends Extension {
         }
 
         if (event.type === 'tool_execution_end') {
-            if (this._live?.toolNodes) {
-                let node = null;
-                if (event.toolCallId) {
-                    node = this._live.toolNodes.find(n => n.toolCallId === event.toolCallId);
-                }
-                if (!node) {
-                    for (let i = this._live.toolNodes.length - 1; i >= 0; i--) {
-                        const cand = this._live.toolNodes[i];
-                        if (cand.status === 'running' && (!event.toolName || cand.toolName === event.toolName)) {
-                            node = cand;
-                            break;
-                        }
-                    }
-                }
-                if (node) {
-                    if (event.detail) node.detail = event.detail;
-                    if (typeof event.duration === 'number' && event.duration > 0) {
-                        node.duration = event.duration;
-                    }
-                    if (node.status !== 'denied') {
-                        node.status = event.isError ? 'error' : 'done';
-                    }
-                    this._live.dirtyToolNodeIds?.add(node.id);
-                }
-                this._live.activeTool = this._live.toolNodes.some(
-                    n => n.status === 'running' || n.status === 'pending_approval' || n.status === 'sending_approval'
-                );
-                this._live.dirty.tools = true;
-                this._live.scheduleRender();
+            const card = this._ensureLiveCard(event);
+            if (card?.toolNodes) {
+                applyToolTraceEventToCard(card, event, {
+                    findOrCreateNode: (targetCard, info) => this._tracePanel.findOrCreateToolNode(targetCard, info),
+                    activeTurn,
+                });
+                if (!card.text) card.dirty.text = true;
+                card.scheduleRender();
             }
         }
 
         if (event.type === 'tool_batch_end') {
             if (this._live?.toolNodes) {
-                const confirmedIds = Array.isArray(event.toolCallIds) && event.toolCallIds.length > 0
-                    ? new Set(event.toolCallIds.map(String))
-                    : null;
-                for (const node of this._live.toolNodes) {
-                    if (node.status === 'running' && (!confirmedIds || (node.toolCallId && confirmedIds.has(node.toolCallId)))) {
-                        node.status = 'done';
-                        this._live.dirtyToolNodeIds?.add(node.id);
-                    }
-                }
-                this._live.activeTool = this._live.toolNodes.some(
-                    n => n.status === 'running' || n.status === 'pending_approval' || n.status === 'sending_approval'
-                );
-                this._live.dirty.tools = true;
+                applyToolTraceEventToCard(this._live, event, {
+                    findOrCreateNode: (targetCard, info) => this._tracePanel.findOrCreateToolNode(targetCard, info),
+                    activeTurn,
+                });
                 this._live.scheduleRender();
             }
         }
@@ -2174,19 +2046,14 @@ export default class QuickChat extends Extension {
 
             if (settledCard) {
                 if (settledCard.toolNodes) {
-                    for (const node of settledCard.toolNodes) {
-                        if (node.status === 'pending_approval' || node.status === 'sending_approval') {
-                            node.status = 'denied';
-                            node.approvalState = 'denied';
-                            settledCard.dirtyToolNodeIds?.add(node.id);
-                            if (settledCard.selectedNodeId === node.id) {
-                                settledCard.selectedNodeId = null;
-                            }
-                        } else if (node.status === 'running') {
-                            node.status = 'interrupted';
-                            settledCard.dirtyToolNodeIds?.add(node.id);
-                        }
-                    }
+                    applyToolTraceEventToCard(settledCard, {
+                        ...event,
+                        type: 'agent_settled',
+                        status: terminalStatus,
+                    }, {
+                        findOrCreateNode: (targetCard, info) => this._tracePanel.findOrCreateToolNode(targetCard, info),
+                        activeTurn,
+                    });
                 }
                 settledCard.status = terminalStatus;
                 settledCard.partial = isPartial;

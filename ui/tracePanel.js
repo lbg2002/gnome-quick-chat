@@ -721,6 +721,7 @@ export class TracePanelController {
                     : '💬 请选择或输入您的回答';
             } else if (node.status === 'running') qTitle = '⏳ 已收到回答，AI 正在继续处理…';
             else if (node.status === 'interrupted') qTitle = '⏹ 提问已中断（未确认完成）';
+            else if (node.status === 'unknown') qTitle = '❓ 提问状态未知（未收到完成事件）';
             else if (node.status === 'denied') qTitle = '✕ 已取消本次提问';
             else if (node.status === 'error') qTitle = `⚠️ 提问处理异常${durSuffix}`;
             else if (node.approvalState === 'skipped') qTitle = `⏭ 已交由 AI 自行判断${durSuffix}`;
@@ -770,6 +771,7 @@ export class TracePanelController {
                 ? `⏳ 已授权，正在执行：${node.toolName}`
                 : `⏳ 正在执行：${node.toolName}`;
         } else if (node.status === 'interrupted') statusTitle = `⏹ 已中断（未确认完成）：${node.toolName}`;
+        else if (node.status === 'unknown') statusTitle = `❓ 状态未知（未确认结果）：${node.toolName}`;
         else if (node.status === 'denied') statusTitle = `✕ 已拒绝调用：${node.toolName}`;
         else if (node.status === 'error') statusTitle = `⚠️ 执行异常：${node.toolName}${durSuffix}`;
         else if (node.approvalState === 'always') statusTitle = `✓ 已按范围授权完成：${node.toolName}${durSuffix}`;
@@ -880,7 +882,12 @@ export class TracePanelController {
 
     findOrCreateToolNode(card, info = {}) {
         if (!card?.toolNodes) return null;
-        const {requestId = '', toolCallId = '', toolName = ''} = info;
+        const {
+            requestId = '',
+            toolCallId = '',
+            toolName = '',
+            matchPendingWithoutToolCallId = false,
+        } = info;
         let node = null;
 
         if (requestId) {
@@ -889,13 +896,13 @@ export class TracePanelController {
         if (!node && toolCallId) {
             node = card.toolNodes.find(n => n.toolCallId && n.toolCallId === toolCallId);
         }
-        if (!node && toolName && toolName !== '工具') {
+        if (!node && matchPendingWithoutToolCallId && toolName && toolName !== '工具') {
             for (let i = card.toolNodes.length - 1; i >= 0; i--) {
                 const cand = card.toolNodes[i];
                 if (
                     cand.toolName === toolName &&
-                    (cand.status === 'running' || cand.status === 'pending_approval' || cand.status === 'sending_approval') &&
-                    (!toolCallId || !cand.toolCallId || cand.toolCallId === toolCallId)
+                    (cand.status === 'pending_approval' || cand.status === 'sending_approval') &&
+                    !cand.toolCallId
                 ) {
                     node = cand;
                     break;

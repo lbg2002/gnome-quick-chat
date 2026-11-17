@@ -102,7 +102,7 @@ export function computeToolDotVisualState(node, selectedNodeId = null) {
         colorClass = 'qc-dot-tool-pending';
     } else if (status === 'denied' || status === 'error') {
         colorClass = 'qc-dot-tool-error';
-    } else if (status === 'interrupted') {
+    } else if (status === 'interrupted' || status === 'unknown' || status === 'cancelled') {
         colorClass = 'qc-dot-tool-interrupted';
     } else if (status === 'running') {
         colorClass = 'qc-dot-tool-running';
@@ -114,6 +114,401 @@ export function computeToolDotVisualState(node, selectedNodeId = null) {
         isSelected,
         styleKey,
     };
+}
+
+/**
+ * Deterministic card-level tool trace state transition engine (R7).
+ * Handles:
+ *  - Idempotent `tool_execution_start` / `tool_execution_update`
+ *  - Concurrent same-name tools (strict ID matching, never guessing by `toolName` on end)
+ *  - `tool_execution_end` arriving before `permission_resolved` ACK (result-before-ACK)
+ *  - Duplicate `tool_execution_end` events
+ *  - `tool_execution_end` without a prior `tool_execution_start`
+ *  - Cross-batch `tool_batch_end` (only updates explicit `toolCallIds`; missing IDs never mark all tools done;
+ *    unconfirmed batch endings mark still-running tools in that batch as `'unknown'`)
+ *  - Turn cancellation / settlement in intermediate states (`'interrupted'` / `'unknown'` / `'denied'`)
+ */
+export function applyToolTraceEventToCard(card, event, {
+    findOrCreateNode = null,
+    activeTurn = null,
+} = {}) {
+    if (!card || !Array.isArray(card.toolNodes) || !event || typeof event !== 'object') {
+        return {node: null, nextPending: null, stillWaiting: false};
+    }
+
+    const markDirty = node => {
+        if (node?.id) {
+            card.dirtyToolNodeIds?.add(node.id);
+        }
+    };
+    const syncCardActiveTool = () => {
+        card.activeTool = card.toolNodes.some(
+            n => n.status === 'running' || n.status === 'pending_approval' || n.status === 'sending_approval'
+        );
+        if (card.dirty && typeof card.dirty === 'object') {
+            card.dirty.tools = true;
+        }
+    };
+    const findNextPending = () => card.toolNodes.find(
+        n => n.status === 'pending_approval' || n.status === 'sending_approval'
+    ) || null;
+
+    const defaultCreateNode = (targetCard, info = {}) => {
+        const index = targetCard.toolNodes.length + 1;
+        const node = {
+            id: `tool_${index}_${Date.now()}`,
+            index,
+            requestId: String(info.requestId || ''),
+            toolCallId: String(info.toolCallId || ''),
+            toolName: String(info.toolName || '工具'),
+            operationLabel: String(info.operationLabel || ''),
+            riskLevel: String(info.riskLevel || 'medium'),
+            riskLabel: String(info.riskLabel || ''),
+            riskWarnings: Array.isArray(info.riskWarnings) ? [...info.riskWarnings] : [],
+            fullCommand: String(info.fullCommand || ''),
+            cwd: String(info.cwd || ''),
+            realCwd: String(info.realCwd || ''),
+            displayPath: String(info.displayPath || ''),
+            realPath: String(info.realPath || ''),
+            networkOrigin: String(info.networkOrigin || ''),
+            targetMismatch: Boolean(info.targetMismatch),
+            symlinkEscape: Boolean(info.symlinkEscape),
+            summary: String(info.summary || ''),
+            reason: String(info.reason || ''),
+            detail: String(info.detail || ''),
+            duration: typeof info.duration === 'number' && info.duration > 0 ? info.duration : 0,
+            status: 'running',
+            approvalState: '',
+            approvalPhase: '',
+            scopeKey: String(info.scopeKey || ''),
+            allowSessionRule: Boolean(info.allowSessionRule),
+            sessionRuleLabel: String(info.sessionRuleLabel || ''),
+            isQuestion: Boolean(info.isQuestion),
+            questions: Array.isArray(info.questions) ? info.questions : [],
+            rawInput: info.rawInput && typeof info.rawInput === 'object' ? info.rawInput : null,
+            deliveryError: '',
+        };
+        targetCard.toolNodes.push(node);
+        markDirty(node);
+        return node;
+    };
+
+    const resolveOrCreate = info => {
+        if (typeof findOrCreateNode === 'function') {
+            return findOrCreateNode(card, info);
+        }
+        const reqId = String(info.requestId || '').trim();
+        const tcId = String(info.toolCallId || '').trim();
+        let existing = null;
+        if (reqId) {
+            existing = card.toolNodes.find(n => n.requestId && n.requestId === reqId) || null;
+        }
+        if (!existing && tcId) {
+            existing = card.toolNodes.find(n => n.toolCallId && n.toolCallId === tcId) || null;
+        }
+        if (!existing && info.matchPendingWithoutToolCallId && info.toolName && info.toolName !== '工具') {
+            for (let i = card.toolNodes.length - 1; i >= 0; i--) {
+                const cand = card.toolNodes[i];
+                if (
+                    cand.toolName === info.toolName &&
+                    (cand.status === 'pending_approval' || cand.status === 'sending_approval') &&
+                    !cand.toolCallId
+                ) {
+                    existing = cand;
+                    break;
+                }
+            }
+        }
+        if (existing) {
+            if (reqId && !existing.requestId) existing.requestId = reqId;
+            if (tcId && !existing.toolCallId) existing.toolCallId = tcId;
+            if (info.toolName && info.toolName !== '工具' && (!existing.toolName || existing.toolName === '工具')) {
+                existing.toolName = String(info.toolName);
+            }
+            if (info.summary && !existing.summary) existing.summary = String(info.summary);
+            if (info.detail) existing.detail = String(info.detail);
+            markDirty(existing);
+            return existing;
+        }
+        return defaultCreateNode(card, info);
+    };
+
+    const type = String(event.type || '');
+
+    if (type === 'tool_execution_start' || type === 'tool_execution_update') {
+        if (type === 'tool_execution_update' && !event.toolCallId && !event.requestId) {
+            const nextPending = findNextPending();
+            return {node: null, nextPending, stillWaiting: Boolean(nextPending)};
+        }
+        const node = resolveOrCreate({
+            requestId: event.requestId || '',
+            toolCallId: event.toolCallId || '',
+            toolName: event.toolName || '工具',
+            summary: event.summary || '',
+            detail: event.detail || '',
+            isQuestion: Boolean(event.isQuestion),
+            questions: event.questions,
+            rawInput: event.rawInput,
+            matchPendingWithoutToolCallId: type === 'tool_execution_start',
+        });
+        if (node) {
+            const isTerminal =
+                node.status === 'done' ||
+                node.status === 'error' ||
+                node.status === 'denied' ||
+                node.status === 'interrupted' ||
+                node.status === 'unknown';
+            if (
+                !isTerminal &&
+                node.status !== 'pending_approval' &&
+                node.status !== 'sending_approval'
+            ) {
+                node.status = 'running';
+            }
+            markDirty(node);
+        }
+        syncCardActiveTool();
+        const nextPending = findNextPending();
+        return {node, nextPending, stillWaiting: Boolean(nextPending)};
+    }
+
+    if (type === 'permission_request') {
+        const hadPendingBefore = Boolean(findNextPending());
+        const node = resolveOrCreate({
+            requestId: event.requestId || '',
+            toolCallId: event.toolCallId || '',
+            toolName: event.toolName || '工具',
+            operationLabel: event.operationLabel || '',
+            riskLevel: event.riskLevel || '',
+            riskLabel: event.riskLabel || '',
+            riskWarnings: event.riskWarnings,
+            fullCommand: event.fullCommand || '',
+            cwd: event.cwd || '',
+            realCwd: event.realCwd || '',
+            displayPath: event.displayPath || '',
+            realPath: event.realPath || '',
+            networkOrigin: event.networkOrigin || '',
+            targetMismatch: Boolean(event.targetMismatch),
+            symlinkEscape: Boolean(event.symlinkEscape),
+            summary: event.summary || '',
+            reason: event.reason || '',
+            scopeKey: event.scopeKey || '',
+            allowSessionRule: event.allowSessionRule,
+            sessionRuleLabel: event.sessionRuleLabel || '',
+            isQuestion: Boolean(event.isQuestion),
+            questions: event.questions,
+            rawInput: event.rawInput,
+        });
+        if (node) {
+            if (node.status !== 'done' && node.status !== 'error' && node.status !== 'denied') {
+                node.status = 'pending_approval';
+            }
+            node.approvalState = 'pending';
+            markDirty(node);
+            if (!hadPendingBefore || !card.selectedNodeId) {
+                card.selectedNodeId = node.id;
+            } else {
+                const selNode = card.toolNodes.find(n => n.id === card.selectedNodeId);
+                if (!selNode || selNode.status !== 'pending_approval') {
+                    card.selectedNodeId = node.id;
+                }
+            }
+        }
+        if (activeTurn) {
+            activeTurn.state = 'awaiting_approval';
+        }
+        syncCardActiveTool();
+        if (card.dirty && typeof card.dirty === 'object') {
+            card.dirty.toolsUrgent = true;
+        }
+        const nextPending = findNextPending();
+        return {node, nextPending, stillWaiting: Boolean(nextPending)};
+    }
+
+    if (type === 'permission_resolved') {
+        let node = card.toolNodes.find(
+            n => (event.requestId && n.requestId === event.requestId) ||
+                 (event.toolCallId && n.toolCallId === event.toolCallId)
+        ) || null;
+        if (!node && event.autoApproved && event.requestId) {
+            node = resolveOrCreate({
+                requestId: event.requestId,
+                toolCallId: event.toolCallId || '',
+                toolName: event.toolName || '工具',
+                scopeKey: event.scopeKey || '',
+            });
+        }
+        const allow = (event.decision === 'allow' || event.decision === 'modify') && !event.timedOut;
+        if (node) {
+            node.deliveryError = '';
+            node.approvalPhase = 'resolved';
+            if (!allow) {
+                node.status = 'denied';
+                node.approvalState = event.timedOut ? 'timed_out' : 'denied';
+            } else {
+                if (node.status !== 'done' && node.status !== 'error') {
+                    if (node.earlyExecutionEnd) {
+                        node.status = node.earlyExecutionEnd.isError ? 'error' : 'done';
+                    } else {
+                        node.status = 'running';
+                    }
+                }
+                if (event.autoApproved) {
+                    node.approvalState = 'always';
+                } else if (node.isQuestion) {
+                    const hasAns = Boolean(
+                        event.answers &&
+                        typeof event.answers === 'object' &&
+                        Object.keys(event.answers).length > 0
+                    );
+                    node.approvalState = hasAns
+                        ? 'answered'
+                        : (node.pendingApprovalAction || 'skipped');
+                } else {
+                    node.approvalState = (event.sessionScopeSaved || node.pendingApprovalAction === 'always')
+                        ? 'always'
+                        : 'allowed';
+                }
+            }
+            markDirty(node);
+            if (card.selectedNodeId === node.id) {
+                const nextPendingSel = findNextPending();
+                card.selectedNodeId = nextPendingSel ? nextPendingSel.id : null;
+            }
+        }
+        const nextPending = findNextPending();
+        const stillWaiting = Boolean(nextPending);
+        if (activeTurn) {
+            activeTurn.state = stillWaiting ? 'awaiting_approval' : 'streaming';
+        }
+        syncCardActiveTool();
+        if (card.dirty && typeof card.dirty === 'object') {
+            card.dirty.toolsUrgent = true;
+        }
+        return {node, nextPending, stillWaiting, allow};
+    }
+
+    if (type === 'tool_execution_end') {
+        const tcId = String(event.toolCallId || '').trim();
+        const reqId = String(event.requestId || '').trim();
+        let node = null;
+        if (tcId) {
+            node = card.toolNodes.find(n => n.toolCallId && n.toolCallId === tcId) || null;
+        }
+        if (!node && reqId) {
+            node = card.toolNodes.find(n => n.requestId && n.requestId === reqId) || null;
+        }
+        if (!node) {
+            node = resolveOrCreate({
+                toolCallId: tcId,
+                requestId: reqId,
+                toolName: event.toolName || '工具',
+                summary: event.summary || '',
+                detail: event.detail || '',
+                duration: event.duration || 0,
+                matchPendingWithoutToolCallId: false,
+            });
+            if (node) {
+                node.startedWithoutStartEvent = true;
+            }
+        }
+        if (node) {
+            const isAlreadyFinal =
+                node.status === 'done' ||
+                node.status === 'error' ||
+                node.status === 'denied';
+            if (event.detail && (!isAlreadyFinal || !node.detail)) {
+                node.detail = String(event.detail);
+            }
+            if (typeof event.duration === 'number' && event.duration > 0 && (!isAlreadyFinal || !node.duration)) {
+                node.duration = event.duration;
+            }
+            if (!isAlreadyFinal) {
+                node.earlyExecutionEnd = {
+                    isError: Boolean(event.isError),
+                    detail: node.detail || '',
+                    duration: node.duration || 0,
+                };
+                node.status = event.isError ? 'error' : 'done';
+            }
+            markDirty(node);
+        }
+        syncCardActiveTool();
+        const nextPending = findNextPending();
+        return {node, nextPending, stillWaiting: Boolean(nextPending)};
+    }
+
+    if (type === 'tool_batch_end') {
+        const ids = Array.isArray(event.toolCallIds)
+            ? event.toolCallIds.map(id => String(id || '').trim()).filter(Boolean)
+            : [];
+        if (ids.length > 0) {
+            const confirmedIds = new Set(ids);
+            for (const node of card.toolNodes) {
+                if (node.status === 'running' && node.toolCallId && confirmedIds.has(node.toolCallId)) {
+                    const perIdStatus = event.statusById && typeof event.statusById === 'object'
+                        ? String(event.statusById[node.toolCallId] || '')
+                        : '';
+                    const batchStatus = String(event.batchStatus || '');
+                    if (
+                        perIdStatus === 'done' ||
+                        perIdStatus === 'completed' ||
+                        perIdStatus === 'success' ||
+                        event.allSucceeded === true ||
+                        batchStatus === 'done' ||
+                        batchStatus === 'completed'
+                    ) {
+                        node.status = 'done';
+                    } else if (
+                        perIdStatus === 'error' ||
+                        perIdStatus === 'failed' ||
+                        batchStatus === 'error' ||
+                        batchStatus === 'failed'
+                    ) {
+                        node.status = 'error';
+                    } else if (perIdStatus === 'interrupted' || batchStatus === 'interrupted') {
+                        node.status = 'interrupted';
+                    } else {
+                        node.status = 'unknown';
+                    }
+                    markDirty(node);
+                }
+            }
+        }
+        syncCardActiveTool();
+        const nextPending = findNextPending();
+        return {node: null, nextPending, stillWaiting: Boolean(nextPending)};
+    }
+
+    if (type === 'agent_settled' || type === 'turn_settled') {
+        const terminalStatus = event.status || (event.aborted ? 'cancelled' : 'completed');
+        const isAbnormalExit = terminalStatus !== 'completed';
+        const isCancelledOrInterrupted = terminalStatus === 'cancelled' || terminalStatus === 'interrupted';
+        for (const node of card.toolNodes) {
+            if (node.status === 'pending_approval' || node.status === 'sending_approval') {
+                node.status = isCancelledOrInterrupted ? 'interrupted' : 'denied';
+                node.approvalState = terminalStatus === 'timed_out'
+                    ? 'timed_out'
+                    : (isCancelledOrInterrupted ? 'cancelled' : 'denied');
+                markDirty(node);
+                if (card.selectedNodeId === node.id) {
+                    card.selectedNodeId = null;
+                }
+            } else if (node.status === 'running') {
+                node.status = isAbnormalExit ? 'interrupted' : 'unknown';
+                markDirty(node);
+            }
+        }
+        card.activeTool = false;
+        if (card.dirty && typeof card.dirty === 'object') {
+            card.dirty.tools = true;
+            card.dirty.toolsUrgent = true;
+        }
+        return {node: null, nextPending: null, stillWaiting: false};
+    }
+
+    const nextPending = findNextPending();
+    return {node: null, nextPending, stillWaiting: Boolean(nextPending)};
 }
 
 /**
@@ -142,7 +537,9 @@ export function partitionToolDotsForLayout(toolNodes, {
             n.status === 'sending_approval' ||
             n.status === 'running' ||
             n.status === 'error' ||
-            n.status === 'denied'
+            n.status === 'denied' ||
+            n.status === 'interrupted' ||
+            n.status === 'unknown'
         ) {
             pinnedIds.add(n.id);
         }

@@ -147,10 +147,18 @@ export class TurnController {
             sawMessageEnd: false,
             pendingApprovals: new Set(),
             approvalRequests: new Map(),
+            toolExecutions: new Map(),
+            activeToolIds: new Set(),
+            anonToolSeq: 0,
+            watchdogPhase: 'stream_idle',
+            activeTimeoutSec: 0,
+            totalTurnTimeoutSec: 0,
+            timedOutPhase: '',
             stdinWriteChain: Promise.resolve(),
             cleanupWatchdog: null,
             resetWatchdog: null,
             pauseWatchdog: null,
+            setWatchdogPhase: null,
             startApprovalWatchdog: null,
             clearApprovalWatchdog: null,
         };
@@ -172,15 +180,24 @@ export class TurnController {
         return true;
     }
 
+    getEffectiveWatchdogPhase(turn) {
+        if (!turn || turn.finalized) return 'settled';
+        if (turn.pendingApprovals && turn.pendingApprovals.size > 0) return 'approval_wait';
+        if (turn.activeToolIds && turn.activeToolIds.size > 0) return 'tool_execution';
+        return 'stream_idle';
+    }
+
     markStreaming(turn) {
         if (!this.isCurrent(turn)) return false;
         if (turn.pendingApprovals.size > 0) {
             turn.state = 'awaiting_approval';
+            turn.watchdogPhase = 'approval_wait';
             return true;
         }
         if (turn.state === 'starting' || turn.state === 'awaiting_approval') {
             turn.state = 'streaming';
         }
+        turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
         return true;
     }
 
@@ -188,6 +205,7 @@ export class TurnController {
         if (!this.isCurrent(turn)) return false;
         const cleanId = String(requestId || '').trim();
         const wasEmpty = turn.pendingApprovals.size === 0;
+        const cleanToolCallId = String(meta?.toolCallId || '').trim();
         if (cleanId) {
             turn.pendingApprovals.add(cleanId);
             const existing = turn.approvalRequests.get(cleanId);
@@ -195,7 +213,7 @@ export class TurnController {
                 turn.approvalRequests.set(cleanId, {
                     requestId: cleanId,
                     turnId: turn.id,
-                    toolCallId: String(meta?.toolCallId || ''),
+                    toolCallId: cleanToolCallId,
                     toolName: String(meta?.toolName || ''),
                     input: meta?.rawInput ?? meta?.input ?? null,
                     questions: Array.isArray(meta?.questions) ? meta.questions : null,
@@ -213,6 +231,7 @@ export class TurnController {
                     resolvedPayload: null,
                 });
             } else {
+                if (cleanToolCallId && !existing.toolCallId) existing.toolCallId = cleanToolCallId;
                 if (meta?.toolName && !existing.toolName) existing.toolName = String(meta.toolName);
                 if ((meta?.rawInput || meta?.input) && !existing.input) existing.input = meta.rawInput ?? meta.input;
                 if (Array.isArray(meta?.questions) && !existing.questions) existing.questions = meta.questions;
@@ -220,8 +239,32 @@ export class TurnController {
                 if (meta?.scopeKey && !existing.scopeKey) existing.scopeKey = String(meta.scopeKey);
                 if (typeof meta?.allowSessionRule === 'boolean') existing.allowSessionRule = meta.allowSessionRule;
             }
+            if (cleanToolCallId) {
+                const toolEntry = turn.toolExecutions.get(cleanToolCallId);
+                if (!toolEntry) {
+                    turn.toolExecutions.set(cleanToolCallId, {
+                        toolCallId: cleanToolCallId,
+                        requestId: cleanId,
+                        toolName: String(meta?.toolName || '工具'),
+                        status: 'pending_approval',
+                        approvalState: 'pending',
+                        summary: String(meta?.summary || ''),
+                        detail: '',
+                        isError: false,
+                        duration: 0,
+                        syntheticId: false,
+                    });
+                } else {
+                    toolEntry.requestId = cleanId;
+                    if (toolEntry.status !== 'done' && toolEntry.status !== 'error' && toolEntry.status !== 'denied') {
+                        toolEntry.status = 'pending_approval';
+                        toolEntry.approvalState = 'pending';
+                    }
+                }
+            }
         }
         turn.state = 'awaiting_approval';
+        turn.watchdogPhase = 'approval_wait';
         turn.pauseWatchdog?.();
         if (wasEmpty || turn.pendingApprovals.size > 0) {
             turn.startApprovalWatchdog?.();
@@ -280,6 +323,10 @@ export class TurnController {
         const cleanId = String(event.requestId || '').trim();
         if (!cleanId) return false;
         const entry = turn.approvalRequests.get(cleanId);
+        const ackDecision = String(event.decision || '');
+        const allow = (ackDecision === 'allow' || ackDecision === 'modify') && !event.timedOut;
+        const toolCallId = String(event.toolCallId || entry?.toolCallId || '').trim();
+
         if (entry) {
             try { entry.clearAckTimer?.(); } catch (_) {}
             entry.clearAckTimer = null;
@@ -287,7 +334,6 @@ export class TurnController {
             entry.state = event.timedOut ? 'timed_out' : 'resolved';
             entry.resolvedPayload = event;
 
-            const ackDecision = String(event.decision || '');
             const ackScopeKey = String(event.scopeKey || '').trim();
             if (
                 approvedScopes &&
@@ -314,6 +360,28 @@ export class TurnController {
                 } catch (_) {}
             }
         }
+
+        if (toolCallId) {
+            const toolEntry = turn.toolExecutions.get(toolCallId);
+            if (toolEntry) {
+                toolEntry.approvalState = !allow
+                    ? (event.timedOut ? 'timed_out' : 'denied')
+                    : (event.autoApproved || event.sessionScopeSaved ? 'always' : 'allowed');
+                if (!allow) {
+                    toolEntry.status = 'denied';
+                    turn.activeToolIds.delete(toolCallId);
+                } else if (toolEntry.status === 'pending_approval' || toolEntry.status === 'sending_approval') {
+                    if (toolEntry.earlyExecutionEnd) {
+                        toolEntry.status = toolEntry.earlyExecutionEnd.isError ? 'error' : 'done';
+                        turn.activeToolIds.delete(toolCallId);
+                    } else {
+                        toolEntry.status = 'running';
+                        turn.activeToolIds.add(toolCallId);
+                    }
+                }
+            }
+        }
+
         return this.leaveApproval(turn, cleanId);
     }
 
@@ -362,9 +430,202 @@ export class TurnController {
         if (turn.pendingApprovals.size === 0) {
             turn.clearApprovalWatchdog?.();
             turn.state = 'streaming';
+            turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
             turn.resetWatchdog?.();
+        } else {
+            turn.state = 'awaiting_approval';
+            turn.watchdogPhase = 'approval_wait';
+            turn.pauseWatchdog?.();
         }
         return true;
+    }
+
+    /**
+     * Records a `tool_execution_start` event idempotently in `turn.toolExecutions` (`Map<toolCallId, state>`)
+     * and `turn.activeToolIds` (`Set<toolCallId>`). Duplicate start events for the same `toolCallId`
+     * update metadata without double-counting or resurrecting already-finished tools (R7).
+     */
+    recordToolStart(turn, event = {}) {
+        if (!this.isCurrent(turn)) return null;
+        const explicitId = String(event.toolCallId || event.requestId || '').trim();
+        const isSynthetic = !explicitId;
+        const toolCallId = explicitId || `anon_tool_${++turn.anonToolSeq}`;
+        let entry = turn.toolExecutions.get(toolCallId);
+
+        if (!entry) {
+            entry = {
+                toolCallId,
+                requestId: String(event.requestId || ''),
+                toolName: String(event.toolName || '工具'),
+                status: 'running',
+                approvalState: '',
+                summary: String(event.summary || ''),
+                detail: String(event.detail || ''),
+                isError: false,
+                duration: 0,
+                syntheticId: isSynthetic,
+            };
+            turn.toolExecutions.set(toolCallId, entry);
+            turn.activeToolIds.add(toolCallId);
+        } else {
+            if (event.toolName && event.toolName !== '工具' && (!entry.toolName || entry.toolName === '工具')) {
+                entry.toolName = String(event.toolName);
+            }
+            if (event.summary && !entry.summary) {
+                entry.summary = String(event.summary);
+            }
+            if (event.detail) {
+                entry.detail = String(event.detail);
+            }
+            const isTerminal =
+                entry.status === 'done' ||
+                entry.status === 'error' ||
+                entry.status === 'denied' ||
+                entry.status === 'interrupted' ||
+                entry.status === 'unknown';
+            if (!isTerminal && entry.status !== 'pending_approval' && entry.status !== 'sending_approval') {
+                entry.status = 'running';
+                turn.activeToolIds.add(toolCallId);
+            }
+        }
+        turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
+        return entry;
+    }
+
+    /**
+     * Records a `tool_execution_update` event idempotently in `turn.toolExecutions` without
+     * incrementing active tool counts when the tool is already running (R7).
+     */
+    recordToolUpdate(turn, event = {}) {
+        if (!this.isCurrent(turn)) return null;
+        const explicitId = String(event.toolCallId || event.requestId || '').trim();
+        if (!explicitId) {
+            turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
+            return null;
+        }
+        return this.recordToolStart(turn, event);
+    }
+
+    /**
+     * Records a `tool_execution_end` event strictly by `toolCallId` (never guessing by `toolName`).
+     * Handles result-before-ACK, duplicate `tool_execution_end`, and `tool_execution_end` without a prior start (R7).
+     */
+    recordToolEnd(turn, event = {}) {
+        if (!this.isCurrent(turn)) return null;
+        const explicitId = String(event.toolCallId || event.requestId || '').trim();
+        const isError = Boolean(event.isError);
+        const nextStatus = isError ? 'error' : 'done';
+
+        if (!explicitId) {
+            const orphanId = `unmatched_end_${++turn.anonToolSeq}`;
+            const orphanEntry = {
+                toolCallId: orphanId,
+                requestId: '',
+                toolName: String(event.toolName || '工具'),
+                status: nextStatus,
+                approvalState: '',
+                summary: String(event.summary || ''),
+                detail: String(event.detail || ''),
+                isError,
+                duration: typeof event.duration === 'number' && event.duration > 0 ? event.duration : 0,
+                syntheticId: true,
+                startedWithoutStartEvent: true,
+            };
+            turn.toolExecutions.set(orphanId, orphanEntry);
+            turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
+            return orphanEntry;
+        }
+
+        let entry = turn.toolExecutions.get(explicitId);
+        if (!entry) {
+            entry = {
+                toolCallId: explicitId,
+                requestId: String(event.requestId || ''),
+                toolName: String(event.toolName || '工具'),
+                status: nextStatus,
+                approvalState: '',
+                summary: String(event.summary || ''),
+                detail: String(event.detail || ''),
+                isError,
+                duration: typeof event.duration === 'number' && event.duration > 0 ? event.duration : 0,
+                syntheticId: false,
+                startedWithoutStartEvent: true,
+            };
+            turn.toolExecutions.set(explicitId, entry);
+        } else {
+            turn.activeToolIds.delete(explicitId);
+            if (event.detail && !entry.detail) {
+                entry.detail = String(event.detail);
+            }
+            if (typeof event.duration === 'number' && event.duration > 0 && !entry.duration) {
+                entry.duration = event.duration;
+            }
+            entry.earlyExecutionEnd = {
+                isError,
+                detail: entry.detail || '',
+                duration: entry.duration || 0,
+            };
+            if (entry.status !== 'done' && entry.status !== 'error' && entry.status !== 'denied') {
+                entry.status = nextStatus;
+                entry.isError = isError;
+            }
+        }
+        turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
+        return entry;
+    }
+
+    /**
+     * Records a `tool_batch_end` event. Only updates tools whose `toolCallId` is explicitly listed
+     * in `event.toolCallIds`. Missing/empty `toolCallIds` never marks all running tools as done,
+     * and running tools in the batch without an explicit individual result transition to `'unknown'`
+     * unless the batch explicitly specifies their status (R7).
+     */
+    recordToolBatchEnd(turn, event = {}) {
+        if (!this.isCurrent(turn)) return [];
+        const ids = Array.isArray(event.toolCallIds)
+            ? event.toolCallIds.map(id => String(id || '').trim()).filter(Boolean)
+            : [];
+        if (ids.length === 0) {
+            turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
+            return [];
+        }
+        const updated = [];
+        for (const id of ids) {
+            const entry = turn.toolExecutions.get(id);
+            if (!entry) continue;
+            turn.activeToolIds.delete(id);
+            if (entry.status === 'running') {
+                const perIdStatus = event.statusById && typeof event.statusById === 'object'
+                    ? String(event.statusById[id] || '')
+                    : '';
+                const batchStatus = String(event.batchStatus || '');
+                if (
+                    perIdStatus === 'done' ||
+                    perIdStatus === 'completed' ||
+                    perIdStatus === 'success' ||
+                    event.allSucceeded === true ||
+                    batchStatus === 'done' ||
+                    batchStatus === 'completed'
+                ) {
+                    entry.status = 'done';
+                } else if (
+                    perIdStatus === 'error' ||
+                    perIdStatus === 'failed' ||
+                    batchStatus === 'error' ||
+                    batchStatus === 'failed'
+                ) {
+                    entry.status = 'error';
+                    entry.isError = true;
+                } else if (perIdStatus === 'interrupted' || batchStatus === 'interrupted') {
+                    entry.status = 'interrupted';
+                } else {
+                    entry.status = 'unknown';
+                }
+                updated.push(entry);
+            }
+        }
+        turn.watchdogPhase = this.getEffectiveWatchdogPhase(turn);
+        return updated;
     }
 
     _applyAggregatedText(turn, nextAggregated) {
@@ -649,6 +910,7 @@ export class TurnController {
         turn.cleanupWatchdog = null;
         turn.resetWatchdog = null;
         turn.pauseWatchdog = null;
+        turn.setWatchdogPhase = null;
         turn.startApprovalWatchdog = null;
         turn.clearApprovalWatchdog = null;
 
@@ -685,6 +947,22 @@ export class TurnController {
         } else {
             turn.state = 'completed';
         }
+
+        turn.activeToolIds?.clear?.();
+        if (turn.toolExecutions instanceof Map) {
+            const isAbnormalExit = turn.state !== 'completed';
+            for (const entry of turn.toolExecutions.values()) {
+                if (entry.status === 'pending_approval' || entry.status === 'sending_approval') {
+                    entry.status = (turn.state === 'cancelled' || turn.state === 'interrupted') ? 'interrupted' : 'denied';
+                    entry.approvalState = turn.state === 'timed_out'
+                        ? 'timed_out'
+                        : ((turn.state === 'cancelled' || turn.state === 'interrupted') ? 'cancelled' : 'denied');
+                } else if (entry.status === 'running') {
+                    entry.status = isAbnormalExit ? 'interrupted' : 'unknown';
+                }
+            }
+        }
+        turn.watchdogPhase = 'settled';
 
         const wasActive = this._activeTurn === turn;
         if (wasActive) {

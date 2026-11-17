@@ -1066,6 +1066,18 @@ export function normalizeEvent(backend, record) {
                 }
                 return evt;
             }
+            if (kind === 'updated' || kind === 'progress') {
+                const evt = {
+                    type: 'tool_execution_update',
+                    toolName: String(toolName),
+                    rawInput: p.input && typeof p.input === 'object' ? p.input : null,
+                };
+                if (toolCallId) evt.toolCallId = toolCallId;
+                if (summary) evt.summary = String(summary);
+                const detail = p.detail || p.progress || p.output || p.result?.summary || '';
+                if (detail) evt.detail = String(detail);
+                return evt;
+            }
             if (kind === 'result' || kind === 'error') {
                 const evt = {
                     type: 'tool_execution_end',
@@ -1079,7 +1091,15 @@ export function normalizeEvent(backend, record) {
                 return evt;
             }
             if (kind === 'batch') {
-                return {type: 'tool_batch_end', toolCallIds: Array.isArray(p.toolCallIds) ? p.toolCallIds : []};
+                return {
+                    type: 'tool_batch_end',
+                    toolCallIds: Array.isArray(p.toolCallIds)
+                        ? p.toolCallIds.map(id => String(id ?? '').trim()).filter(Boolean)
+                        : [],
+                    ...(p.statusById && typeof p.statusById === 'object' ? {statusById: p.statusById} : {}),
+                    ...(p.batchStatus ? {batchStatus: String(p.batchStatus)} : {}),
+                    ...(typeof p.allSucceeded === 'boolean' ? {allSucceeded: p.allSucceeded} : {}),
+                };
             }
             return null;
         }
@@ -1151,6 +1171,14 @@ export function normalizeEvent(backend, record) {
                     }
                     return evt;
                 }
+                if (type === 'item.updated') {
+                    const evt = {type: 'tool_execution_update', toolName};
+                    if (toolCallId) evt.toolCallId = toolCallId;
+                    if (summary) evt.summary = summary;
+                    const detail = item.aggregated_output || item.output || item.detail || '';
+                    if (detail) evt.detail = String(detail);
+                    return evt;
+                }
                 const evt = {type: 'tool_execution_start', toolName};
                 if (toolCallId) evt.toolCallId = toolCallId;
                 if (summary) evt.summary = summary;
@@ -1186,6 +1214,45 @@ export function normalizeEvent(backend, record) {
     }
 
     return record;
+}
+
+const MEANINGFUL_PROGRESS_EVENT_TYPES = new Set([
+    'bridge_ready',
+    'session_bound',
+    'message_start',
+    'message_end',
+    'turn_completed',
+    'turn_result',
+    'tool_execution_start',
+    'tool_execution_update',
+    'tool_execution_end',
+    'tool_batch_end',
+    'permission_request',
+    'permission_resolved',
+    'permission_response_rejected',
+]);
+
+/**
+ * Returns true ONLY when a normalized event represents genuine turn/tool/stream progress.
+ * Ordinary logs, pings, heartbeats, or empty updates do NOT reset the progress watchdog (R7).
+ */
+export function isMeaningfulProgressEvent(event) {
+    if (!event || typeof event !== 'object') return false;
+    const type = String(event.type || '');
+    if (!type) return false;
+    if (type === 'message_update') {
+        const ev = event.assistantMessageEvent;
+        if (!ev || typeof ev !== 'object') return false;
+        return Boolean(
+            (typeof ev.delta === 'string' && ev.delta.length > 0) ||
+            (typeof ev.text === 'string' && ev.text.length > 0) ||
+            (typeof ev.thinking === 'string' && ev.thinking.length > 0)
+        );
+    }
+    if (type === 'text_snapshot' || type === 'thinking_snapshot') {
+        return typeof event.text === 'string' && event.text.length > 0;
+    }
+    return MEANINGFUL_PROGRESS_EVENT_TYPES.has(type);
 }
 
 export {

@@ -86,9 +86,9 @@
 
 现状：runtime/processManager.js:586–597 用整数 activeRunningTools 计数；重复 started/updated 事件可重复加一（Codex protocol.js item.started/item.updated 均转换 start）；batch end 直接清零，可能忽略其他仍运行的工具。extension.js:1903–1919 无 IDs 的 batch end 将所有 running 节点标为 done，工具 end 未匹配 ID 时按同名工具猜测（1870–1883）。
 
-- [ ] 使用 Map<toolCallId, state> / Set 跟踪活动工具；start/update 幂等；仅对应 ID end/batch 修改状态，缺 ID 不将全部工具推断成功。明确协议中 batch 是否代表成功还是仅批次结束，未知状态使用 unknown/interrupted。
-- [ ] 审批等待、工具执行、流空闲、总超时四种状态单独计算。普通日志/无意义心跳不无限延长有效进度 watchdog；长工具允许合理时间但受总时长约束。多审批仍待确认时不得恢复流超时。
-- [ ] 修正结果早于 ACK、重复 tool end、无 tool start、并发同名工具、交叉批次、取消中间状态；断言圆点颜色及实际 timeout phase 准确。
+- [x] 使用 Map<toolCallId, state> / Set 跟踪活动工具；start/update 幂等；仅对应 ID end/batch 修改状态，缺 ID 不将全部工具推断成功。明确协议中 batch 是否代表成功还是仅批次结束，未知状态使用 unknown/interrupted。
+- [x] 审批等待、工具执行、流空闲、总超时四种状态单独计算。普通日志/无意义心跳不无限延长有效进度 watchdog；长工具允许合理时间但受总时长约束。多审批仍待确认时不得恢复流超时。
+- [x] 修正结果早于 ACK、重复 tool end、无 tool start、并发同名工具、交叉批次、取消中间状态；断言圆点颜色及实际 timeout phase 准确。
 
 ### R8. 历史归档与长会话数据层（P1）
 
