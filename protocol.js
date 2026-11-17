@@ -1089,10 +1089,13 @@ export function normalizeEvent(backend, record) {
         }
         if (type === 'result') {
             const isErr = Boolean(record.is_error || record.subtype === 'error');
+            const resultText = typeof record.response === 'string'
+                ? record.response
+                : (typeof record.result === 'string' ? record.result : '');
             return {
                 type: 'turn_result',
-                sessionId: record.sessionId || '',
-                text: typeof record.response === 'string' ? record.response : '',
+                sessionId: record.sessionId || record.session_id || '',
+                text: resultText,
                 isError: isErr,
                 errorMessage: isErr ? String(record.error || record.message || 'ZCode 执行返回错误') : '',
             };

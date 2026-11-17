@@ -278,6 +278,7 @@ export function attachTurnWatchdog({
                 onTerminateProcess: proc => terminateTurnProcess(turn, proc),
                 onCleanupTempFiles: files => files.forEach(removeFileQuietly),
             });
+            store?.clearRemoteSessionId('turn_timed_out');
         }
     };
 
@@ -347,6 +348,7 @@ export function attachApprovalWatchdog({
                     onTerminateProcess: proc => terminateTurnProcess(turn, proc),
                     onCleanupTempFiles: files => files.forEach(removeFileQuietly),
                 });
+                store?.clearRemoteSessionId('approval_timed_out');
             }
             return GLib.SOURCE_REMOVE;
         });
@@ -446,6 +448,7 @@ export function spawnManagedCliTurn({
         turn.processGroupId = verifiedIsolatedGroup ? rawPid : 0;
         turn.leaderStartTime = statAfterSpawn?.startTime || '';
     } catch (spawnErr) {
+        store?.clearRemoteSessionId('spawn_failed');
         turns.finalizeTurn(turn, {
             status: 'failed',
             errorText: spawnErr.message,
@@ -541,6 +544,7 @@ export function spawnManagedCliTurn({
             onTerminateProcess: p => terminateTurnProcess(turn, p),
             onCleanupTempFiles: files => files.forEach(removeFileQuietly),
         });
+        store?.clearRemoteSessionId('fatal_monitor_error');
     };
 
     const trySettleWhenComplete = () => {
@@ -593,6 +597,17 @@ export function spawnManagedCliTurn({
             onPersistAssistant: m => store?.appendMessage(m, backend, persistCfg),
             onTerminateProcess: isCleanNormalCompletion ? null : (p => terminateTurnProcess(turn, p)),
             onCleanupTempFiles: files => files.forEach(removeFileQuietly),
+            onBeforeSettle: finalStatus => {
+                // R3: Advance remoteSyncedRevision ONLY when the backend protocol confirms clean completion!
+                if (finalStatus === 'completed') {
+                    const confirmedRemoteId = turn.boundRemoteSessionId || store?.remoteSessionId || remoteId;
+                    if (confirmedRemoteId) {
+                        store?.confirmRemoteTurnSynced?.(confirmedRemoteId, backend, persistCfg);
+                    }
+                } else {
+                    store?.clearRemoteSessionId(`turn_${finalStatus || 'incomplete'}`);
+                }
+            },
         });
     };
 
@@ -805,12 +820,14 @@ export function spawnManagedCliTurn({
                         syncCliToolTimeoutPhase();
                         turns.emitForTurn(turn, norm);
                     } else if (norm.type === 'session_bound' && norm.sessionId) {
-                        store?.setRemoteSessionId(norm.sessionId, backend, segCfg);
+                        turn.boundRemoteSessionId = norm.sessionId;
+                        store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
                     } else if (norm.type === 'turn_completed') {
                         turn.sawDoneMarker = true;
                     } else if (norm.type === 'turn_result') {
                         if (norm.sessionId) {
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg);
+                            turn.boundRemoteSessionId = norm.sessionId;
+                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
                         }
                         if (norm.isError) {
                             turn.error = norm.errorMessage || `${backend.toUpperCase()} 执行返回错误`;
@@ -826,7 +843,8 @@ export function spawnManagedCliTurn({
                         turns.replaceThinking(turn, norm.text, norm.segmentId || '');
                     } else if (norm.type === 'message_update') {
                         if (norm.sessionId) {
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg);
+                            turn.boundRemoteSessionId = norm.sessionId;
+                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
                         }
                         const ev = norm.assistantMessageEvent;
                         if (ev?.type === 'text_delta') {
@@ -838,7 +856,8 @@ export function spawnManagedCliTurn({
                         }
                     } else if (norm.type === 'message_end' && norm.message) {
                         if (norm.sessionId) {
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg);
+                            turn.boundRemoteSessionId = norm.sessionId;
+                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
                         }
                         if (typeof norm.message.content === 'string' && norm.message.content) {
                             turns.replaceText(turn, norm.message.content, norm.segmentId || norm.message.id || '');
@@ -848,7 +867,8 @@ export function spawnManagedCliTurn({
                         }
                     } else {
                         if (norm.sessionId) {
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg);
+                            turn.boundRemoteSessionId = norm.sessionId;
+                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
                         }
                         if (norm.type === 'message_start' && norm.modelId) {
                             turn.modelId = norm.modelId;

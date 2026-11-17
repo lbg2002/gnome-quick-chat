@@ -480,6 +480,7 @@ export class TurnController {
             onPersistAssistant = null,
             onTerminateProcess = null,
             onCleanupTempFiles = null,
+            onBeforeSettle = null,
         } = options;
 
         const cleanFinishReason = typeof finishReason === 'string' ? finishReason.trim() : '';
@@ -605,6 +606,10 @@ export class TurnController {
                     errorMessage: turn.error,
                 },
             });
+        }
+
+        if (typeof onBeforeSettle === 'function') {
+            try { onBeforeSettle(turn.state, turn); } catch (_) {}
         }
 
         this._onEvent?.({

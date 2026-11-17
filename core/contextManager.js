@@ -278,9 +278,32 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
     let usedChars = 0;
     let usedTokens = 0;
 
+    const hasSeparateCurrentPrompt = Boolean(opts.currentPrompt && String(opts.currentPrompt).trim());
+    const cleanSeparateCurrent = hasSeparateCurrentPrompt
+        ? stripInternalPromptHeaders(String(opts.currentPrompt)).trim()
+        : '';
+
     for (let i = turnGroups.length - 1; i >= 0; i--) {
         const group = turnGroups[i];
         const isNewestTurn = i === turnGroups.length - 1;
+        const hasAssistantReply = group.some(m => m.role === 'assistant');
+
+        // R3: If a prior turn group has NO assistant reply (e.g. CLI spawn failed, request failed,
+        // or turn was cancelled before any output), do NOT re-inject the unanswered user prompt
+        // into subsequent turns (prevents both duplicate prompt injection on retry and unintended
+        // re-execution of side-effecting requests).
+        if (!hasAssistantReply && (hasSeparateCurrentPrompt || !isNewestTurn)) {
+            continue;
+        }
+        if (
+            hasSeparateCurrentPrompt &&
+            group.length === 1 &&
+            group[0].role === 'user' &&
+            stripInternalPromptHeaders(group[0].content).trim() === cleanSeparateCurrent
+        ) {
+            continue;
+        }
+
         const groupMsgCount = group.length;
         const groupChars = group.reduce((sum, m) => sum + m.content.length, 0);
         const groupTokens = group.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
@@ -290,7 +313,11 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
             usedChars + groupChars <= maxHistoryChars &&
             usedTokens + groupTokens <= maxHistoryTokens
         ) {
-            selectedGroupsReversed.push(group.map(m => ({role: m.role, content: m.content})));
+            selectedGroupsReversed.push(group.map(m => ({
+                role: m.role,
+                content: m.content,
+                ...(m.status ? {status: m.status} : {}),
+            })));
             usedMessages += groupMsgCount;
             usedChars += groupChars;
             usedTokens += groupTokens;
@@ -299,7 +326,7 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
 
         // If even the newest group exceeds the budget AND it is the trailing current user message,
         // bound it explicitly instead of blowing past the ceiling or returning empty context!
-        if (isNewestTurn && selectedGroupsReversed.length === 0) {
+        if (!hasSeparateCurrentPrompt && isNewestTurn && selectedGroupsReversed.length === 0) {
             const latestUser = group[0];
             if (latestUser && latestUser.role === 'user') {
                 const boundedContent = latestUser.content.length > maxHistoryChars
@@ -311,7 +338,7 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
         break;
     }
 
-    return selectedGroupsReversed.reverse().flat();
+    return selectedGroupsReversed.reverse().flat().map(m => ({role: m.role, content: m.content}));
 }
 
 export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromptText, maxCharsOrOpts = 6000) {
@@ -328,7 +355,7 @@ export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromp
 
     const lines = prior.map(m => `${m.role === 'user' ? '用户' : '助手'}：${m.content}`);
     return [
-        '[以下是当前随问会话的前序上下文，请自然承接回答最新问题]',
+        '[以下是当前随问会话的前序上下文（仅供背景参考，请勿自动重复执行前序已取消或未完成的副作用操作），请自然承接回答最新问题]',
         ...lines,
         '',
         '[最新问题]',

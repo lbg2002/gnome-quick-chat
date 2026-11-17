@@ -75,8 +75,13 @@ export class CodexAdapter extends BaseBackendAdapter {
         const modeInfo = normalizeEffectiveAgentMode('codex', this._config?.mode || 'readonly', cliCaps);
         const effectiveMode = modeInfo.effectiveMode;
 
+        const ctxCfg = this._getSessionContextConfig();
         const historyBeforePrompt = this._store ? [...this._store.messages] : [];
-        const remoteId = this._store?.remoteSessionId || '';
+        const remoteId = this._store
+            ? (typeof this._store.resolveRemoteSessionForTurn === 'function'
+                ? this._store.resolveRemoteSessionForTurn('codex', ctxCfg)
+                : (this._store.remoteSessionId || ''))
+            : '';
         const promptWithDesktopEnv = augmentPromptWithDesktopContext(budgetCheck.promptText, specialDirs, {
             isFirstTurn: !remoteId,
             mode: effectiveMode,
@@ -102,6 +107,7 @@ export class CodexAdapter extends BaseBackendAdapter {
                 stdinPrompt: useCodexStdin,
             });
         } catch (prepErr) {
+            this._store?.clearRemoteSessionId('prep_failed');
             if (this._turns.isCurrent(turn)) {
                 this._turns.finalizeTurn(turn, {
                     status: turn.aborted ? 'cancelled' : 'failed',
@@ -114,7 +120,7 @@ export class CodexAdapter extends BaseBackendAdapter {
             throw prepErr;
         }
 
-        const ctxCfg = this._getSessionContextConfig();
+        const updatedCtxCfg = this._getSessionContextConfig();
         this._store?.appendMessage(
             {
                 id: turnMeta.userMessageId,
@@ -126,7 +132,7 @@ export class CodexAdapter extends BaseBackendAdapter {
                 ...(turnMeta.userTs ? {ts: turnMeta.userTs} : {}),
             },
             'codex',
-            ctxCfg
+            updatedCtxCfg
         );
 
         return spawnManagedCliTurn({
@@ -162,6 +168,7 @@ export class CodexAdapter extends BaseBackendAdapter {
             onTerminateProcess: proc => terminateTurnProcess(active, proc),
             onCleanupTempFiles: files => files.forEach(removeFileQuietly),
         });
+        this._store?.clearRemoteSessionId('turn_cancelled');
         return {aborted: true, turnId: active.id};
     }
 }

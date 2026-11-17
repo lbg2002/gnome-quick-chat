@@ -335,7 +335,7 @@ export class BackendClient {
         if (this._closed) {
             throw new Error('服务已关闭');
         }
-        if (this._store) {
+        if (this._store && this._adapter) {
             await this._adapter.restoreSession(this._store, this._getSessionContextConfig());
         }
 
@@ -364,7 +364,10 @@ export class BackendClient {
                 sessionUnsavedWarning: this._store?.lastWriteError
                     ? `历史未保存：${this._store.lastWriteError.message}`
                     : '',
+                hasUnsavedChanges: Boolean(this._store?.hasUnsavedChanges),
                 committedRevision: this._store?.revision || 0,
+                durableRevision: this._store?.durableRevision || 0,
+                failedRevisions: this._store?.failedRevisions || [],
             };
         }
         if (type === 'get_models') {
@@ -377,28 +380,79 @@ export class BackendClient {
             return {messages: this._store ? [...this._store.messages] : []};
         }
         if (type === 'flush_session') {
-            await this._store?.flush();
+            if (!this._store) {
+                return {
+                    ok: true,
+                    flushed: true,
+                    durableRevision: 0,
+                    committedRevision: 0,
+                    failedRevisions: [],
+                    hasUnsavedChanges: false,
+                    error: '',
+                };
+            }
+            return this._store.flush();
+        }
+        if (type === 'retry_save_session') {
+            if (!this._store) {
+                return {ok: false, error: '当前会话尚未初始化', hasUnsavedChanges: false};
+            }
+            const res = await this._store.retryFailedWrites();
             return {
-                flushed: true,
-                hasUnsavedChanges: Boolean(this._store?.hasUnsavedChanges),
+                ok: Boolean(res?.ok),
+                durableRevision: this._store.durableRevision,
+                committedRevision: this._store.revision,
+                failedRevisions: this._store.failedRevisions,
+                hasUnsavedChanges: Boolean(this._store.hasUnsavedChanges),
+                error: res?.error?.message || (this._store.lastWriteError?.message || ''),
             };
         }
         if (type === 'rewind_from_user_turn') {
             if (!this._store) {
                 return {ok: false, error: '当前会话尚未初始化'};
             }
-            const rewound = this._store.rewindFromUserMessage(fields.userMessageId || '');
-            if (rewound.ok) {
-                // Rewinding conversation history revokes session-scoped approvals for safety
-                this.revokeApprovedScopes();
-                await rewound.writePromise;
+            if (fields.sessionId && String(fields.sessionId) !== String(this._sessionId)) {
+                return {
+                    ok: false,
+                    error: '当前会话已切换，已取消历史回退',
+                    targetUserMessage: null,
+                    removedCount: 0,
+                    remoteSessionReset: false,
+                };
             }
+            const rewound = this._store.rewindFromUserMessage(fields.userMessageId || '');
+            if (!rewound.ok) {
+                return {
+                    ok: false,
+                    error: rewound.error || '',
+                    targetUserMessage: null,
+                    removedCount: 0,
+                    remoteSessionReset: false,
+                };
+            }
+            const writeRes = await rewound.writePromise;
+            if (!writeRes || !writeRes.ok) {
+                const errMsg = writeRes?.error?.message || String(writeRes?.error || '历史回退写入磁盘失败');
+                return {
+                    ok: false,
+                    error: errMsg,
+                    rolledBack: Boolean(writeRes?.rolledBack),
+                    targetUserMessage: null,
+                    removedCount: 0,
+                    remoteSessionReset: false,
+                };
+            }
+            // Rewinding conversation history revokes session-scoped approvals for safety
+            this.revokeApprovedScopes();
             return {
-                ok: rewound.ok,
-                error: rewound.error || '',
+                ok: true,
+                error: '',
                 targetUserMessage: rewound.targetUserMessage,
                 removedCount: rewound.removedMessages?.length || 0,
+                retainedCount: rewound.retainedCount,
                 remoteSessionReset: Boolean(rewound.remoteSessionReset),
+                committedRevision: this._store.revision,
+                durableRevision: this._store.durableRevision,
             };
         }
         if (type === 'export_session') {

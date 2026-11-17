@@ -626,6 +626,9 @@ export function createMockGio() {
             }
             spawnv(argv) {
                 const cmd = String(argv[0]);
+                if (cmd.startsWith('/') && !fs.existsSync(cmd)) {
+                    throw new Error(`Failed to execute child process "${cmd}" (No such file or directory)`);
+                }
                 const args = argv.slice(1).map(String);
                 const stdio = [
                     (this._flags & 1) ? 'pipe' : 'ignore',
@@ -805,6 +808,21 @@ export function createMockGio() {
                         if (res?._err) throw res._err;
                         return [true, ''];
                     },
+                    create_async(_flags, _prio, _cancellable, cb) {
+                        queueMicrotask(() => {
+                            try {
+                                const fd = fs.openSync(p, 'wx', 0o600);
+                                const stream = fs.createWriteStream(null, {fd});
+                                cb(this, {_stream: new MockOutputStream(stream)});
+                            } catch (err) {
+                                cb(this, {_err: err});
+                            }
+                        });
+                    },
+                    create_finish(res) {
+                        if (res?._err) throw res._err;
+                        return res._stream;
+                    },
                     replace_async(_etag, _backup, _flags, _prio, _cancellable, cb) {
                         queueMicrotask(() => {
                             try {
@@ -876,16 +894,145 @@ export function registerGiMocks() {
 
     globalThis.__qcMockGLib = createMockGLib();
     globalThis.__qcMockGio = createMockGio();
+    globalThis.__qcMockClutter = {
+        EVENT_STOP: true,
+        EVENT_PROPAGATE: false,
+        ModifierType: {SHIFT_MASK: 1, CONTROL_MASK: 4},
+        ActorAlign: {START: 1, CENTER: 2, END: 3, FILL: 0},
+        Orientation: {HORIZONTAL: 0, VERTICAL: 1},
+    };
+    globalThis.__qcMockSt = {
+        ClipboardType: {CLIPBOARD: 0},
+        Clipboard: {
+            get_default: () => ({
+                get_text: (_type, cb) => cb?.(null, ''),
+                set_text: () => {},
+            }),
+        },
+        BoxLayout: class {},
+        Button: class {},
+        Label: class {},
+        Entry: class {},
+        ScrollView: class {},
+        Widget: class {},
+        Icon: class {},
+    };
+    globalThis.__qcMockSoup = {
+        Session: class {
+            abort() {}
+        },
+        Message: {
+            new: (_method, _url) => ({
+                connect: () => 1,
+                get_uri: () => ({to_string: () => _url}),
+                get_request_headers: () => ({
+                    append: () => {},
+                    remove: () => {},
+                }),
+                get_response_headers: () => ({
+                    get_content_length: () => 0,
+                    get_one: () => null,
+                }),
+                get_status: () => 200,
+                get_reason_phrase: () => 'OK',
+                set_request_body_from_bytes: () => {},
+            }),
+        },
+    };
+    const MockConstructible = new Proxy(function MockGiClass() {}, {
+        get(_t, p) {
+            if (p === '__esModule') return false;
+            if (p === Symbol.toPrimitive) return () => 0;
+            return MockConstructible;
+        },
+        construct() {
+            return {};
+        },
+        apply() {
+            return {};
+        },
+    });
+    globalThis.__qcMockGenericGi = MockConstructible;
+    globalThis.__qcMockGnomeMain = {
+        panel: {statusArea: {}},
+        wm: {addKeybinding: () => {}, removeKeybinding: () => {}},
+        sessionMode: {isLocked: false, isGreeter: false, hasNotifications: true, connect: () => 1, disconnect: () => {}},
+        messageTray: {getSources: () => [], connect: () => 1, disconnect: () => {}},
+        notify: () => {},
+    };
+    globalThis.__qcMockExtensionBase = class Extension {
+        constructor(meta = {}) {
+            this.metadata = meta;
+        }
+        getSettings() {
+            return null;
+        }
+        openPreferences() {}
+    };
 
     registerHooks({
         resolve(specifier, context, nextResolve) {
-            if (specifier === 'gi://GLib' || specifier === 'gi://Gio') {
+            if (specifier === 'gi://GLib') {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent('export default globalThis.__qcMockGLib;')}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier === 'gi://Gio') {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent('export default globalThis.__qcMockGio;')}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier.startsWith('gi://Clutter')) {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent('export default globalThis.__qcMockClutter;')}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier.startsWith('gi://St')) {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent('export default globalThis.__qcMockSt;')}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier.startsWith('gi://Soup')) {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent('export default globalThis.__qcMockSoup;')}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier.startsWith('gi://')) {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent('export default globalThis.__qcMockGenericGi;')}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier === 'resource:///org/gnome/shell/ui/main.js') {
                 return {
                     url: `data:text/javascript,${encodeURIComponent(
-                        specifier === 'gi://GLib'
-                            ? 'export default globalThis.__qcMockGLib;'
-                            : 'export default globalThis.__qcMockGio;'
+                        'export const panel = globalThis.__qcMockGnomeMain.panel;' +
+                        'export const wm = globalThis.__qcMockGnomeMain.wm;' +
+                        'export const sessionMode = globalThis.__qcMockGnomeMain.sessionMode;' +
+                        'export const messageTray = globalThis.__qcMockGnomeMain.messageTray;' +
+                        'export const notify = globalThis.__qcMockGnomeMain.notify;' +
+                        'export default globalThis.__qcMockGnomeMain;'
                     )}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier === 'resource:///org/gnome/shell/extensions/extension.js') {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent(
+                        'export const Extension = globalThis.__qcMockExtensionBase;' +
+                        'export default {Extension: globalThis.__qcMockExtensionBase};'
+                    )}`,
+                    shortCircuit: true,
+                };
+            }
+            if (specifier.startsWith('resource://')) {
+                return {
+                    url: `data:text/javascript,${encodeURIComponent('export default {};')}`,
                     shortCircuit: true,
                 };
             }

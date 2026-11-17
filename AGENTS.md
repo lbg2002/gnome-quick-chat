@@ -49,11 +49,11 @@
 
 **已确认缺陷三**：sessionEngine.js:699–707 每次本地 append 都推进 remoteSyncedRevision，即使 CLI 尚未启动、启动失败、取消或未接收完整问题。会话 ID 仍可能被复用，导致后端遗漏本地回合；remoteSyncedRevision 不能等同于本地 revision。
 
-- [ ] 独立保存 durableRevision / pending writes / failed writes，失败记录保持可恢复；重试写入使用幂等 messageId/revision。后续成功不能抹除未解决的失败；flush 返回真实结果及失败 revision。磁盘写失败时保持未保存提示，允许重试或导出内存历史。
-- [ ] 回退为可验证事务：先准备快照，确保会话/写入身份一致并提交，再改变 UI；失败明确停止后续请求，恢复旧内存或进入可恢复错误状态。新建/删除/切换/重试通过同一互斥操作锁，await 后再次验证 sessionId/generation/busy。对 rw.ok=false 直接报错返回。
-- [ ] remoteSyncedRevision 仅在后端协议证明确认对应回合后推进；启动失败、取消、截断、未知 exit、写错误时失效远端恢复或标记不确定。下次以预算内本地上下文恢复，不自动重试有副作用的任务；避免重复注入同一问题。
-- [ ] 检查同一 sessionId 两个已加载的 SessionStore 各自独立内存 revision：共享写队列并不等于共享最新状态。约束单写者，或增加版本检查/冲突重读；旧实例不可覆盖新数据。
-- [ ] 测试：写失败 A→成功 B→重启、flush 错误、rewind 写失败、重复点击旧回答重试、rewind 与新建/删除竞争、CLI spawn failure 后 resume、取消 partial 后 resume、两个已加载实例并发写。断言磁盘/内存/UI 一致，不能靠清除错误掩盖丢失。
+- [x] 独立保存 durableRevision / pending writes / failed writes，失败记录保持可恢复；重试写入使用幂等 messageId/revision。后续成功不能抹除未解决的失败；flush 返回真实结果及失败 revision。磁盘写失败时保持未保存提示，允许重试或导出内存历史。
+- [x] 回退为可验证事务：先准备快照，确保会话/写入身份一致并提交，再改变 UI；失败明确停止后续请求，恢复旧内存或进入可恢复错误状态。新建/删除/切换/重试通过同一互斥操作锁，await 后再次验证 sessionId/generation/busy。对 rw.ok=false 直接报错返回。
+- [x] remoteSyncedRevision 仅在后端协议证明确认对应回合后推进；启动失败、取消、截断、未知 exit、写错误时失效远端恢复或标记不确定。下次以预算内本地上下文恢复，不自动重试有副作用的任务；避免重复注入同一问题。
+- [x] 检查同一 sessionId 两个已加载的 SessionStore 各自独立内存 revision：共享写队列并不等于共享最新状态。约束单写者，或增加版本检查/冲突重读；旧实例不可覆盖新数据。
+- [x] 测试：写失败 A→成功 B→重启、flush 错误、rewind 写失败、重复点击旧回答重试、rewind 与新建/删除竞争、CLI spawn failure 后 resume、取消 partial 后 resume、两个已加载实例并发写。断言磁盘/内存/UI 一致，不能靠清除错误掩盖丢失。
 
 ### R4. 冷启动仍在 Shell 主线程同步启动 CLI（P1，高优先性能）
 

@@ -1072,8 +1072,12 @@ export default class QuickChat extends Extension {
         this._historyIndex = -1;
     }
 
+    _isBusyOrMutating() {
+        return Boolean(this._chatController?.busy || this._sessionMutationLock);
+    }
+
     _retryForAssistantCard(assistantCard) {
-        if (this._chatController?.busy || !this._panel?.historyWindow) return;
+        if (this._isBusyOrMutating() || !this._panel?.historyWindow) return;
         const retryInfo = this._panel.historyWindow.findRetryTurnInfoForCard(assistantCard);
         if (!retryInfo?.promptText) return;
         this._executePromptTurn({
@@ -1090,7 +1094,7 @@ export default class QuickChat extends Extension {
     }
 
     _continueForAssistantCard(assistantCard) {
-        if (this._chatController?.busy || !assistantCard?.text?.trim()) return;
+        if (this._isBusyOrMutating() || !assistantCard?.text?.trim()) return;
         const contPrompt = buildContinuationPrompt(assistantCard.text);
         if (!contPrompt) return;
         this._executePromptTurn({
@@ -1102,7 +1106,7 @@ export default class QuickChat extends Extension {
     }
 
     _beginEditUserCard(userCard) {
-        if (this._chatController?.busy || !this._panel?.historyWindow || !userCard) return;
+        if (this._isBusyOrMutating() || !this._panel?.historyWindow || !userCard) return;
         const info = this._panel.historyWindow.findRetryTurnInfoForCard(userCard);
         if (!info?.promptText) return;
         this._editingTurnInfo = info;
@@ -1162,7 +1166,7 @@ export default class QuickChat extends Extension {
             this._cancelEditQuestion();
             return Clutter.EVENT_STOP;
         }
-        if (ctrl && (symbol === Clutter.KEY_n || symbol === Clutter.KEY_l) && !this._chatController?.busy) {
+        if (ctrl && (symbol === Clutter.KEY_n || symbol === Clutter.KEY_l) && !this._isBusyOrMutating()) {
             this._newSession();
             return Clutter.EVENT_STOP;
         }
@@ -1204,14 +1208,14 @@ export default class QuickChat extends Extension {
                     cursorAtEnd: true,
                 });
             }
-            return Clutter.EVENT_STOP;
+            return Clutter.EVENT_PROPAGATE;
         }
         return Clutter.EVENT_PROPAGATE;
     }
 
     async _send() {
         const entry = this._panel?.entry;
-        if (!entry || !this._chatController || this._chatController.busy) return;
+        if (!entry || !this._chatController || this._isBusyOrMutating()) return;
         const rawDraft = entry.get_text().trim();
         const hasAttachments = Boolean(this._attachments?.count > 0);
         if (!rawDraft && !hasAttachments) return;
@@ -1248,93 +1252,120 @@ export default class QuickChat extends Extension {
         recordHistoryText = '',
         restoreDraftOnEarlyError = '',
     } = {}) {
-        if (!promptText || !this._panel || !this._chatController || this._chatController.busy) return;
-        if (this._modelPicker?.isOpen) {
-            this._modelPicker.toggle(false);
-        }
-        if (this._panel.isSessionMenuOpen) {
-            this._panel.toggleSessionMenu(false);
-        }
-        this._panel.closeSlashMenu();
-        this._panel.setRouteSuggestion(null);
+        if (!promptText || !this._panel || !this._chatController || this._isBusyOrMutating()) return;
+        this._sessionMutationLock = true;
 
-        if (!this._chatController.ready) {
-            await this._ensureClient();
-            if (!this._chatController?.ready) return;
-        }
-        if (!this._isSessionUnlockedAndAlive() || this._chatController.busy) return;
+        let lifeGen = this._lifecycleGeneration;
+        let generation = this._chatController.clientGeneration;
+        let expectedSessionId = this._chatController.currentSessionId || this._getSettingString('session-id', '');
 
-        const lifeGen = this._lifecycleGeneration;
-        const generation = this._chatController.clientGeneration;
+        try {
+            if (this._modelPicker?.isOpen) {
+                this._modelPicker.toggle(false);
+            }
+            if (this._panel.isSessionMenuOpen) {
+                this._panel.toggleSessionMenu(false);
+            }
+            this._panel.closeSlashMenu();
+            this._panel.setRouteSuggestion(null);
 
-        if (rewindUserMessageId) {
-            try {
-                const rw = await this._chatController.client.request('rewind_from_user_turn', {
-                    userMessageId: rewindUserMessageId,
-                });
-                if (!this._isSessionUnlockedAndAlive(lifeGen) || generation !== this._chatController?.clientGeneration) {
+            if (!this._chatController.ready) {
+                await this._ensureClient();
+                if (!this._chatController?.ready) return;
+            }
+            if (!this._isSessionUnlockedAndAlive(lifeGen) || this._chatController.busy) return;
+
+            lifeGen = this._lifecycleGeneration;
+            generation = this._chatController.clientGeneration;
+            expectedSessionId = this._chatController.currentSessionId || this._getSettingString('session-id', '');
+
+            if (rewindUserMessageId) {
+                let rw = null;
+                try {
+                    rw = await this._chatController.client.request('rewind_from_user_turn', {
+                        userMessageId: rewindUserMessageId,
+                        sessionId: expectedSessionId,
+                    });
+                } catch (rwErr) {
+                    this._panel?.setStatusIndicator('error', `回退历史失败：${rwErr?.message || rwErr}`);
                     return;
                 }
-                if (rw?.ok) {
-                    this._panel.truncateMessagesFromId(rewindUserMessageId, {
-                        keepStartMessage: Boolean(reuseExistingUserCard),
-                    });
+                const currentSessionAfterAwait =
+                    this._chatController?.currentSessionId || this._getSettingString('session-id', '');
+                if (
+                    !this._isSessionUnlockedAndAlive(lifeGen) ||
+                    generation !== this._chatController?.clientGeneration ||
+                    this._chatController?.busy ||
+                    (expectedSessionId && currentSessionAfterAwait !== expectedSessionId)
+                ) {
+                    return;
                 }
-            } catch (rwErr) {
-                this._panel?.setStatusIndicator('error', `回退历史失败：${rwErr?.message || rwErr}`);
-                return;
+                if (!rw || !rw.ok) {
+                    this._panel?.setStatusIndicator('error', `回退历史失败：${rw?.error || '磁盘写入失败'}`);
+                    return;
+                }
+                this._panel.truncateMessagesFromId(rewindUserMessageId, {
+                    keepStartMessage: Boolean(reuseExistingUserCard),
+                });
             }
-        }
 
-        if (this._panel.historyWindow?.hasNewer) {
-            this._panel.restoreLatestHistoryWindow();
-        }
+            if (this._panel.historyWindow?.hasNewer) {
+                this._panel.restoreLatestHistoryWindow();
+            }
 
-        const turnId = `turn_${GLib.uuid_string_random()}`;
-        const effectiveUserMessageId = userMessageId || `user_${GLib.uuid_string_random()}`;
-        const messageId = `msg_${GLib.uuid_string_random()}`;
-        const shownUserText = displayUserText || promptText;
+            const turnId = `turn_${GLib.uuid_string_random()}`;
+            const effectiveUserMessageId = userMessageId || `user_${GLib.uuid_string_random()}`;
+            const messageId = `msg_${GLib.uuid_string_random()}`;
+            const shownUserText = displayUserText || promptText;
 
-        this._chatController.activeTurnState = {
-            turnId,
-            userMessageId: effectiveUserMessageId,
-            messageId,
-            sessionId: this._chatController.currentSessionId || '',
-            clientGeneration: generation,
-            lifecycleGeneration: lifeGen,
-            state: 'starting',
-        };
-
-        if (recordHistoryText) {
-            this._recordPromptHistory(recordHistoryText);
-        }
-        if (clearEditState) {
-            this._cancelEditQuestion({keepEntry: true});
-        }
-        if (clearEntry && this._panel.entry) {
-            this._panel.setEntryTextProgrammatically('', {focus: false, cursorAtEnd: true});
-        }
-        if (clearAttachments && this._attachments) {
-            this._attachments.clear();
-            this._refreshAttachmentBarUi();
-        }
-
-        if (!reuseExistingUserCard) {
-            this._panel.addMessage('user', shownUserText, {
-                rawPromptText: promptText,
-                animate: true,
+            this._chatController.activeTurnState = {
                 turnId,
-                messageId: effectiveUserMessageId,
-                ...(userCreatedAt ? {createdAt: userCreatedAt} : {}),
-                ...(userTs ? {ts: userTs} : {}),
-            });
-        } else {
-            this._panel.scrollBottom(true, true);
+                userMessageId: effectiveUserMessageId,
+                messageId,
+                sessionId: expectedSessionId,
+                clientGeneration: generation,
+                lifecycleGeneration: lifeGen,
+                state: 'starting',
+            };
+
+            if (recordHistoryText) {
+                this._recordPromptHistory(recordHistoryText);
+            }
+            if (clearEditState) {
+                this._cancelEditQuestion({keepEntry: true});
+            }
+            if (clearEntry && this._panel.entry) {
+                this._panel.setEntryTextProgrammatically('', {focus: false, cursorAtEnd: true});
+            }
+            if (clearAttachments && this._attachments) {
+                this._attachments.clear();
+                this._refreshAttachmentBarUi();
+            }
+
+            if (!reuseExistingUserCard) {
+                this._panel.addMessage('user', shownUserText, {
+                    rawPromptText: promptText,
+                    animate: true,
+                    turnId,
+                    messageId: effectiveUserMessageId,
+                    ...(userCreatedAt ? {createdAt: userCreatedAt} : {}),
+                    ...(userTs ? {ts: userTs} : {}),
+                });
+            } else {
+                this._panel.scrollBottom(true, true);
+            }
+
+            this._live = null;
+            this._setBusy(true);
+            this._panel.setStatusIndicator('busy', '思考与生成中…');
+        } finally {
+            this._sessionMutationLock = false;
         }
 
-        this._live = null;
-        this._setBusy(true);
-        this._panel.setStatusIndicator('busy', '思考与生成中…');
+        const activeTurn = this._chatController?.activeTurnState;
+        if (!activeTurn) return;
+        const {turnId, userMessageId: effectiveUserMessageId, messageId} = activeTurn;
+        const shownUserText = displayUserText || promptText;
 
         try {
             const result = await this._chatController.client.request('prompt', {
@@ -2356,7 +2387,7 @@ export default class QuickChat extends Extension {
     }
 
     async _restoreSessionById(targetSessionId) {
-        if (!this._chatController || this._chatController.busy) return;
+        if (!this._chatController || this._isBusyOrMutating()) return;
         let validTarget = '';
         try {
             validTarget = validateSessionId(targetSessionId);
@@ -2366,20 +2397,31 @@ export default class QuickChat extends Extension {
         const currentId = this._getSettingString('session-id', '');
         if (validTarget === currentId) return;
 
+        this._sessionMutationLock = true;
         const lifeGen = this._lifecycleGeneration;
-        const prevClient = this._chatController.client;
-        prevClient?.revokeApprovedScopes?.();
-        if (prevClient) {
-            try { await prevClient.request('flush_session'); } catch (_) {}
-        }
-        if (!this._isSessionUnlockedAndAlive(lifeGen) || this._chatController.busy) return;
+        try {
+            const prevClient = this._chatController.client;
+            prevClient?.revokeApprovedScopes?.();
+            if (prevClient) {
+                try { await prevClient.request('flush_session'); } catch (_) {}
+            }
+            if (
+                !this._isSessionUnlockedAndAlive(lifeGen) ||
+                this._chatController.busy ||
+                this._getSettingString('session-id', '') !== currentId
+            ) {
+                return;
+            }
 
-        this._rememberPreviousNonEmptySessionId(currentId);
-        this._resetTransientComposerState();
-        this._chatController.stopClient();
-        this._settings.set_string('session-id', validTarget);
-        this._ensureClient();
-        this._panel?.entry?.grab_key_focus();
+            this._rememberPreviousNonEmptySessionId(currentId);
+            this._resetTransientComposerState();
+            this._chatController.stopClient();
+            this._settings.set_string('session-id', validTarget);
+            this._ensureClient();
+            this._panel?.entry?.grab_key_focus();
+        } finally {
+            this._sessionMutationLock = false;
+        }
     }
 
     async _exportCurrentSession() {
@@ -2407,26 +2449,37 @@ export default class QuickChat extends Extension {
     }
 
     async _deleteCurrentSession() {
-        if (!this._chatController || this._chatController.busy) return;
+        if (!this._chatController || this._isBusyOrMutating()) return;
+        this._sessionMutationLock = true;
         const lifeGen = this._lifecycleGeneration;
         const victimId = this._getSettingString('session-id', '');
 
-        this._chatController.client?.revokeApprovedScopes?.();
-        this._chatController.stopClient();
-        if (this._hasKey('previous-session-id') && this._getSettingString('previous-session-id', '') === victimId) {
-            this._settings.set_string('previous-session-id', '');
-        }
-
         try {
-            await deleteStoredSessionAsync(victimId);
-        } catch (_) {}
-        if (!this._isSessionUnlockedAndAlive(lifeGen) || this._chatController.busy) return;
+            this._chatController.client?.revokeApprovedScopes?.();
+            this._chatController.stopClient();
+            if (this._hasKey('previous-session-id') && this._getSettingString('previous-session-id', '') === victimId) {
+                this._settings.set_string('previous-session-id', '');
+            }
 
-        this._resetTransientComposerState();
-        this._settings.set_string('session-id', GLib.uuid_string_random());
-        this._panel?.clearMessages();
-        this._ensureClient();
-        this._panel?.entry?.grab_key_focus();
+            try {
+                await deleteStoredSessionAsync(victimId);
+            } catch (_) {}
+            if (
+                !this._isSessionUnlockedAndAlive(lifeGen) ||
+                this._chatController.busy ||
+                this._getSettingString('session-id', '') !== victimId
+            ) {
+                return;
+            }
+
+            this._resetTransientComposerState();
+            this._settings.set_string('session-id', GLib.uuid_string_random());
+            this._panel?.clearMessages();
+            this._ensureClient();
+            this._panel?.entry?.grab_key_focus();
+        } finally {
+            this._sessionMutationLock = false;
+        }
     }
 
     async _approveRetentionCleanup(candidateIds = []) {
@@ -2475,31 +2528,45 @@ export default class QuickChat extends Extension {
     }
 
     async _newSession() {
-        if (!this._chatController || this._chatController.busy) return;
-        if (this._modelPicker?.isOpen) {
-            this._modelPicker.toggle(false);
-        }
+        if (!this._chatController || this._isBusyOrMutating()) return;
+        this._sessionMutationLock = true;
+        const lifeGen = this._lifecycleGeneration;
         const currentId = this._getSettingString('session-id', '');
-        const prevClient = this._chatController.client;
-        prevClient?.revokeApprovedScopes?.();
-        if (prevClient) {
-            try { await prevClient.request('flush_session'); } catch (_) {}
-        }
-        if (!this._isSessionUnlockedAndAlive() || this._chatController.busy) return;
 
-        this._rememberPreviousNonEmptySessionId(currentId);
-        this._chatController.stopClient();
-        this._resetTransientComposerState();
-        this._settings.set_string('session-id', GLib.uuid_string_random());
-        this._panel?.clearMessages();
-        this._ensureClient();
-        this._panel?.entry?.grab_key_focus();
+        try {
+            if (this._modelPicker?.isOpen) {
+                this._modelPicker.toggle(false);
+            }
+            const prevClient = this._chatController.client;
+            prevClient?.revokeApprovedScopes?.();
+            if (prevClient) {
+                try { await prevClient.request('flush_session'); } catch (_) {}
+            }
+            if (
+                !this._isSessionUnlockedAndAlive(lifeGen) ||
+                this._chatController.busy ||
+                this._getSettingString('session-id', '') !== currentId
+            ) {
+                return;
+            }
+
+            this._rememberPreviousNonEmptySessionId(currentId);
+            this._chatController.stopClient();
+            this._resetTransientComposerState();
+            this._settings.set_string('session-id', GLib.uuid_string_random());
+            this._panel?.clearMessages();
+            this._ensureClient();
+            this._panel?.entry?.grab_key_focus();
+        } finally {
+            this._sessionMutationLock = false;
+        }
     }
 
     disable() {
         ++nextLifecycleGeneration;
         this._lifecycleGeneration = 0;
         this._enabled = false;
+        this._sessionMutationLock = false;
 
         this._unregisterGlobalKeybindings();
 

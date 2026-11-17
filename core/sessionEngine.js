@@ -28,6 +28,9 @@ const UTF8_ENCODER = new TextEncoder();
 // Shared cross-instance write chain keyed by canonical `sessionsRootDir::sessionId`
 // so old and new client instances never write to the same session files concurrently.
 const sharedSessionWriteChains = new Map();
+// R3: Shared cross-instance in-memory revision/state coordinator so two loaded SessionStoreEngine
+// instances for the same sessionId cannot clobber each other's revisions or messages.
+const sharedSessionCoordinatorState = new Map();
 
 function cloneDeepJson(value) {
     if (value === null || value === undefined) return value;
@@ -391,26 +394,128 @@ export class SessionStoreEngine {
             committedRevision: 0,
             updatedAt: 0,
         };
-        this.messages = [];
+        this._messages = [];
+        this._syncingCoord = false;
         this._revision = 0;
+        this._durableRevision = 0;
         this._loaded = false;
         this._loadPromise = null;
         this.lastWriteError = null;
+        this._pendingWrites = new Map();
+        this._failedWrites = new Map();
+        this._nextWriteSeq = 0;
         this.corruptLineCount = 0;
         this._initialCorruptSnapshot = null;
         this._needsLeadingNewlineOnAppend = false;
     }
 
+    get messages() {
+        if (this._loaded && !this._syncingCoord) {
+            this._syncFromCoordinator();
+        }
+        return this._messages;
+    }
+
+    set messages(next) {
+        this._messages = Array.isArray(next) ? next : [];
+    }
+
     get revision() {
+        if (!this._syncingCoord) {
+            this._syncFromCoordinator();
+        }
         return this._revision;
     }
 
+    get durableRevision() {
+        return this._durableRevision;
+    }
+
+    get pendingWriteCount() {
+        return this._pendingWrites.size;
+    }
+
+    get failedWrites() {
+        return Array.from(this._failedWrites.values()).map(item => ({
+            key: item.key,
+            operation: item.operation,
+            revision: item.revision,
+            messageId: item.messageId,
+            message: item.message,
+            timestamp: item.timestamp,
+        }));
+    }
+
+    get failedRevisions() {
+        return Array.from(this._failedWrites.values())
+            .map(item => Number(item.revision || 0))
+            .filter(rev => rev > 0);
+    }
+
     get hasUnsavedChanges() {
-        return Boolean(this.lastWriteError);
+        return this._failedWrites.size > 0 || Boolean(this.lastWriteError);
     }
 
     setSaveErrorListener(fn) {
         this._onSaveError = fn;
+    }
+
+    _publishToCoordinator(operation = '', {forceOverwrite = false} = {}) {
+        const existing = sharedSessionCoordinatorState.get(this._coordKey);
+        if (!forceOverwrite && existing && existing.revision > this._revision) {
+            return;
+        }
+        sharedSessionCoordinatorState.set(this._coordKey, {
+            revision: this._revision,
+            durableRevision: Math.max(this._durableRevision, existing?.durableRevision || 0),
+            messages: this._messages.map(cloneDeepJson),
+            meta: cloneDeepJson(this.meta),
+            needsLeadingNewlineOnAppend: this._needsLeadingNewlineOnAppend,
+            lastOperation: operation,
+            lastWriter: this,
+        });
+    }
+
+    _syncFromCoordinator() {
+        if (this._syncingCoord) return false;
+        const coord = sharedSessionCoordinatorState.get(this._coordKey);
+        if (!coord || coord.lastWriter === this) {
+            return false;
+        }
+        if (coord.revision < this._revision) {
+            return false;
+        }
+        if (coord.revision === this._revision && coord.messages.length === this._messages.length) {
+            return false;
+        }
+
+        this._syncingCoord = true;
+        try {
+            if (coord.lastOperation === 'rewind_from_user_turn' || coord.lastOperation === 'rewind_rollback') {
+                this._messages = coord.messages.map(cloneDeepJson);
+                this._revision = coord.revision;
+            } else {
+                const {messages, maxRevision} = deduplicateMessagesPreservingOrder(
+                    [...this._messages, ...coord.messages],
+                    {
+                        backend: coord.meta?.backend || this.meta.backend || '',
+                        modelId: '',
+                    }
+                );
+                this._messages = messages;
+                this._revision = Math.max(this._revision, coord.revision, maxRevision);
+            }
+
+            this.meta = {
+                ...this.meta,
+                ...cloneDeepJson(coord.meta || {}),
+                committedRevision: this._revision,
+            };
+            this._durableRevision = Math.max(this._durableRevision, Number(coord.durableRevision || 0));
+            return true;
+        } finally {
+            this._syncingCoord = false;
+        }
     }
 
     _computeSignature(backend, config) {
@@ -427,11 +532,13 @@ export class SessionStoreEngine {
      */
     load(currentBackend = '', currentConfig = {}) {
         if (this._loaded) {
+            this._syncFromCoordinator();
             this._reconcileRuntimeContext(currentBackend, currentConfig);
             return Promise.resolve();
         }
         if (this._loadPromise) {
             return this._loadPromise.then(() => {
+                this._syncFromCoordinator();
                 this._reconcileRuntimeContext(currentBackend, currentConfig);
             });
         }
@@ -500,8 +607,9 @@ export class SessionStoreEngine {
                     backend: this.meta.backend || '',
                     modelId: '',
                 });
-                this.messages = messages;
+                this._messages = messages;
                 this._revision = Math.max(Number(this.meta.committedRevision || 0), maxRevision, messages.length);
+                this._durableRevision = this._revision;
                 this.meta.committedRevision = this._revision;
 
                 if (linesRaw && !linesRaw.endsWith('\n')) {
@@ -523,8 +631,16 @@ export class SessionStoreEngine {
                         .join('\n') + '\n';
                     this._enqueueWrite('isolate_corrupt_lines', async () => {
                         await this._io.appendLine(this.corruptPath, isolationPayload);
-                    });
+                    }, {isAuxWrite: true});
                 }
+            } else {
+                this._durableRevision = this._revision;
+            }
+            const coord = sharedSessionCoordinatorState.get(this._coordKey);
+            if (coord && coord.revision > this._revision && sharedSessionWriteChains.has(this._coordKey)) {
+                this._syncFromCoordinator();
+            } else {
+                this._publishToCoordinator('load', {forceOverwrite: true});
             }
             return;
         }
@@ -560,6 +676,7 @@ export class SessionStoreEngine {
                         committedRevision: this._revision,
                         updatedAt: parsed.updatedAt || Date.now(),
                     };
+                    this._publishToCoordinator('migrate_legacy_json', {forceOverwrite: true});
                     const snapshotMessages = this.messages.map(cloneDeepJson);
                     const snapshotMeta = cloneDeepJson(this.meta);
                     const snapshotEvicted = compacted.evicted;
@@ -572,10 +689,13 @@ export class SessionStoreEngine {
                         await this._io.replaceFile(this.jsonlPath, body);
                         await this._io.replaceFile(this.metaPath, JSON.stringify(snapshotMeta, null, 2));
                         await this._io.unlink?.(this.legacyPath);
-                    });
+                    }, {revision: this._revision, isFullSnapshot: true});
                 }
             }
+            return;
         }
+
+        this._publishToCoordinator('load_empty', {forceOverwrite: true});
     }
 
     _reconcileRuntimeContext(currentBackend, currentConfig) {
@@ -592,12 +712,15 @@ export class SessionStoreEngine {
         const nextSig = this._computeSignature(currentBackend, currentConfig);
         const prevSig = this.meta.contextSignature || this.meta.modelSignature || '';
 
-        // Invalidate remoteSessionId if backend/model/endpoint/workspace/mode changed OR
-        // if local conversation advanced (e.g. turns occurred on another backend) past remoteSyncedRevision!
+        // R3: Invalidate remoteSessionId if backend/model/endpoint/workspace/mode changed,
+        // if local conversation advanced past remoteSyncedRevision, if remoteSyncedRevision was never
+        // confirmed (<= 0 while _revision > 0), or if there are unsaved disk write errors!
         const hasUnsyncedTurns = Boolean(
             this.meta.remoteSessionId &&
-            Number(this.meta.remoteSyncedRevision || 0) > 0 &&
-            this._revision > Number(this.meta.remoteSyncedRevision)
+            (
+                (this._revision > 0 && Number(this.meta.remoteSyncedRevision || 0) !== this._revision) ||
+                this.hasUnsavedChanges
+            )
         );
         const backendChanged = Boolean(this.meta.backend && this.meta.backend !== currentBackend);
         const signatureChanged = Boolean(prevSig && nextSig && prevSig !== nextSig);
@@ -613,45 +736,85 @@ export class SessionStoreEngine {
     }
 
     get remoteSessionId() {
+        this._syncFromCoordinator();
         return this.meta.remoteSessionId || '';
     }
 
+    /**
+     * R3: Verifies whether `remoteSessionId` is safe to pass to `--resume` / `codex exec resume`
+     * for a new turn. If any prior local turn was not confirmed by the backend (`remoteSyncedRevision !== _revision`)
+     * or disk writes failed, invalidates `remoteSessionId` so the adapter falls back to local context.
+     */
+    resolveRemoteSessionForTurn(backend, config = {}) {
+        this._syncFromCoordinator();
+        this._reconcileRuntimeContext(backend, config);
+        if (!this.meta.remoteSessionId) {
+            return '';
+        }
+        return this.meta.remoteSessionId;
+    }
+
     clearRemoteSessionId(reason = '') {
-        if (!this.meta.remoteSessionId) return Promise.resolve();
+        this._syncFromCoordinator();
+        if (!this.meta.remoteSessionId && !this.meta.remoteSyncedRevision) {
+            return Promise.resolve({ok: true});
+        }
         this.meta.remoteSessionId = '';
         this.meta.remoteSyncedRevision = 0;
         this.meta.updatedAt = Date.now();
         if (reason) {
             this.meta.lastRemoteResetReason = String(reason).slice(0, 240);
         }
+        this._publishToCoordinator('clear_remote_session');
         const metaSnapshot = cloneDeepJson({...this.meta, committedRevision: this._revision});
         return this._enqueueWrite('clear_remote_session', async () => {
             await this._io.replaceFile(this.metaPath, JSON.stringify(metaSnapshot, null, 2));
-        });
+        }, {revision: this._revision, isMetaOnly: true});
     }
 
-    setRemoteSessionId(remoteId, backend, config) {
+    setRemoteSessionId(remoteId, backend, config, {markSynced = true} = {}) {
+        this._syncFromCoordinator();
         const clean = String(remoteId || '').trim();
         const sig = this._computeSignature(backend, config);
+        const targetSyncedRev = !clean
+            ? 0
+            : (markSynced ? this._revision : Number(this.meta.remoteSyncedRevision || 0));
         if (
             this.meta.remoteSessionId === clean &&
             this.meta.backend === backend &&
             this.meta.contextSignature === sig &&
-            this.meta.remoteSyncedRevision === this._revision
+            this.meta.remoteSyncedRevision === targetSyncedRev
         ) {
-            return Promise.resolve();
+            return Promise.resolve({ok: true});
         }
         this.meta.remoteSessionId = clean;
         this.meta.backend = backend || this.meta.backend;
         this.meta.contextSignature = sig;
         this.meta.modelSignature = sig;
-        this.meta.remoteSyncedRevision = clean ? this._revision : 0;
+        this.meta.remoteSyncedRevision = targetSyncedRev;
         this.meta.updatedAt = Date.now();
+        this._publishToCoordinator('set_remote_session');
 
         const metaSnapshot = cloneDeepJson({...this.meta, committedRevision: this._revision});
         return this._enqueueWrite('set_remote_session', async () => {
             await this._io.replaceFile(this.metaPath, JSON.stringify(metaSnapshot, null, 2));
-        });
+        }, {revision: this._revision, isMetaOnly: true});
+    }
+
+    /**
+     * R3: Advances `remoteSyncedRevision` ONLY after a backend turn has completed cleanly
+     * and both user + assistant messages for that turn have been appended.
+     */
+    confirmRemoteTurnSynced(remoteId = '', backend = '', config = {}) {
+        this._syncFromCoordinator();
+        if (this.hasUnsavedChanges) {
+            return this.clearRemoteSessionId('write_error_unsynced');
+        }
+        const clean = String(remoteId || this.meta.remoteSessionId || '').trim();
+        if (!clean) {
+            return Promise.resolve({ok: false});
+        }
+        return this.setRemoteSessionId(clean, backend || this.meta.backend, config, {markSynced: true});
     }
 
     /**
@@ -661,6 +824,7 @@ export class SessionStoreEngine {
      * and #202/#203 append ONLY their own lines — zero duplicates, zero dropped records!
      */
     appendMessage(message, backend = '', config = {}) {
+        this._syncFromCoordinator();
         const rev = ++this._revision;
         let lastUserId = '';
         for (let i = this.messages.length - 1; i >= 0; i--) {
@@ -702,9 +866,8 @@ export class SessionStoreEngine {
             this.meta.contextSignature = sig;
             this.meta.modelSignature = sig;
         }
-        if (this.meta.remoteSessionId && this.meta.backend === (backend || this.meta.backend)) {
-            this.meta.remoteSyncedRevision = rev;
-        }
+        // R3: Do NOT advance `this.meta.remoteSyncedRevision` on local append!
+        // `remoteSyncedRevision` is only advanced when the backend protocol confirms turn completion.
         this.meta.committedRevision = rev;
         this.meta.updatedAt = record.ts;
 
@@ -725,6 +888,8 @@ export class SessionStoreEngine {
             fullSnapshotForInPlaceUpdate = this.messages.map(cloneDeepJson);
         }
 
+        this._publishToCoordinator('append_message');
+
         const metaSnapshot = cloneDeepJson(this.meta);
         const hadPriorCorruptLines = this.corruptLineCount > 0;
         const corruptOriginalSnapshot = this._initialCorruptSnapshot;
@@ -732,7 +897,8 @@ export class SessionStoreEngine {
         if (prependLeadingNewline) {
             this._needsLeadingNewlineOnAppend = false;
         }
-        if (compactionResult.compacted || fullSnapshotForInPlaceUpdate) {
+        const isFullSnapshotWrite = Boolean(compactionResult.compacted || fullSnapshotForInPlaceUpdate);
+        if (isFullSnapshotWrite) {
             this._needsLeadingNewlineOnAppend = false;
         }
 
@@ -740,7 +906,7 @@ export class SessionStoreEngine {
         let jsonlWritten = false;
 
         return this._enqueueWrite('append_message', async () => {
-            if (compactionResult.compacted || fullSnapshotForInPlaceUpdate) {
+            if (isFullSnapshotWrite) {
                 // Never overwrite the sole copy if corrupt lines were seen earlier without backing up first!
                 if (hadPriorCorruptLines) {
                     const backupPath = `${this.jsonlPath}.corrupt-backup`;
@@ -773,6 +939,10 @@ export class SessionStoreEngine {
                 jsonlWritten = true;
             }
             await this._io.replaceFile(this.metaPath, JSON.stringify(metaSnapshot, null, 2));
+        }, {
+            revision: rev,
+            messageId: record.id,
+            isFullSnapshot: isFullSnapshotWrite,
         });
     }
 
@@ -780,13 +950,15 @@ export class SessionStoreEngine {
      * Rewinds session history cleanly to the point right BEFORE `targetMessageId`'s user turn
      * (used by in-place Regenerate `↻` and Edit Question `✎`).
      *
-     * Architectural Invariant (Stage F3):
-     * Because external CLI `resume` (`--resume` / `codex exec resume`) cannot roll back remote session turns,
-     * rewinding history ALWAYS invalidates `remoteSessionId` (`remoteSessionReset: true`) so the next turn
-     * starts a fresh CLI session and reconstructs exact local context via `buildCrossBackendPromptWithContext`
-     * — NEVER pretending remote history rolled back!
+     * Architectural Invariant (Stage F3 & R3):
+     * 1. Because external CLI `resume` (`--resume` / `codex exec resume`) cannot roll back remote session turns,
+     *    rewinding history ALWAYS invalidates `remoteSessionId` (`remoteSessionReset: true`) so the next turn
+     *    starts a fresh CLI session and reconstructs exact local context via `buildCrossBackendPromptWithContext`.
+     * 2. Transactional durability (R3): captures pre-rewind snapshot; if the disk write fails after retries,
+     *    rolls back in-memory `messages`, `meta`, and `_revision` so memory, disk, and UI never diverge!
      */
     rewindFromUserMessage(targetMessageId, {archiveRemoved = true} = {}) {
+        this._syncFromCoordinator();
         const cleanId = String(targetMessageId || '').trim();
         if (!cleanId) {
             return {
@@ -795,7 +967,7 @@ export class SessionStoreEngine {
                 removedMessages: [],
                 targetUserMessage: null,
                 remoteSessionReset: false,
-                writePromise: Promise.resolve(),
+                writePromise: Promise.resolve({ok: false, error: new Error('缺少需要回退的消息标识')}),
             };
         }
 
@@ -824,9 +996,15 @@ export class SessionStoreEngine {
                 removedMessages: [],
                 targetUserMessage: null,
                 remoteSessionReset: false,
-                writePromise: Promise.resolve(),
+                writePromise: Promise.resolve({ok: false, error: new Error('未在当前会话中找到对应的提问记录')}),
             };
         }
+
+        // Capture full pre-rewind state for transactional rollback if disk commit fails
+        const prevMessagesSnapshot = this.messages.map(cloneDeepJson);
+        const prevMetaSnapshot = cloneDeepJson(this.meta);
+        const prevRevision = this._revision;
+        const prevNeedsNewline = this._needsLeadingNewlineOnAppend;
 
         const targetUserMessage = cloneDeepJson(this.messages[splitIdx]);
         const removedMessages = this.messages.slice(splitIdx).map(cloneDeepJson);
@@ -841,6 +1019,8 @@ export class SessionStoreEngine {
         this.meta.committedRevision = rev;
         this.meta.updatedAt = Date.now();
         this._needsLeadingNewlineOnAppend = false;
+
+        this._publishToCoordinator('rewind_from_user_turn');
 
         const metaSnapshot = cloneDeepJson(this.meta);
         const hadPriorCorruptLines = this.corruptLineCount > 0;
@@ -870,6 +1050,17 @@ export class SessionStoreEngine {
                 jsonlWritten = true;
             }
             await this._io.replaceFile(this.metaPath, JSON.stringify(metaSnapshot, null, 2));
+        }, {
+            revision: rev,
+            isFullSnapshot: true,
+            dontRecordFailedWriteOnRollback: true,
+            onRollback: () => {
+                this.messages = prevMessagesSnapshot.map(cloneDeepJson);
+                this.meta = cloneDeepJson(prevMetaSnapshot);
+                this._revision = prevRevision;
+                this._needsLeadingNewlineOnAppend = prevNeedsNewline;
+                this._publishToCoordinator('rewind_rollback', {forceOverwrite: true});
+            },
         });
 
         return {
@@ -882,11 +1073,81 @@ export class SessionStoreEngine {
         };
     }
 
-    flush() {
-        return sharedSessionWriteChains.get(this._coordKey) || Promise.resolve();
+    /**
+     * R3: Idempotently re-persists the full in-memory deduplicated message history and metadata
+     * to recover from earlier failed incremental writes without losing or duplicating records.
+     */
+    retryFailedWrites() {
+        this._syncFromCoordinator();
+        const {messages, maxRevision} = deduplicateMessagesPreservingOrder(this.messages, {
+            backend: this.meta.backend || '',
+            modelId: '',
+        });
+        this.messages = messages;
+        this._revision = Math.max(this._revision, maxRevision, messages.length);
+        this.meta.committedRevision = this._revision;
+        this.meta.updatedAt = Date.now();
+        this._needsLeadingNewlineOnAppend = false;
+
+        this._publishToCoordinator('retry_failed_writes');
+
+        const snapshotMessages = this.messages.map(cloneDeepJson);
+        const snapshotMeta = cloneDeepJson(this.meta);
+        const targetRev = this._revision;
+
+        return this._enqueueWrite('retry_failed_writes', async () => {
+            const jsonlBody = snapshotMessages.map(m => JSON.stringify(m)).join('\n')
+                + (snapshotMessages.length ? '\n' : '');
+            await this._io.replaceFile(this.jsonlPath, jsonlBody);
+            await this._io.replaceFile(this.metaPath, JSON.stringify(snapshotMeta, null, 2));
+        }, {
+            revision: targetRev,
+            isFullSnapshot: true,
+        });
     }
 
-    _enqueueWrite(operation, taskFn) {
+    async flush() {
+        const activeChain = sharedSessionWriteChains.get(this._coordKey);
+        if (activeChain) {
+            try {
+                await activeChain;
+            } catch (_) {}
+        }
+        this._syncFromCoordinator();
+        const isClean = this._failedWrites.size === 0 && !this.lastWriteError;
+        return {
+            ok: isClean,
+            flushed: isClean,
+            durableRevision: this._durableRevision,
+            committedRevision: this._revision,
+            pendingWriteCount: this._pendingWrites.size,
+            failedRevisions: this.failedRevisions,
+            failedWrites: this.failedWrites,
+            hasUnsavedChanges: this.hasUnsavedChanges,
+            error: this.lastWriteError ? this.lastWriteError.message : '',
+        };
+    }
+
+    _enqueueWrite(operation, taskFn, {
+        revision = 0,
+        messageId = '',
+        isFullSnapshot = false,
+        isMetaOnly = false,
+        isAuxWrite = false,
+        dontRecordFailedWriteOnRollback = false,
+        onRollback = null,
+    } = {}) {
+        const writeId = ++this._nextWriteSeq;
+        const effectiveRev = Number(revision || this._revision || 0);
+        if (!isAuxWrite) {
+            this._pendingWrites.set(writeId, {
+                writeId,
+                operation,
+                revision: effectiveRev,
+                messageId: String(messageId || ''),
+            });
+        }
+
         const prevChain = sharedSessionWriteChains.get(this._coordKey) || Promise.resolve();
         const nextChain = prevChain
             .catch(() => {})
@@ -896,8 +1157,38 @@ export class SessionStoreEngine {
                 for (let attempt = 1; attempt <= totalAttempts; attempt++) {
                     try {
                         await taskFn();
-                        this.lastWriteError = null;
-                        return {ok: true};
+                        this._pendingWrites.delete(writeId);
+
+                        if (isFullSnapshot) {
+                            // Full snapshot write durably commits all messages up to effectiveRev
+                            for (const [k, item] of this._failedWrites.entries()) {
+                                if (!item.revision || item.revision <= effectiveRev) {
+                                    this._failedWrites.delete(k);
+                                }
+                            }
+                            if (this._failedWrites.size === 0) {
+                                this.lastWriteError = null;
+                                this._durableRevision = Math.max(this._durableRevision, effectiveRev);
+                            }
+                        } else if (!isAuxWrite && !isMetaOnly) {
+                            // R3: Incremental write success MUST NOT clear earlier unresolved failedWrites!
+                            if (this._failedWrites.size === 0) {
+                                this.lastWriteError = null;
+                                this._durableRevision = Math.max(this._durableRevision, effectiveRev);
+                            }
+                        } else if (isMetaOnly && this._failedWrites.size === 0) {
+                            this.lastWriteError = null;
+                        }
+
+                        const coord = sharedSessionCoordinatorState.get(this._coordKey);
+                        if (coord && this._durableRevision > (coord.durableRevision || 0)) {
+                            coord.durableRevision = this._durableRevision;
+                        }
+                        return {
+                            ok: true,
+                            durableRevision: this._durableRevision,
+                            hasUnsavedChanges: this.hasUnsavedChanges,
+                        };
                     } catch (err) {
                         lastErr = err;
                         if (attempt < totalAttempts) {
@@ -905,22 +1196,53 @@ export class SessionStoreEngine {
                         }
                     }
                 }
+
+                this._pendingWrites.delete(writeId);
+                let rolledBack = false;
+                if (typeof onRollback === 'function') {
+                    try {
+                        onRollback();
+                        rolledBack = true;
+                    } catch (_) {}
+                }
+
                 const errMsg = lastErr?.message || String(lastErr || '未知磁盘写入错误');
-                this.lastWriteError = {
+                const failEntry = {
+                    key: effectiveRev > 0 ? `rev:${effectiveRev}` : `op:${writeId}`,
                     operation,
+                    revision: effectiveRev,
+                    messageId: String(messageId || ''),
                     message: errMsg,
+                    error: lastErr,
                     timestamp: Date.now(),
                 };
+                if (!dontRecordFailedWriteOnRollback || !rolledBack) {
+                    this._failedWrites.set(failEntry.key, failEntry);
+                    this.lastWriteError = {
+                        operation,
+                        revision: effectiveRev,
+                        messageId: String(messageId || ''),
+                        message: errMsg,
+                        timestamp: failEntry.timestamp,
+                    };
+                }
                 console.warn(`[Quick Chat] 会话保存失败 (${this.sessionId} / ${operation}): ${errMsg}`);
                 try {
                     this._onSaveError?.({
                         sessionId: this.sessionId,
                         operation,
+                        revision: effectiveRev,
+                        messageId: String(messageId || ''),
                         message: `历史未保存：${errMsg}`,
                         error: lastErr,
                     });
                 } catch (_) {}
-                return {ok: false, error: lastErr};
+                return {
+                    ok: false,
+                    error: lastErr,
+                    rolledBack,
+                    failedRevisions: this.failedRevisions,
+                };
             });
 
         sharedSessionWriteChains.set(this._coordKey, nextChain);
