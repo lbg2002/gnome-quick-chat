@@ -27,10 +27,10 @@
 
 **已确认缺陷**：extension.js:1446–1456 提交问题回答时发送 decision='allow' 加 modifiedInput；backends/zcodeAdapter.js:304–317 仅支持 allow/deny；zcodeBridge.cjs:190–225 只有 decision='modify' 才读取 modifiedInput，allow + AskUserQuestion 则构建 answers={}。因此用户填写的真实答案在生产链路会被丢弃并被当作交由 AI 自行判断，即使 UI 显示已回答。现有 bridge 单测直接传 modify 并不能覆盖整条链路。
 
-- [ ] 明确协议 decision = allow | deny | modify。extension、adapter、bridge 保持一致，普通批准不可偷偷携带修改参数；仅允许当前已验证的交互问题使用 modify，校验 questions/answers 结构及问题 ID，拒绝其他工具的任意 modifiedInput。保留显式“交由 AI 判断”的空 answers 语义。
-- [ ] 验收：真实 adapter 序列化 → bridge stdin 接收 → broker resolution 逐层断言，自定义回答、多选、跳过、取消；确保用户选择不丢失。严格模式下缺失或不匹配 turnId 均拒绝（bridge:496–499 当前只在双方非空时比较）。
-- [ ] **审批确认仍未真正完成**：zcodeAdapter.js:320–332 在管道写完时就 leaveApproval、增加 approvedScopes；extension.js:1482–1505、1566–1599 又直接显示运行并提前放行其他同 scope 节点。bridge 已有 quickchat.permission_resolved（480–541），但 host 没有以它作为唯一确认。改为发送中 → 等待权威 ACK → resolved/拒绝/超时；仅在对应 bridge ACK 且 scopeKey 匹配后保存会话授权；收到已拒绝/超时 ACK 后，迟到的 write success 不得覆盖状态或扩大授权。所有审批请求按 turnId/requestId 跟踪、串行化 stdin 写入、明确 ack 超时、重试幂等；不能因管道写成功就解除 watchdog。多审批的自动放行只由 bridge 的各 requestId resolved 事件驱动。
-- [ ] 回归：模拟管道成功但请求已过期、拒绝 ACK 先于写回调、ACK 丢失、重复响应、并行审批、取消后 B 开始；断言 pendingApprovals、approvedScopes、UI 三者一致。不要真实执行危险命令。
+- [x] 明确协议 decision = allow | deny | modify。extension、adapter、bridge 保持一致，普通批准不可偷偷携带修改参数；仅允许当前已验证的交互问题使用 modify，校验 questions/answers 结构及问题 ID，拒绝其他工具的任意 modifiedInput。保留显式“交由 AI 判断”的空 answers 语义。
+- [x] 验收：真实 adapter 序列化 → bridge stdin 接收 → broker resolution 逐层断言，自定义回答、多选、跳过、取消；确保用户选择不丢失。严格模式下缺失或不匹配 turnId 均拒绝（bridge:496–499 当前只在双方非空时比较）。
+- [x] **审批确认仍未真正完成**：zcodeAdapter.js:320–332 在管道写完时就 leaveApproval、增加 approvedScopes；extension.js:1482–1505、1566–1599 又直接显示运行并提前放行其他同 scope 节点。bridge 已有 quickchat.permission_resolved（480–541），但 host 没有以它作为唯一确认。改为发送中 → 等待权威 ACK → resolved/拒绝/超时；仅在对应 bridge ACK 且 scopeKey 匹配后保存会话授权；收到已拒绝/超时 ACK 后，迟到的 write success 不得覆盖状态或扩大授权。所有审批请求按 turnId/requestId 跟踪、串行化 stdin 写入、明确 ack 超时、重试幂等；不能因管道写成功就解除 watchdog。多审批的自动放行只由 bridge 的各 requestId resolved 事件驱动。
+- [x] 回归：模拟管道成功但请求已过期、拒绝 ACK 先于写回调、ACK 丢失、重复响应、并行审批、取消后 B 开始；断言 pendingApprovals、approvedScopes、UI 三者一致。不要真实执行危险命令。
 
 ### R2. 进程树、取消和桥接安全（P0）
 

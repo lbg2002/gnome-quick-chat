@@ -1222,3 +1222,162 @@ export function computePermissionScope(toolName, summaryOrInput = '', context = 
         ...context,
     });
 }
+
+/**
+ * Shared authoritative validator for `permission_response` payloads across GJS (`ZCodeAdapter`)
+ * and Node/Electron (`zcodeBridge.cjs`).
+ *
+ * Rules (Stage R1):
+ * 1. `decision` must be `'allow' | 'deny' | 'modify'`.
+ * 2. Ordinary `'allow'` or `'deny'` decisions MUST NOT carry `modifiedInput`.
+ * 3. Only verified interactive question tools (`AskUserQuestion`) may use `decision === 'modify'`.
+ * 4. For `decision === 'modify'`, `modifiedInput` must be a plain object with `questions` (Array)
+ *    and `answers` (plain object), every question must match the pending request's questions,
+ *    and every answer key must match a known question identifier (`id` or `question`) with
+ *    string (or string[]) values. Empty `answers: {}` is preserved for explicit "交由 AI 判断".
+ */
+export function validatePermissionResponsePayload(msg, pendingContext = {}) {
+    if (!msg || typeof msg !== 'object') {
+        return {valid: false, reason: 'invalid_response_object'};
+    }
+
+    const decision = typeof msg.decision === 'string' ? msg.decision.trim() : '';
+    if (decision !== 'allow' && decision !== 'deny' && decision !== 'modify') {
+        return {valid: false, reason: 'invalid_decision'};
+    }
+
+    const hasModifiedInput = msg.modifiedInput !== undefined && msg.modifiedInput !== null;
+    if (decision !== 'modify' && hasModifiedInput) {
+        return {valid: false, reason: 'modified_input_forbidden_for_decision'};
+    }
+
+    const toolName = String(pendingContext?.toolName || msg.toolName || '').trim();
+    const rawInput = pendingContext?.input !== undefined ? pendingContext.input : null;
+    const ruleId = String(pendingContext?.ruleId || '').trim();
+    const isQuestionTool = Boolean(
+        pendingContext?.isQuestion ||
+        (toolName ? classifyTool(toolName, rawInput, ruleId).kind === 'question' : false)
+    );
+
+    if (decision === 'modify') {
+        if (toolName && !isQuestionTool) {
+            return {valid: false, reason: 'modify_forbidden_for_tool'};
+        }
+        if (!hasModifiedInput || typeof msg.modifiedInput !== 'object' || Array.isArray(msg.modifiedInput)) {
+            return {valid: false, reason: 'invalid_modified_input'};
+        }
+
+        const modQuestions = msg.modifiedInput.questions;
+        const modAnswers = msg.modifiedInput.answers;
+        if (!Array.isArray(modQuestions) || modQuestions.length === 0) {
+            return {valid: false, reason: 'invalid_questions_structure'};
+        }
+        if (!modAnswers || typeof modAnswers !== 'object' || Array.isArray(modAnswers)) {
+            return {valid: false, reason: 'invalid_answers_structure'};
+        }
+
+        const allowedQuestionIds = new Set();
+        for (const q of modQuestions) {
+            if (!q || typeof q !== 'object' || Array.isArray(q)) {
+                return {valid: false, reason: 'invalid_question_item'};
+            }
+            const qText = typeof q.question === 'string' ? q.question.trim() : '';
+            const qId = typeof q.id === 'string' ? q.id.trim() : '';
+            if (!qText && !qId) {
+                return {valid: false, reason: 'invalid_question_item'};
+            }
+            if (qText) allowedQuestionIds.add(qText);
+            if (qId) allowedQuestionIds.add(qId);
+        }
+
+        const origQuestions = Array.isArray(rawInput?.questions)
+            ? rawInput.questions
+            : (Array.isArray(pendingContext?.questions) ? pendingContext.questions : null);
+        if (Array.isArray(origQuestions) && origQuestions.length > 0) {
+            if (modQuestions.length !== origQuestions.length) {
+                return {valid: false, reason: 'questions_mismatch'};
+            }
+            allowedQuestionIds.clear();
+            for (let i = 0; i < origQuestions.length; i++) {
+                const oq = origQuestions[i];
+                const mq = modQuestions[i];
+                const oText = typeof oq?.question === 'string' ? oq.question.trim() : '';
+                const oId = typeof oq?.id === 'string' ? oq.id.trim() : '';
+                const mText = typeof mq?.question === 'string' ? mq.question.trim() : '';
+                const mId = typeof mq?.id === 'string' ? mq.id.trim() : '';
+                if ((oText && mText && oText !== mText) || (oId && mId && oId !== mId)) {
+                    return {valid: false, reason: 'questions_mismatch'};
+                }
+                if (oText) allowedQuestionIds.add(oText);
+                if (oId) allowedQuestionIds.add(oId);
+            }
+        }
+
+        const normalizedAnswers = {};
+        for (const [rawKey, rawVal] of Object.entries(modAnswers)) {
+            const key = String(rawKey || '').trim();
+            if (!key || !allowedQuestionIds.has(key)) {
+                return {valid: false, reason: 'unknown_question_id'};
+            }
+            if (typeof rawVal === 'string') {
+                const trimmed = rawVal.trim();
+                if (trimmed) {
+                    normalizedAnswers[key] = trimmed;
+                }
+            } else if (Array.isArray(rawVal) && rawVal.every(item => typeof item === 'string')) {
+                const cleaned = rawVal.map(s => s.trim()).filter(Boolean);
+                if (cleaned.length > 0) {
+                    normalizedAnswers[key] = cleaned.join(', ');
+                }
+            } else {
+                return {valid: false, reason: 'invalid_answer_value'};
+            }
+        }
+
+        const normalizedModifiedInput = {
+            questions: Array.isArray(rawInput?.questions) && rawInput.questions.length > 0
+                ? rawInput.questions
+                : modQuestions,
+            answers: normalizedAnswers,
+        };
+        if (msg.modifiedInput.annotations && typeof msg.modifiedInput.annotations === 'object' && !Array.isArray(msg.modifiedInput.annotations)) {
+            normalizedModifiedInput.annotations = msg.modifiedInput.annotations;
+        }
+        const metaSrc = rawInput?.metadata?.source || msg.modifiedInput?.metadata?.source;
+        if (typeof metaSrc === 'string' && metaSrc.trim()) {
+            normalizedModifiedInput.metadata = {source: metaSrc.trim()};
+        }
+
+        return {
+            valid: true,
+            decision: 'modify',
+            alwaysAllow: false,
+            scopeKey: '',
+            modifiedInput: normalizedModifiedInput,
+        };
+    }
+
+    const pendingScopeKey = typeof pendingContext?.scopeKey === 'string' ? pendingContext.scopeKey.trim() : '';
+    const msgScopeKey = typeof msg.scopeKey === 'string' ? msg.scopeKey.trim() : '';
+    if (decision === 'allow' && msg.alwaysAllow && pendingScopeKey && msgScopeKey && msgScopeKey !== pendingScopeKey) {
+        return {valid: false, reason: 'scope_key_mismatch'};
+    }
+
+    const canGrantSessionScope = Boolean(
+        decision === 'allow' &&
+        msg.alwaysAllow === true &&
+        !isQuestionTool &&
+        (pendingContext?.allowSessionRule ?? Boolean(msg.allowSessionRule)) &&
+        (pendingScopeKey || msgScopeKey)
+    );
+    const effectiveScopeKey = canGrantSessionScope ? (pendingScopeKey || msgScopeKey) : '';
+
+    return {
+        valid: true,
+        decision,
+        alwaysAllow: canGrantSessionScope,
+        scopeKey: effectiveScopeKey,
+        modifiedInput: undefined,
+    };
+}
+

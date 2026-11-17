@@ -101,6 +101,8 @@ export class TurnController {
             sawDoneMarker: false,
             sawMessageEnd: false,
             pendingApprovals: new Set(),
+            approvalRequests: new Map(),
+            stdinWriteChain: Promise.resolve(),
             cleanupWatchdog: null,
             resetWatchdog: null,
             pauseWatchdog: null,
@@ -137,10 +139,43 @@ export class TurnController {
         return true;
     }
 
-    enterApproval(turn, requestId) {
+    enterApproval(turn, requestId, meta = {}) {
         if (!this.isCurrent(turn)) return false;
+        const cleanId = String(requestId || '').trim();
         const wasEmpty = turn.pendingApprovals.size === 0;
-        if (requestId) turn.pendingApprovals.add(requestId);
+        if (cleanId) {
+            turn.pendingApprovals.add(cleanId);
+            const existing = turn.approvalRequests.get(cleanId);
+            if (!existing) {
+                turn.approvalRequests.set(cleanId, {
+                    requestId: cleanId,
+                    turnId: turn.id,
+                    toolCallId: String(meta?.toolCallId || ''),
+                    toolName: String(meta?.toolName || ''),
+                    input: meta?.rawInput ?? meta?.input ?? null,
+                    questions: Array.isArray(meta?.questions) ? meta.questions : null,
+                    isQuestion: Boolean(meta?.isQuestion),
+                    scopeKey: String(meta?.scopeKey || ''),
+                    allowSessionRule: Boolean(meta?.allowSessionRule),
+                    state: 'pending_approval',
+                    requestedDecision: '',
+                    requestedAlwaysAllow: false,
+                    requestedScopeKey: '',
+                    requestedModifiedInput: undefined,
+                    inFlightPromise: null,
+                    clearAckTimer: null,
+                    ackWaiters: [],
+                    resolvedPayload: null,
+                });
+            } else {
+                if (meta?.toolName && !existing.toolName) existing.toolName = String(meta.toolName);
+                if ((meta?.rawInput || meta?.input) && !existing.input) existing.input = meta.rawInput ?? meta.input;
+                if (Array.isArray(meta?.questions) && !existing.questions) existing.questions = meta.questions;
+                if (meta?.isQuestion) existing.isQuestion = true;
+                if (meta?.scopeKey && !existing.scopeKey) existing.scopeKey = String(meta.scopeKey);
+                if (typeof meta?.allowSessionRule === 'boolean') existing.allowSessionRule = meta.allowSessionRule;
+            }
+        }
         turn.state = 'awaiting_approval';
         turn.pauseWatchdog?.();
         if (wasEmpty || turn.pendingApprovals.size > 0) {
@@ -149,10 +184,135 @@ export class TurnController {
         return true;
     }
 
+    getApprovalEntry(turn, requestId) {
+        if (!turn?.approvalRequests) return null;
+        return turn.approvalRequests.get(String(requestId || '').trim()) || null;
+    }
+
+    markApprovalWriteCompleted(turn, requestId) {
+        if (!this.isCurrent(turn)) {
+            return {ok: false, stale: true, state: 'cancelled'};
+        }
+        const cleanId = String(requestId || '').trim();
+        const entry = turn.approvalRequests.get(cleanId);
+        if (!entry) {
+            return {ok: false, state: 'unknown'};
+        }
+        if (entry.state !== 'sending_approval') {
+            return {ok: true, alreadySettled: true, state: entry.state};
+        }
+        entry.state = 'awaiting_ack';
+        return {ok: true, alreadySettled: false, state: 'awaiting_ack'};
+    }
+
+    markApprovalAckTimedOut(turn, requestId, reason = 'bridge_ack_timeout') {
+        if (!this.isCurrent(turn)) return false;
+        const cleanId = String(requestId || '').trim();
+        const entry = turn.approvalRequests.get(cleanId);
+        if (!entry || (entry.state !== 'sending_approval' && entry.state !== 'awaiting_ack')) {
+            return false;
+        }
+        try { entry.clearAckTimer?.(); } catch (_) {}
+        entry.clearAckTimer = null;
+        entry.inFlightPromise = null;
+        entry.state = 'ack_timeout';
+        const waiters = entry.ackWaiters.splice(0);
+        for (const resolve of waiters) {
+            try { resolve({acked: false, timedOut: true, reason}); } catch (_) {}
+        }
+        this.emitForTurn(turn, {
+            type: 'permission_ack_timeout',
+            requestId: cleanId,
+            toolCallId: entry.toolCallId || '',
+            toolName: entry.toolName || '',
+            reason,
+        });
+        return true;
+    }
+
+    resolveApprovalFromBridge(turn, event = {}, {approvedScopes = null} = {}) {
+        if (!this.isCurrent(turn)) return false;
+        const cleanId = String(event.requestId || '').trim();
+        if (!cleanId) return false;
+        const entry = turn.approvalRequests.get(cleanId);
+        if (entry) {
+            try { entry.clearAckTimer?.(); } catch (_) {}
+            entry.clearAckTimer = null;
+            entry.inFlightPromise = null;
+            entry.state = event.timedOut ? 'timed_out' : 'resolved';
+            entry.resolvedPayload = event;
+
+            const ackDecision = String(event.decision || '');
+            const ackScopeKey = String(event.scopeKey || '').trim();
+            if (
+                approvedScopes &&
+                ackDecision === 'allow' &&
+                !event.timedOut &&
+                ackScopeKey &&
+                (!entry.scopeKey || entry.scopeKey === ackScopeKey) &&
+                (entry.allowSessionRule || event.sessionScopeSaved) &&
+                (entry.requestedAlwaysAllow || event.sessionScopeSaved || event.autoApproved)
+            ) {
+                approvedScopes.add(ackScopeKey);
+            }
+
+            const waiters = entry.ackWaiters.splice(0);
+            for (const resolve of waiters) {
+                try {
+                    resolve({
+                        acked: true,
+                        decision: ackDecision,
+                        timedOut: Boolean(event.timedOut),
+                        autoApproved: Boolean(event.autoApproved),
+                        scopeKey: ackScopeKey,
+                    });
+                } catch (_) {}
+            }
+        }
+        return this.leaveApproval(turn, cleanId);
+    }
+
+    rejectApprovalResponseFromBridge(turn, event = {}) {
+        if (!this.isCurrent(turn)) return false;
+        const cleanId = String(event.requestId || '').trim();
+        if (!cleanId) return false;
+        const reason = String(event.reason || 'rejected');
+        const entry = turn.approvalRequests.get(cleanId);
+        if (entry) {
+            try { entry.clearAckTimer?.(); } catch (_) {}
+            entry.clearAckTimer = null;
+            entry.inFlightPromise = null;
+            entry.state = 'rejected';
+            const waiters = entry.ackWaiters.splice(0);
+            for (const resolve of waiters) {
+                try {
+                    resolve({
+                        acked: false,
+                        rejected: reason,
+                    });
+                } catch (_) {}
+            }
+        }
+        if (reason === 'unknown_or_expired_request_id') {
+            this.leaveApproval(turn, cleanId);
+        }
+        return true;
+    }
+
     leaveApproval(turn, requestId) {
         if (!this.isCurrent(turn)) return false;
-        if (requestId) {
-            turn.pendingApprovals.delete(requestId);
+        const cleanId = String(requestId || '').trim();
+        if (cleanId) {
+            turn.pendingApprovals.delete(cleanId);
+            const entry = turn.approvalRequests.get(cleanId);
+            if (entry) {
+                try { entry.clearAckTimer?.(); } catch (_) {}
+                entry.clearAckTimer = null;
+                entry.inFlightPromise = null;
+                if (entry.state === 'pending_approval' || entry.state === 'sending_approval' || entry.state === 'awaiting_ack') {
+                    entry.state = 'resolved';
+                }
+            }
         }
         if (turn.pendingApprovals.size === 0) {
             turn.clearApprovalWatchdog?.();
@@ -470,6 +630,18 @@ export class TurnController {
         if (turn && !turn.finalized) {
             turn.finalized = true;
             turn.state = 'cancelled';
+            if (turn.approvalRequests) {
+                for (const entry of turn.approvalRequests.values()) {
+                    try { entry.clearAckTimer?.(); } catch (_) {}
+                    entry.clearAckTimer = null;
+                    entry.inFlightPromise = null;
+                    const waiters = entry.ackWaiters ? entry.ackWaiters.splice(0) : [];
+                    for (const resolve of waiters) {
+                        try { resolve({acked: false, cancelled: true}); } catch (_) {}
+                    }
+                }
+                turn.approvalRequests.clear();
+            }
             turn.pendingApprovals.clear();
             try { turn.cleanupWatchdog?.(); } catch (_) {}
             try { turn.clearApprovalWatchdog?.(); } catch (_) {}

@@ -11,6 +11,7 @@ import {
     buildZCodeArgs,
     normalizeEffectiveAgentMode,
     preparePromptWithinBudget,
+    validatePermissionResponsePayload,
 } from '../protocol.js';
 import {
     loadLocalBackendCatalogAsync,
@@ -253,6 +254,7 @@ export class ZCodeAdapter extends BaseBackendAdapter {
             turns: this._turns,
             turn,
             store: this._store,
+            approvedScopes: this._approvedScopes,
             getSessionContextConfig: this._getSessionContextConfig,
             isDisposedFn: () => this._disposed,
             rawArgv,
@@ -286,53 +288,150 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         alwaysAllow = false,
         allowSessionRule = false,
         scopeKey = '',
+        toolName = '',
         modifiedInput = undefined,
         reason = '',
+        ackTimeoutMs = 0,
     } = {}) {
         const turn = this._turns?.activeTurn;
         const cleanReqId = String(requestId || '').trim();
         if (!turn || turn.finalized || !turn.stdin || !cleanReqId) {
             return Promise.resolve({sent: false, rejected: 'no_active_turn_or_request_id'});
         }
-        if (turnId && String(turnId) !== turn.id) {
+        const cleanTurnId = String(turnId || '').trim();
+        if (!cleanTurnId) {
+            return Promise.resolve({sent: false, rejected: 'missing_turn_id'});
+        }
+        if (cleanTurnId !== turn.id) {
             return Promise.resolve({sent: false, rejected: 'turn_id_mismatch'});
         }
         if (!turn.pendingApprovals.has(cleanReqId)) {
             return Promise.resolve({sent: false, rejected: 'unknown_or_already_resolved_request'});
         }
 
-        const effectiveAlwaysAllow = Boolean(decision === 'allow' && alwaysAllow && allowSessionRule && scopeKey);
+        const entry = this._turns.getApprovalEntry?.(turn, cleanReqId) || null;
+        if (entry && (entry.state === 'sending_approval' || entry.state === 'awaiting_ack')) {
+            if (entry.inFlightPromise && entry.requestedDecision === decision) {
+                return entry.inFlightPromise;
+            }
+            return Promise.resolve({sent: false, rejected: 'approval_already_in_flight'});
+        }
+
+        const validation = validatePermissionResponsePayload(
+            {
+                decision,
+                alwaysAllow,
+                allowSessionRule: entry ? (entry.allowSessionRule || allowSessionRule) : allowSessionRule,
+                scopeKey: scopeKey || entry?.scopeKey || '',
+                modifiedInput,
+                toolName: entry?.toolName || toolName || '',
+            },
+            entry || {toolName, allowSessionRule, scopeKey}
+        );
+        if (!validation.valid) {
+            return Promise.resolve({sent: false, rejected: validation.reason});
+        }
+
+        if (entry) {
+            try { entry.clearAckTimer?.(); } catch (_) {}
+            entry.clearAckTimer = null;
+            entry.state = 'sending_approval';
+            entry.requestedDecision = validation.decision;
+            entry.requestedAlwaysAllow = validation.alwaysAllow;
+            entry.requestedScopeKey = validation.scopeKey;
+            entry.requestedModifiedInput = validation.modifiedInput;
+        }
+
         const msgObj = {
             type: 'permission_response',
             turnId: turn.id,
             requestId: cleanReqId,
-            decision: decision === 'allow' ? 'allow' : 'deny',
-            alwaysAllow: effectiveAlwaysAllow,
+            decision: validation.decision,
+            alwaysAllow: validation.alwaysAllow,
+            ...(validation.scopeKey ? {scopeKey: validation.scopeKey} : {}),
+            ...(validation.modifiedInput !== undefined ? {modifiedInput: validation.modifiedInput} : {}),
+            ...(reason ? {reason: String(reason)} : {}),
         };
-        if (modifiedInput !== undefined) {
-            msgObj.modifiedInput = modifiedInput;
-        }
-        if (reason) {
-            msgObj.reason = String(reason);
-        }
         const bytes = Encoder.encode(`${JSON.stringify(msgObj)}\n`);
 
-        return new Promise(resolve => {
+        const effectiveAckTimeoutMs = Number.isFinite(ackTimeoutMs) && ackTimeoutMs > 0
+            ? Number(ackTimeoutMs)
+            : Number(this._config?.approvalAckTimeoutMs || 8000);
+
+        const writeTask = () => new Promise(resolve => {
+            if (!this._turns.matchesIdentity(turn, {turnId: turn.id}) || !turn.stdin) {
+                if (entry) entry.inFlightPromise = null;
+                resolve({sent: false, rejected: 'turn_no_longer_active'});
+                return;
+            }
+            if (entry && entry.state !== 'sending_approval') {
+                entry.inFlightPromise = null;
+                resolve({sent: false, alreadySettled: true, status: entry.state});
+                return;
+            }
             writeAllBytesAsync(turn.stdin, bytes, GLib.PRIORITY_DEFAULT, turn.cancellable).then(
                 () => {
                     try {
-                        turn.stdin.flush_async(GLib.PRIORITY_DEFAULT, turn.cancellable, () => {});
+                        turn.stdin?.flush_async?.(GLib.PRIORITY_DEFAULT, turn.cancellable, () => {});
                     } catch (_) {}
-                    if (this._turns.matchesIdentity(turn, {turnId: turn.id})) {
-                        if (effectiveAlwaysAllow) {
-                            this._approvedScopes.add(scopeKey);
-                        }
-                        this._turns.leaveApproval(turn, cleanReqId);
+
+                    const markRes = this._turns.markApprovalWriteCompleted(turn, cleanReqId);
+                    if (!markRes.ok || markRes.alreadySettled) {
+                        if (entry) entry.inFlightPromise = null;
+                        resolve({
+                            sent: Boolean(markRes.ok),
+                            alreadySettled: Boolean(markRes.alreadySettled),
+                            status: markRes.state,
+                        });
+                        return;
                     }
-                    resolve({sent: true});
+
+                    if (entry && effectiveAckTimeoutMs > 0) {
+                        let ackTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, effectiveAckTimeoutMs, () => {
+                            ackTimerId = 0;
+                            if (entry) entry.clearAckTimer = null;
+                            this._turns.markApprovalAckTimedOut(turn, cleanReqId, 'bridge_ack_timeout');
+                            return GLib.SOURCE_REMOVE;
+                        });
+                        entry.clearAckTimer = () => {
+                            if (ackTimerId) {
+                                GLib.source_remove(ackTimerId);
+                                ackTimerId = 0;
+                            }
+                        };
+                    }
+
+                    const ackPromise = entry
+                        ? new Promise(ackResolve => {
+                            if (entry.state !== 'sending_approval' && entry.state !== 'awaiting_ack') {
+                                ackResolve({acked: entry.state === 'resolved', state: entry.state});
+                            } else {
+                                entry.ackWaiters.push(ackResolve);
+                            }
+                        })
+                        : Promise.resolve({acked: false});
+
+                    resolve({
+                        sent: true,
+                        status: 'awaiting_ack',
+                        ackPromise,
+                    });
                 },
-                () => resolve({sent: false})
+                () => {
+                    if (entry && entry.state === 'sending_approval') {
+                        entry.state = 'pending_approval';
+                        entry.inFlightPromise = null;
+                    }
+                    resolve({sent: false, rejected: 'stdin_write_failed'});
+                }
             );
         });
+
+        const chainedPromise = (turn.stdinWriteChain || Promise.resolve()).then(writeTask, writeTask);
+        turn.stdinWriteChain = chainedPromise.then(() => {}, () => {});
+        if (entry) {
+            entry.inFlightPromise = chainedPromise;
+        }
+        return chainedPromise;
     }
 }

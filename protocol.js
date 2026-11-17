@@ -5,6 +5,7 @@ import {
     evaluatePermissionPolicy,
     isInteractiveQuestionTool,
     summarizeToolInput,
+    validatePermissionResponsePayload,
 } from './core/permissionPolicy.js';
 import {
     buildBudgetedContextMessages,
@@ -24,6 +25,7 @@ export {
     evaluatePermissionPolicy,
     preparePromptWithinBudget,
     sanitizeMessagesForModelContext,
+    validatePermissionResponsePayload,
 };
 
 const UTF8_ENC = new TextEncoder();
@@ -359,9 +361,19 @@ export function buildAskUserModifiedInput(rawInput, drafts = {}, {skipAll = fals
     const annotations = {};
 
     if (!skipAll) {
-        for (const q of parsedQuestions) {
-            const draft = drafts?.[q.question] || {};
-            const selectedLabels = (Array.isArray(draft.selectedLabels) ? draft.selectedLabels : [])
+        for (let i = 0; i < parsedQuestions.length; i++) {
+            const q = parsedQuestions[i];
+            const rawQ = baseQuestions.find(item => item && String(item.question || '').trim() === q.question) || baseQuestions[i] || {};
+            const rawId = typeof rawQ.id === 'string' ? rawQ.id.trim() : '';
+            const hasByQuestion = Boolean(drafts && Object.prototype.hasOwnProperty.call(drafts, q.question));
+            const hasById = Boolean(rawId && drafts && Object.prototype.hasOwnProperty.call(drafts, rawId));
+            const draft = (hasByQuestion ? drafts[q.question] : (hasById ? drafts[rawId] : null)) || {};
+            const answerKey = (!hasByQuestion && hasById && rawId) ? rawId : q.question;
+
+            const rawSel = Array.isArray(draft.selectedLabels)
+                ? draft.selectedLabels
+                : (Array.isArray(draft.selected) ? draft.selected : []);
+            const selectedLabels = rawSel
                 .map(s => String(s || '').trim())
                 .filter(Boolean);
             const customText = String(draft.customText || '').trim();
@@ -369,19 +381,19 @@ export function buildAskUserModifiedInput(rawInput, drafts = {}, {skipAll = fals
             if (q.multiSelect) {
                 const combined = [...selectedLabels, ...(customText ? [customText] : [])];
                 if (combined.length > 0) {
-                    answers[q.question] = combined.join(', ');
+                    answers[answerKey] = combined.join(', ');
                 }
             } else if (selectedLabels.length > 0) {
-                answers[q.question] = selectedLabels[0];
+                answers[answerKey] = selectedLabels[0];
                 const matchedOpt = q.options.find(o => o.label === selectedLabels[0]);
                 const noteObj = {};
                 if (matchedOpt?.preview) noteObj.preview = matchedOpt.preview;
                 if (customText) noteObj.notes = customText;
                 if (Object.keys(noteObj).length > 0) {
-                    annotations[q.question] = noteObj;
+                    annotations[answerKey] = noteObj;
                 }
             } else if (customText) {
-                answers[q.question] = customText;
+                answers[answerKey] = customText;
             }
         }
     }
@@ -415,13 +427,15 @@ export function formatAskUserAnswerSummary(questions = [], modifiedInput = null)
         ? questions
         : entries.map(([qText]) => ({question: qText, header: ''}));
     for (const q of list) {
-        const val = answers[q.question];
-        const prefix = q.header || q.question;
+        const qId = typeof q?.id === 'string' ? q.id.trim() : '';
+        const val = answers[q.question] ?? (qId ? answers[qId] : undefined);
+        const noteKey = answers[q.question] !== undefined ? q.question : qId;
+        const prefix = q.header || q.question || qId;
         if (!val) {
             lines.push(`• ${prefix}：（未指定，交由 AI 判断）`);
             continue;
         }
-        const notes = annotations[q.question]?.notes;
+        const notes = annotations[noteKey]?.notes;
         lines.push(notes ? `✓ ${prefix}：${val}（备注：${notes}）` : `✓ ${prefix}：${val}`);
     }
     return lines.join('\n');
@@ -994,10 +1008,23 @@ export function normalizeEvent(backend, record) {
                 type: 'permission_resolved',
                 requestId: String(p.requestId || ''),
                 toolCallId: String(p.toolCallId || ''),
+                ...(p.toolName ? {toolName: String(p.toolName)} : {}),
                 decision: String(p.decision || (type === 'permission.denied' ? 'deny' : 'allow')),
                 autoApproved: Boolean(p.autoApproved),
                 timedOut: Boolean(p.timedOut),
                 scopeKey: p.scopeKey ? String(p.scopeKey) : '',
+                ...(p.sessionScopeSaved ? {sessionScopeSaved: true} : {}),
+                ...(p.answers && typeof p.answers === 'object' ? {answers: p.answers} : {}),
+                ...(p.reason ? {reason: String(p.reason)} : {}),
+            };
+        }
+        if (type === 'quickchat.permission_response_rejected') {
+            const p = record.payload || {};
+            return {
+                type: 'permission_response_rejected',
+                requestId: String(p.requestId || ''),
+                reason: String(p.reason || 'rejected'),
+                ...(p.incomingTurnId ? {incomingTurnId: String(p.incomingTurnId)} : {}),
             };
         }
         if (type === 'tool.updated') {

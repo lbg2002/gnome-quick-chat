@@ -711,8 +711,11 @@ export class TracePanelController {
         if (node.isQuestion && Array.isArray(node.questions) && node.questions.length > 0) {
             if (card.drawerExpandBtn) card.drawerExpandBtn.visible = false;
             let qTitle = '💬 交互式提问';
-            if (node.status === 'sending_approval') qTitle = '⏳ 正在提交您的回答…';
-            else if (node.status === 'pending_approval') {
+            if (node.status === 'sending_approval') {
+                qTitle = node.approvalPhase === 'awaiting_ack'
+                    ? '⏳ 已发送回答，等待桥接确认…'
+                    : '⏳ 正在提交您的回答…';
+            } else if (node.status === 'pending_approval') {
                 qTitle = node.questions.length > 1
                     ? `💬 请回答以下问题（共 ${node.questions.length} 项）`
                     : '💬 请选择或输入您的回答';
@@ -757,8 +760,11 @@ export class TracePanelController {
         this._hideQuestionForm(card);
         const riskBadge = node.riskLabel ? ` · ${node.riskLabel}` : '';
         let statusTitle = `🔧 ${node.toolName}`;
-        if (node.status === 'sending_approval') statusTitle = `⏳ 正在发送授权：${node.toolName}…`;
-        else if (node.status === 'pending_approval') statusTitle = `🛡️ 请求授权：${node.operationLabel || node.toolName}${riskBadge}`;
+        if (node.status === 'sending_approval') {
+            statusTitle = node.approvalPhase === 'awaiting_ack'
+                ? `⏳ 已发送授权，等待桥接确认：${node.toolName}…`
+                : `⏳ 正在发送授权：${node.toolName}…`;
+        } else if (node.status === 'pending_approval') statusTitle = `🛡️ 请求授权：${node.operationLabel || node.toolName}${riskBadge}`;
         else if (node.status === 'running') {
             statusTitle = node.approvalState
                 ? `⏳ 已授权，正在执行：${node.toolName}`

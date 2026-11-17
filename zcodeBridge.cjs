@@ -187,24 +187,33 @@ function computeBridgeScope(toolName, summaryOrInput, context = {}) {
     });
 }
 
-function buildBrokerResolution(entry, msg) {
+function buildBrokerResolution(entry, msg, validation = null) {
     const req = entry?.req || {};
     const scope = entry?.policy || entry?.scope || {scopeKey: '', allowSessionRule: false};
+    const effectiveDecision = validation ? validation.decision : msg?.decision;
+    const effectiveModifiedInput = validation ? validation.modifiedInput : msg?.modifiedInput;
 
-    if (msg?.decision === 'modify' && msg.modifiedInput && typeof msg.modifiedInput === 'object') {
+    if (effectiveDecision === 'modify' && effectiveModifiedInput && typeof effectiveModifiedInput === 'object') {
+        const ansObj = effectiveModifiedInput.answers;
+        const hasNonEmptyAnswers = Boolean(
+            ansObj && typeof ansObj === 'object' && Object.keys(ansObj).length > 0
+        );
+        const defaultReason = hasNonEmptyAnswers
+            ? '用户在随问中提交了问题回答'
+            : '用户选择交由 AI 自行判断';
         return {
             decision: 'modify',
-            modifiedInput: msg.modifiedInput,
-            reason: typeof msg.reason === 'string' && msg.reason
+            modifiedInput: effectiveModifiedInput,
+            reason: typeof msg?.reason === 'string' && msg.reason
                 ? msg.reason
-                : '用户在随问中提交了问题回答',
+                : defaultReason,
             resolvedAt: new Date(),
         };
     }
 
     // Defense-in-depth: AskUserQuestion requires `decision: "modify"` with `answers` object;
-    // a plain `allow` would leave `answers === undefined` and fail ZCode's schema check.
-    if (msg?.decision === 'allow' && isInteractiveQuestionRequest(req.toolName, req.input, req.ruleId)) {
+    // a plain `allow` without modifiedInput represents explicit "交由 AI 自行判断" (empty answers `{}`).
+    if (effectiveDecision === 'allow' && isInteractiveQuestionRequest(req.toolName, req.input, req.ruleId)) {
         const fallbackModified = {
             questions: Array.isArray(req.input?.questions) ? req.input.questions : [],
             answers: {},
@@ -224,7 +233,7 @@ function buildBrokerResolution(entry, msg) {
         };
     }
 
-    const allow = msg?.decision === 'allow';
+    const allow = effectiveDecision === 'allow';
     const effectiveScopeKey = scope.allowSessionRule ? scope.scopeKey : '';
 
     return {
@@ -268,7 +277,18 @@ function createPermissionBrokerController({
         } catch (_) {}
     };
 
-    const emitResolved = ({requestId, toolCallId = '', decision, autoApproved = false, timedOut = false, scopeKey = ''}) => {
+    const emitResolved = ({
+        requestId,
+        toolCallId = '',
+        toolName = '',
+        decision,
+        autoApproved = false,
+        timedOut = false,
+        scopeKey = '',
+        sessionScopeSaved = false,
+        answers = null,
+        reason = '',
+    }) => {
         emit({
             type: 'quickchat.permission_resolved',
             protocolVersion: PROTOCOL_VERSION,
@@ -277,10 +297,28 @@ function createPermissionBrokerController({
             payload: {
                 requestId: String(requestId || ''),
                 toolCallId: String(toolCallId || ''),
+                toolName: String(toolName || ''),
                 decision,
-                autoApproved,
-                timedOut,
-                scopeKey,
+                autoApproved: Boolean(autoApproved),
+                timedOut: Boolean(timedOut),
+                scopeKey: String(scopeKey || ''),
+                sessionScopeSaved: Boolean(sessionScopeSaved),
+                ...(answers && typeof answers === 'object' ? {answers} : {}),
+                ...(reason ? {reason: String(reason)} : {}),
+            },
+        });
+    };
+
+    const emitRejected = ({requestId = '', reason = '', incomingTurnId = ''}) => {
+        emit({
+            type: 'quickchat.permission_response_rejected',
+            protocolVersion: PROTOCOL_VERSION,
+            turnId,
+            sessionId,
+            payload: {
+                requestId: String(requestId || ''),
+                reason: String(reason || 'rejected'),
+                ...(incomingTurnId ? {incomingTurnId: String(incomingTurnId)} : {}),
             },
         });
     };
@@ -436,6 +474,7 @@ function createPermissionBrokerController({
         const entry = {
             req: {...req, requestId},
             turnId,
+            interactiveQuestion,
             opts,
             policy,
             scope: policy,
@@ -484,41 +523,79 @@ function createPermissionBrokerController({
 
         // Strict ID verification: NEVER match missing/blank requestId to an arbitrary pending request!
         const targetId = typeof msg.requestId === 'string' ? msg.requestId.trim() : '';
+        const incomingTurnId = typeof msg.turnId === 'string' ? msg.turnId.trim() : '';
         if (!targetId) {
+            emitRejected({requestId: '', reason: 'missing_request_id', incomingTurnId});
             return {accepted: false, reason: 'missing_request_id'};
         }
 
         const entry = pendingRequests.get(targetId);
         if (!entry) {
+            emitRejected({requestId: targetId, reason: 'unknown_or_expired_request_id', incomingTurnId});
             return {accepted: false, reason: 'unknown_or_expired_request_id'};
         }
 
-        const incomingTurnId = typeof msg.turnId === 'string' ? msg.turnId.trim() : '';
-        if (entry.turnId && incomingTurnId && incomingTurnId !== entry.turnId) {
+        // Strict turnId verification: both missing turnId (when entry.turnId is set) and mismatched turnId are rejected.
+        if (entry.turnId) {
+            if (!incomingTurnId) {
+                emitRejected({requestId: targetId, reason: 'missing_turn_id'});
+                return {accepted: false, reason: 'missing_turn_id'};
+            }
+            if (incomingTurnId !== entry.turnId) {
+                emitRejected({requestId: targetId, reason: 'turn_id_mismatch', incomingTurnId});
+                return {accepted: false, reason: 'turn_id_mismatch'};
+            }
+        } else if (incomingTurnId) {
+            emitRejected({requestId: targetId, reason: 'turn_id_mismatch', incomingTurnId});
             return {accepted: false, reason: 'turn_id_mismatch'};
         }
 
-        const resolution = buildBrokerResolution(entry, msg);
-        const allow = resolution.decision === 'allow';
-        const effectiveScopeKey = entry.policy.allowSessionRule ? entry.policy.scopeKey : '';
+        const validation = typeof sharedPolicy.validatePermissionResponsePayload === 'function'
+            ? sharedPolicy.validatePermissionResponsePayload(msg, {
+                toolName: entry.req?.toolName || entry.policy?.toolName || '',
+                input: entry.req?.input ?? null,
+                ruleId: entry.req?.ruleId || '',
+                isQuestion: Boolean(entry.interactiveQuestion),
+                scopeKey: entry.policy?.scopeKey || '',
+                allowSessionRule: Boolean(entry.policy?.allowSessionRule),
+            })
+            : {valid: msg.decision === 'allow' || msg.decision === 'deny', decision: msg.decision === 'allow' ? 'allow' : 'deny', alwaysAllow: false, scopeKey: ''};
 
-        if (allow && msg.alwaysAllow && effectiveScopeKey) {
+        if (!validation.valid) {
+            emitRejected({requestId: targetId, reason: validation.reason, incomingTurnId});
+            return {accepted: false, reason: validation.reason};
+        }
+
+        const resolution = buildBrokerResolution(entry, msg, validation);
+        const allow = resolution.decision === 'allow';
+        const effectiveScopeKey = (allow && validation.alwaysAllow && entry.policy.allowSessionRule)
+            ? entry.policy.scopeKey
+            : '';
+
+        let sessionScopeSaved = false;
+        if (allow && validation.alwaysAllow && effectiveScopeKey) {
             approvedScopes.add(effectiveScopeKey);
+            sessionScopeSaved = true;
         }
 
         entry.settle(resolution);
         emitResolved({
             requestId: targetId,
             toolCallId: entry.req?.toolCallId || '',
+            toolName: entry.req?.toolName || entry.policy?.toolName || '',
             decision: resolution.decision,
             autoApproved: false,
-            scopeKey: allow && msg.alwaysAllow ? effectiveScopeKey : '',
+            timedOut: false,
+            scopeKey: effectiveScopeKey || entry.policy?.scopeKey || '',
+            sessionScopeSaved,
+            answers: resolution.modifiedInput?.answers || null,
+            reason: resolution.reason || '',
         });
 
         // Auto-settle parallel pending requests ONLY if they match the exact same deterministic scopeKey,
         // and explicitly notify the host UI for every auto-settled requestId!
         const autoSettledIds = [];
-        if (allow && msg.alwaysAllow && effectiveScopeKey) {
+        if (sessionScopeSaved && effectiveScopeKey) {
             for (const [otherId, otherEntry] of Array.from(pendingRequests.entries())) {
                 if (otherEntry.policy?.allowSessionRule && otherEntry.policy.scopeKey === effectiveScopeKey) {
                     otherEntry.settle({
@@ -530,9 +607,12 @@ function createPermissionBrokerController({
                     emitResolved({
                         requestId: otherId,
                         toolCallId: otherEntry.req?.toolCallId || '',
+                        toolName: otherEntry.req?.toolName || otherEntry.policy?.toolName || '',
                         decision: 'allow',
                         autoApproved: true,
+                        timedOut: false,
                         scopeKey: effectiveScopeKey,
+                        sessionScopeSaved: true,
                     });
                 }
             }
@@ -690,6 +770,14 @@ if (isZCodeProcess || process.env.QUICK_CHAT_FORCE_BRIDGE === '1') {
             if (desc.value === 'DenyPermissionBroker' && target.prototype) {
                 patchDenyPermissionBroker(target, origDefineProperty);
             }
+        } else if (
+            prop === 'requestPermission' &&
+            target &&
+            typeof target === 'object' &&
+            target.constructor &&
+            target.constructor.name === 'DenyPermissionBroker'
+        ) {
+            patchDenyPermissionBroker(target.constructor, origDefineProperty);
         }
         return res;
     };

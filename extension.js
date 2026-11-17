@@ -1836,34 +1836,108 @@ export default class QuickChat extends Extension {
                     node = this._tracePanel.findOrCreateToolNode(card, {
                         requestId: event.requestId,
                         toolCallId: event.toolCallId || '',
+                        toolName: event.toolName || '工具',
                         scopeKey: event.scopeKey || '',
                     });
                 }
+                const allow = event.decision === 'allow' || event.decision === 'modify';
                 if (node && (node.status === 'pending_approval' || node.status === 'sending_approval' || event.autoApproved)) {
-                    const allow = event.decision !== 'deny';
+                    node.deliveryError = '';
+                    node.approvalPhase = 'resolved';
                     if (node.status !== 'done' && node.status !== 'error') {
                         node.status = allow ? 'running' : 'denied';
                     }
-                    if (!node.approvalState || node.approvalState === 'pending') {
-                        node.approvalState = allow
-                            ? (event.autoApproved ? 'always' : (node.isQuestion ? 'answered' : 'allowed'))
-                            : 'denied';
+                    if (!allow) {
+                        node.approvalState = event.timedOut ? 'timed_out' : 'denied';
+                    } else if (event.autoApproved) {
+                        node.approvalState = 'always';
+                    } else if (node.isQuestion) {
+                        const hasAns = Boolean(
+                            event.answers &&
+                            typeof event.answers === 'object' &&
+                            Object.keys(event.answers).length > 0
+                        );
+                        node.approvalState = hasAns
+                            ? 'answered'
+                            : (node.pendingApprovalAction || 'skipped');
+                    } else {
+                        node.approvalState = (event.sessionScopeSaved || node.pendingApprovalAction === 'always')
+                            ? 'always'
+                            : 'allowed';
                     }
                     card.dirtyToolNodeIds?.add(node.id);
                     if (card.selectedNodeId === node.id) {
-                        const nextPending = card.toolNodes.find(n => n.status === 'pending_approval');
+                        const nextPending = card.toolNodes.find(
+                            n => n.status === 'pending_approval' || n.status === 'sending_approval'
+                        );
                         card.selectedNodeId = nextPending ? nextPending.id : null;
                     }
                 }
+                const nextPending = card.toolNodes.find(
+                    n => n.status === 'pending_approval' || n.status === 'sending_approval'
+                );
+                const stillWaiting = Boolean(nextPending);
                 if (activeTurn) {
-                    activeTurn.state = this._tracePanel.hasPendingApprovalNodes(card)
-                        ? 'awaiting_approval'
-                        : 'streaming';
+                    activeTurn.state = stillWaiting ? 'awaiting_approval' : 'streaming';
                 }
+                card.activeTool = allow || stillWaiting;
                 card.dirty.tools = true;
                 card.dirty.toolsUrgent = true;
+                if (!card.text) card.dirty.text = true;
                 this._updateAiTabBadge();
                 card.scheduleRender();
+
+                const labelName = node?.toolName || event.toolName || '工具';
+                this._panel.setStatusIndicator(
+                    'busy',
+                    nextPending
+                        ? (nextPending.isQuestion
+                            ? '💬 请继续回答下一个问题…'
+                            : `⚠️ 等待您审批工具：${nextPending.toolName}`)
+                        : allow
+                            ? (node?.isQuestion
+                                ? '已确认您的回答，正在继续执行…'
+                                : `已确认授权 ${labelName}，正在执行…`)
+                            : `已拒绝 ${labelName}，正在继续…`
+                );
+            }
+        }
+
+        if (event.type === 'permission_response_rejected' || event.type === 'permission_ack_timeout') {
+            const card = this._live;
+            if (card?.toolNodes && event.requestId) {
+                const node = card.toolNodes.find(n => n.requestId === event.requestId);
+                if (node && (node.status === 'sending_approval' || node.status === 'pending_approval')) {
+                    if (event.reason === 'unknown_or_expired_request_id') {
+                        node.status = 'denied';
+                        node.approvalState = 'timed_out';
+                        node.approvalPhase = 'expired';
+                        node.deliveryError = '该审批请求在桥接端已过期或已结束';
+                        const nextPending = card.toolNodes.find(
+                            n => n.status === 'pending_approval' || n.status === 'sending_approval'
+                        );
+                        card.selectedNodeId = nextPending ? nextPending.id : node.id;
+                        if (activeTurn) {
+                            activeTurn.state = nextPending ? 'awaiting_approval' : 'streaming';
+                        }
+                    } else {
+                        node.status = 'pending_approval';
+                        node.approvalPhase = '';
+                        node.deliveryError = event.type === 'permission_ack_timeout'
+                            ? '等待桥接确认超时，请点击重试或停止当前回合'
+                            : `审批确认未通过桥接校验（${event.reason || '已拒绝'}），请重试`;
+                        card.selectedNodeId = node.id;
+                        if (activeTurn) {
+                            activeTurn.state = 'awaiting_approval';
+                        }
+                    }
+                    card.dirtyToolNodeIds?.add(node.id);
+                    card.dirty.tools = true;
+                    card.dirty.toolsUrgent = true;
+                    this._updateAiTabBadge();
+                    card.flushRender(true);
+                    this._panel.setStatusIndicator('error', `⚠️ ${node.deliveryError}`);
+                }
             }
         }
 

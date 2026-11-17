@@ -252,6 +252,7 @@ export function spawnManagedCliTurn({
     turns,
     turn,
     store,
+    approvedScopes = null,
     getSessionContextConfig,
     isDisposedFn = () => false,
     rawArgv,
@@ -575,12 +576,21 @@ export function spawnManagedCliTurn({
                     } else if (norm.type === 'permission_request') {
                         if (norm.requestId && !seenPermissionIds.has(norm.requestId)) {
                             seenPermissionIds.add(norm.requestId);
-                            turns.enterApproval(turn, norm.requestId);
+                            turns.enterApproval(turn, norm.requestId, norm);
                             turns.emitForTurn(turn, norm);
                         }
                     } else if (norm.type === 'permission_resolved') {
                         if (norm.requestId) {
-                            turns.leaveApproval(turn, norm.requestId);
+                            if (typeof turns.resolveApprovalFromBridge === 'function') {
+                                turns.resolveApprovalFromBridge(turn, norm, {approvedScopes});
+                            } else {
+                                turns.leaveApproval(turn, norm.requestId);
+                            }
+                        }
+                        turns.emitForTurn(turn, norm);
+                    } else if (norm.type === 'permission_response_rejected') {
+                        if (norm.requestId && typeof turns.rejectApprovalResponseFromBridge === 'function') {
+                            turns.rejectApprovalResponseFromBridge(turn, norm);
                         }
                         turns.emitForTurn(turn, norm);
                     } else if (norm.type === 'tool_execution_start') {
