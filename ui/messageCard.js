@@ -88,10 +88,12 @@ export class MessageCardFactory {
                     ? '正在整理回答…'
                     : '…';
 
+        const isStreaming = Boolean(this._isCardStreaming(card));
         renderCardBodyIncremental(card, {
             markdownEnabled: this._isMarkdownEnabled(),
             placeholderText,
-            isStreaming: Boolean(this._isCardStreaming(card)),
+            isStreaming,
+            isFinal: !isStreaming,
             onCreateCodeCopyButton: getCodeTextFn => {
                 const codeCopyBtn = createStButton('复制代码', () => {
                     this.copyWithFeedback(codeCopyBtn, getCodeTextFn, '复制代码');
@@ -291,7 +293,9 @@ export class MessageCardFactory {
                 this._clearTimer(card.renderTimer);
                 card.renderTimer = 0;
             }
-            if (!this._isChatVisible() && !forceAll && this._isCardStreaming(card)) {
+            // R12: When the panel is hidden (`!this._isChatVisible()`) and not explicitly forced on open,
+            // never create or layout body/trace Actors! Defer until `flushPendingBackgroundWork` when opened.
+            if (!this._isChatVisible() && !forceAll) {
                 this._onMarkBackgroundDirty();
                 return;
             }
@@ -336,7 +340,11 @@ export class MessageCardFactory {
             });
         };
 
-        card.flushRender(true);
+        if (this._isChatVisible()) {
+            card.flushRender(true);
+        } else {
+            this._onMarkBackgroundDirty();
+        }
         return card;
     }
 }

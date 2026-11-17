@@ -259,6 +259,7 @@ export class TurnController {
                     if (toolEntry.status !== 'done' && toolEntry.status !== 'error' && toolEntry.status !== 'denied') {
                         toolEntry.status = 'pending_approval';
                         toolEntry.approvalState = 'pending';
+                        turn.activeToolIds.delete(cleanToolCallId);
                     }
                 }
             }

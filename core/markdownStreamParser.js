@@ -139,11 +139,10 @@ export class StreamingMarkdownParser {
         this._inCode = false;
         this._codeLang = '';
         this._codeLines = [];
+        this._codePrefix = '';
         this._codeCharCount = 0;
 
-        this._textRawLines = [];
-        this._textPangoLines = [];
-        this._textCharCount = 0;
+        this._resetOpenTextState();
 
         this.stats = {
             incrementalUpdates: 0,
@@ -152,36 +151,123 @@ export class StreamingMarkdownParser {
         };
     }
 
+    _resetOpenTextState() {
+        this._textRawLines = [];
+        this._textPangoLines = [];
+        this._textCharCount = 0;
+        this._firstNonEmptyIdx = -1;
+        this._lastNonEmptyIdx = -1;
+        this._pendingEmptyCount = 0;
+        this._committedRawJoined = '';
+        this._committedEscapedJoined = '';
+        this._committedPangoJoined = '';
+        this._hasLazyNullPango = false;
+    }
+
     get confirmedBlockCount() {
         return this._confirmedBlocks.length;
+    }
+
+    _materializeOpenTextBlock({deferFormatting = false} = {}) {
+        if (this._firstNonEmptyIdx === -1 || this._lastNonEmptyIdx < this._firstNonEmptyIdx) {
+            return null;
+        }
+        const raw = this._committedRawJoined;
+        if (!raw) return null;
+
+        if (deferFormatting) {
+            return {
+                type: 'text',
+                raw,
+                pango: this._committedEscapedJoined,
+                deferredFormatting: true,
+            };
+        }
+
+        this._ensureCommittedPangoJoined();
+        return {
+            type: 'text',
+            raw,
+            pango: this._committedPangoJoined,
+        };
+    }
+
+    _ensureCommittedPangoJoined() {
+        if (!this._hasLazyNullPango || this._firstNonEmptyIdx === -1) {
+            return;
+        }
+        const pangoParts = [];
+        for (let i = this._firstNonEmptyIdx; i <= this._lastNonEmptyIdx; i++) {
+            let formatted = this._textPangoLines[i];
+            if (formatted === null || formatted === undefined) {
+                formatted = formatLineToPango(this._textRawLines[i]);
+                this._textPangoLines[i] = formatted;
+                this.stats.linesFormatted++;
+            }
+            pangoParts.push(formatted);
+        }
+        this._committedPangoJoined = pangoParts.join('\n');
+        this._hasLazyNullPango = false;
     }
 
     _consumeCompletedLine(line, allowLazyTextPango) {
         if (!this._inCode) {
             const fenceMatch = OPEN_FENCE_RE.exec(line);
             if (fenceMatch) {
-                const flushed = buildTextBlockFromLines(this._textRawLines, this._textPangoLines, {deferFormatting: false});
+                const flushed = this._materializeOpenTextBlock({deferFormatting: false});
                 if (flushed) {
                     this._confirmedBlocks.push(flushed);
                 }
-                this._textRawLines = [];
-                this._textPangoLines = [];
-                this._textCharCount = 0;
+                this._resetOpenTextState();
 
                 this._inCode = true;
                 this._codeLang = (fenceMatch[1] || '').trim().toLowerCase();
                 this._codeLines = [];
+                this._codePrefix = '';
                 this._codeCharCount = 0;
                 return;
             }
 
+            const lineIdx = this._textRawLines.length;
             this._textRawLines.push(line);
             this._textCharCount += line.length + 1;
+
+            let formattedLine = null;
             if (allowLazyTextPango && this._textCharCount > this._deferThreshold) {
                 this._textPangoLines.push(null);
             } else {
-                this._textPangoLines.push(formatLineToPango(line));
+                formattedLine = formatLineToPango(line);
+                this._textPangoLines.push(formattedLine);
                 this.stats.linesFormatted++;
+            }
+
+            if (line === '') {
+                if (this._firstNonEmptyIdx !== -1) {
+                    this._pendingEmptyCount++;
+                }
+            } else {
+                const escapedLine = escapePango(line);
+                if (this._firstNonEmptyIdx === -1) {
+                    this._firstNonEmptyIdx = lineIdx;
+                    this._committedRawJoined = line;
+                    this._committedEscapedJoined = escapedLine;
+                    if (formattedLine !== null) {
+                        this._committedPangoJoined = formattedLine;
+                    } else {
+                        this._hasLazyNullPango = true;
+                    }
+                } else {
+                    const sep = '\n'.repeat(this._pendingEmptyCount + 1);
+                    this._committedRawJoined += sep + line;
+                    this._committedEscapedJoined += sep + escapedLine;
+                    if (!this._hasLazyNullPango && formattedLine !== null) {
+                        this._committedPangoJoined += sep + formattedLine;
+                    } else {
+                        this._hasLazyNullPango = true;
+                    }
+                }
+                this._lastNonEmptyIdx = lineIdx;
+                this._pendingEmptyCount = 0;
             }
             return;
         }
@@ -190,16 +276,18 @@ export class StreamingMarkdownParser {
             this._confirmedBlocks.push({
                 type: 'code',
                 lang: this._codeLang || 'code',
-                code: this._codeLines.join('\n'),
+                code: this._codePrefix,
                 closed: true,
             });
             this._inCode = false;
             this._codeLang = '';
             this._codeLines = [];
+            this._codePrefix = '';
             this._codeCharCount = 0;
             return;
         }
 
+        this._codePrefix = this._codeLines.length === 0 ? line : `${this._codePrefix}\n${line}`;
         this._codeLines.push(line);
         this._codeCharCount += line.length + 1;
     }
@@ -232,8 +320,6 @@ export class StreamingMarkdownParser {
         }
 
         // Normalize only the newly appended suffix from `_checkpointOffset`!
-        // Because `_checkpointOffset` always points to the start of the last (unterminated) line in `_normalizedPrefix`,
-        // we compute normalized text only from the raw equivalent or incrementally normalize delta.
         if (this._rawInput === '') {
             this._normalizedPrefix = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
         } else if (raw.length > this._rawInput.length) {
@@ -252,10 +338,6 @@ export class StreamingMarkdownParser {
 
         // Consume all newly completed `\n`-terminated lines starting from `_checkpointOffset`
         let nlIdx = this._normalizedPrefix.indexOf('\n', this._checkpointOffset);
-        // Note: if the normalized string ends right at `\n` AND raw ended with `\r` (possible `\r\n` split across chunks),
-        // hold off committing that last line until we know whether `\n` follows or more chars arrive?
-        // Actually even if `\n` follows `\r`, the line before `\r` IS already terminated! Dropping the paired `\n` above
-        // keeps `_normalizedPrefix` 100% identical!
         while (nlIdx !== -1) {
             const line = this._normalizedPrefix.slice(this._checkpointOffset, nlIdx);
             this._checkpointOffset = nlIdx + 1;
@@ -266,12 +348,8 @@ export class StreamingMarkdownParser {
         // Handle the single unterminated trailing line (`_checkpointOffset .. end`) WITHOUT mutating committed state!
         const hasTailSlice = this._checkpointOffset <= this._normalizedPrefix.length;
         const tailLine = hasTailSlice ? this._normalizedPrefix.slice(this._checkpointOffset) : '';
-        // Note: `split('\n')` on `"abc\n"` has a trailing `""` element after `\n`!
-        // Let's match `markdown.replace(/\r\n/g, '\n').split('\n')` semantics 100%:
         const tailBlocks = this._computeTailBlocks(tailLine, finalize);
 
-        // Ensure any deferred formatting on already-confirmed blocks is not possible (flushed with deferFormatting: false),
-        // and on `finalize === true`, tailBlocks also have `deferFormatting: false`.
         const blocks = this._confirmedBlocks.concat(tailBlocks);
 
         return {
@@ -289,11 +367,7 @@ export class StreamingMarkdownParser {
             const fenceMatch = OPEN_FENCE_RE.exec(tailLine);
             if (fenceMatch) {
                 const out = [];
-                const flushed = buildTextBlockFromLines(
-                    this._textRawLines,
-                    [...this._textPangoLines],
-                    {deferFormatting: false}
-                );
+                const flushed = this._materializeOpenTextBlock({deferFormatting: false});
                 if (flushed) out.push(flushed);
                 out.push({
                     type: 'code',
@@ -304,16 +378,40 @@ export class StreamingMarkdownParser {
                 return out;
             }
 
-            const combinedRaw = [...this._textRawLines, tailLine];
-            const combinedPango = [
-                ...this._textPangoLines,
-                deferFormatting ? null : formatLineToPango(tailLine),
-            ];
-            if (!deferFormatting) {
-                this.stats.linesFormatted++;
+            if (tailLine === '') {
+                const textBlock = this._materializeOpenTextBlock({deferFormatting});
+                return textBlock ? [textBlock] : [];
             }
-            const textBlock = buildTextBlockFromLines(combinedRaw, combinedPango, {deferFormatting});
-            return textBlock ? [textBlock] : [];
+
+            const sep = this._firstNonEmptyIdx === -1 ? '' : '\n'.repeat(this._pendingEmptyCount + 1);
+            const raw = this._firstNonEmptyIdx === -1
+                ? tailLine
+                : `${this._committedRawJoined}${sep}${tailLine}`;
+
+            if (deferFormatting) {
+                const tailEscaped = escapePango(tailLine);
+                const pango = this._firstNonEmptyIdx === -1
+                    ? tailEscaped
+                    : `${this._committedEscapedJoined}${sep}${tailEscaped}`;
+                return [{
+                    type: 'text',
+                    raw,
+                    pango,
+                    deferredFormatting: true,
+                }];
+            }
+
+            this._ensureCommittedPangoJoined();
+            const tailPango = formatLineToPango(tailLine);
+            this.stats.linesFormatted++;
+            const pango = this._firstNonEmptyIdx === -1
+                ? tailPango
+                : `${this._committedPangoJoined}${sep}${tailPango}`;
+            return [{
+                type: 'text',
+                raw,
+                pango,
+            }];
         }
 
         // Currently inside a fenced code block (`this._inCode === true`)
@@ -321,12 +419,14 @@ export class StreamingMarkdownParser {
             return [{
                 type: 'code',
                 lang: this._codeLang || 'code',
-                code: this._codeLines.join('\n'),
+                code: this._codePrefix,
                 closed: true,
             }];
         }
 
-        const combinedCode = [...this._codeLines, tailLine].join('\n');
+        const combinedCode = this._codeLines.length === 0
+            ? tailLine
+            : `${this._codePrefix}\n${tailLine}`;
         return [{
             type: 'code',
             lang: this._codeLang || 'code',

@@ -217,29 +217,45 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 │   ├── sessionEngine.js       # 无竞争快照持久化、整轮压缩、原地回退、导出与保留策略规划
 │   ├── sessionStore.js        # Gio 异步会话存储与旧版会话只读导入封装
 │   ├── backendRegistry.js     # 三后端独立 Profile 配置隔离与事务写回
-│   ├── backendDetect.js       # 异步 CLI 身份探测与带缓存的模型目录扫描
-│   ├── secretStore.js         # 按端点隔离的 GNOME Keyring 读写与串行保存队列
-│   ├── markdownParser.js      # 流式增量 Markdown 解析器（冻结块缓存 + 尾块增量解析）
-│   ├── renderScheduler.js     # 自适应节流渲染调度器与窗口化历史 Actor 控制器
+│   ├── backendDetect.js       # 异步 CLI 身份探测（有界流 + 超时进程组回收 + Single-Flight 缓存）
+│   ├── modelCatalogCache.js   # 模型目录扫描、近期/收藏排序与思考强度能力推导
+│   ├── paths.js               # 有界分块文件读取（拒绝 FIFO/设备特殊文件、检测读取中膨胀）
+│   ├── markdownStreamParser.js# 流式增量 Markdown 解析器（冻结块缓存 + 开放块增量前缀缓存）
+│   ├── renderScheduler.js     # 自适应节流渲染调度器、单节点工具差量更新与统一回合派生状态
 │   ├── quickActions.js        # 可编辑快捷动作模板与 `/` 命令匹配引擎
-│   ├── attachmentManager.js   # 多文本/Nautilus 文件/终端日志上下文附件与二进制保护
+│   ├── attachmentManager.js   # 上下文附件（世代+会话隔离、动态围栏、预算联动与跨端点隐私剥离）
 │   ├── notificationPolicy.js  # 后台状态通知脱敏、锁屏屏蔽、限频去重与点击路由
 │   ├── modelRouter.js         # 纯本地规则智能后端/模型推荐（零额外请求，禁自动开启高权限）
 │   └── diagnosticsReport.js   # 白名单脱敏运行诊断快照与复制报告生成
-├── runtime/                   # 进程树管理 (subprocessRunner) 与事件级 SSE 解析 (sseParser)
-├── ui/                        # 原生 St/Clutter 视图组件 (dateMenuIntegration / chatPanel / messageCard / approvalCard / modelPicker / markdownRenderer)
-├── schemas/                   # GSettings XML Schema 定义
-├── tests/                     # Node.js 自动化测试套件（覆盖阶段 A–F 全部核心模块与假 CLI/HTTP 集成）
+├── runtime/                   # 独立进程组管理 (processManager / cliProcessRunner)、Soup 有界流与跨域重定向守卫 (httpStreamClient)、SSE 解析 (sseParser) 与系统密钥环 (secretStorage)
+├── ui/                        # 原生 St/Clutter 视图组件 (chatPanel / messageCard / approvalCard / modelPicker / historyWindow / traceBar / turnComposer / statusHeader / quickActionsPopover)
+├── schemas/                   # GSettings XML Schema 定义（含旧版配置幂等迁移字段）
+├── tests/                     # Node.js + GJS 生产路径自动化测试套件（132 项单测与假 CLI / 双源 HTTP / Gio 子进程集成测试）
 ├── install.sh / uninstall.sh  # 带锁原子安装回滚与支持 --purge 精确清理的卸载脚本
 └── pack.sh                    # gnome-extensions pack 标准打包脚本
 ```
 
-运行语法检查、Schema 严格编译与全部自动化单元测试：
+运行语法检查、Schema 严格编译、GJS 生产路径集成测试与全部自动化单元测试：
 
 ```bash
 npm test
+gjs -m tests/gjs_smoke.js
 glib-compile-schemas --strict --dry-run schemas/
+bash -n install.sh && bash -n uninstall.sh && bash -n pack.sh
 ```
+
+### 已验证自动化基准与待 GNOME 50 实机验收说明
+
+* **已通过自动化验证（Node 24 + GJS 1.78 / Gio / Soup 3.0 生产路径测试，共 132 项用例）**：
+  * **R1–R10 生产链路集成**：真实 `ZCodeAdapter` ↔ `zcodeBridge.cjs` 交互问题 (`modify` + 自定义/多选/跳过) 与 `permission_resolved` 权威 ACK、独立进程组 `SIGKILL` 清理与 `setsid` 脱离检测、`SessionStore` 持久化失败恢复与事务性回退、纯异步 CLI 探测、stdout/stderr/HTTP/文件有界分块流读取、附件世代隔离与动态防注入围栏、4 阶段独立超时看门狗、`archive.jsonl` / `rewound.jsonl` 分离与 1000+ 消息分页回收、双源 HTTP `307`/`308` 跨域 POST 拦截。
+  * **R12 流式解析与工具轨迹基准（Node 24 实测）**：
+    * `StreamingMarkdownParser` 30,000 字符流式增量更新（501 ticks）：`p50 = 0.030ms`、`p95 = 0.062ms`、`max = 2.701ms`（增量行格式化比 `881 / 607`，无全量重排）；
+    * `StreamingMarkdownParser` 100,000 字符流式增量更新（835 ticks）：`p50 = 0.069ms`、`p95 = 0.590ms`、`max = 15.179ms`（增量行格式化比 `2204 / 2003`）；
+    * 100 对工具 `start + end` 突发事件单节点差量更新：`p50 = 0.045ms`、`p95 = 0.079ms`；1,000 对工具突发事件：`p50 = 0.071ms`、`p95 = 0.111ms`（可见圆点布局恒定受 `maxVisible = 8` 约束）；
+    * 隐藏面板期间后台流式输出与回合完成保持 **0 正文/轨迹 Actor 创建与重排**，直至面板打开时一次性合并刷新。
+* **待真实 GNOME 50 / Wayland 桌面人工实机验收（Pending）**：
+  * 真实 GNOME 50 桌面五种基线（禁用、空闲、冷/热打开面板 p95、OpenAI 流式、CLI 多工具）下的 `gnome-shell` CPU/RSS 与帧耗时采样；
+  * 锁屏/解锁循环、扩展连续启禁 30 次、通知栏开合 100 次、与其他顶栏扩展共存、Nautilus 真实文件拖拽/复制引用及真实已安装 ZCode/Codex CLI 端到端交互问答。
 
 查看运行日志与内存监控建议：
 
@@ -257,3 +273,4 @@ pidstat -p "$(pgrep -n gnome-shell)" -u -r 1
 ./uninstall.sh           # 仅移除扩展，保留历史对话记录
 ./uninstall.sh --purge   # 移除扩展并彻底清理本地会话、临时文件与密钥环中的 API Key
 ```
+

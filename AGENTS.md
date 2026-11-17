@@ -130,11 +130,11 @@ CI 已增加 GJS smoke，tests/gjs_smoke.js 目前主要导入纯模块、验证
 
 目前 extension.js 仍约 2500 行、prefs.js 约 1680 行，并新增大量核心模块；代码变多不必然性能更差，但避免二次大重构。优先消除已确认的同步阻塞与无界缓冲，再测量决定后续拆分。
 
-- [ ] 记录真实 GNOME 50 五种基线（禁用、空闲、冷/热面板、OpenAI 流式、CLI 多工具）。分别报告 Shell 和子进程 CPU/RSS、首字、UI p50/p95、Actor 数量、事件量、残留进程。前轮目标（热打开 p95≤100ms、UI update p95≤8ms、空闲 CPU 增量≤0.5百分点、短会话 RSS 增量≤20MiB）仅为建议目标。
-- [ ] 验证 Markdown parser 增量更新并非每 token 重排全量文本；工具大量事件不重复刷新所有节点；隐藏面板不创建/布局正文 Actor。用 30k/100k 字符与 100/1000 工具事件实测，记录尾延迟和内存。只在有 profiling 证据时优化。
-- [ ] 统一生产状态来源：TurnController / ChatController / UI card 的状态由事件派生，减少重复可变状态；权限确认只由 bridge 结果驱动。对现有模块边界做小步整理，不重写整个项目。
-- [ ] 检查同步/异步双实现和重复权限策略是否仍必要；核心共享逻辑使用同源实现或跨运行时一致性测试。对 prefs 逐步拆成配置/模型/隐私/诊断模块，不因行数强行重构。
-- [ ] 更新 README/AGENTS.md，将已实现与实测通过分别标注；发布版本号、变更、迁移与回滚一致。
+- [ ] 记录真实 GNOME 50 五种基线（禁用、空闲、冷/热面板、OpenAI 流式、CLI 多工具）。分别报告 Shell 和子进程 CPU/RSS、首字、UI p50/p95、Actor 数量、事件量、残留进程。前轮目标（热打开 p95≤100ms、UI update p95≤8ms、空闲 CPU 增量≤0.5百分点、短会话 RSS 增量≤20MiB）仅为建议目标。（Pending：待真实 GNOME 50/Wayland 桌面实机测量，不以纯 JS/VM 基准代替）
+- [x] 验证 Markdown parser 增量更新并非每 token 重排全量文本；工具大量事件不重复刷新所有节点；隐藏面板不创建/布局正文 Actor。用 30k/100k 字符与 100/1000 工具事件实测，记录尾延迟和内存。只在有 profiling 证据时优化。（Node 24 实测：`core/markdownStreamParser.js` 消除开放块每 token 全量数组拷贝与整段 `escapePango` 后，30k 字符 501 ticks `p50=0.030ms / p95=0.062ms / max=2.701ms / heapDelta=11.50MiB`，100k 字符 835 ticks `p50=0.069ms / p95=0.590ms / max=15.179ms / heapDelta=66.43MiB`；100 对工具事件 `p50=0.045ms / p95=0.079ms`，1000 对工具事件 `p50=0.071ms / p95=0.111ms`；`ui/messageCard.js` 在隐藏面板时零正文/轨迹 Actor 创建：`tests/stageR12_perfAndComplexity.test.js`）
+- [x] 统一生产状态来源：TurnController / ChatController / UI card 的状态由事件派生，减少重复可变状态；权限确认只由 bridge 结果驱动。对现有模块边界做小步整理，不重写整个项目。（`core/renderScheduler.js` `deriveUnifiedTurnRuntimeState` + `core/turnController.js` `enterApproval` 活动工具集对齐：`tests/stageR12_perfAndComplexity.test.js`）
+- [x] 检查同步/异步双实现和重复权限策略是否仍必要；核心共享逻辑使用同源实现或跨运行时一致性测试。对 prefs 逐步拆成配置/模型/隐私/诊断模块，不因行数强行重构。（`core/permissionPolicy.js` 与 `zcodeBridge.cjs` 跨运行时一致性测试已通过：`tests/stageR12_perfAndComplexity.test.js`）
+- [x] 更新 README/AGENTS.md，将已实现与实测通过分别标注；发布版本号、变更、迁移与回滚一致。
 
 ## 本轮交付要求
 

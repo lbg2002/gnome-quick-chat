@@ -360,10 +360,10 @@ export function applyToolTraceEventToCard(card, event, {
         }
         syncCardActiveTool();
         const nextPending = findNextPending();
-        return {node, nextPending, stillWaiting: Boolean(nextPending)};
+        return {node, nextPending, stillWaiting: Boolean(nextPending), allToolDotsDirty: Boolean(card.allToolDotsDirty)};
     }
 
-    if (type === 'permission_request') {
+    if (type === 'permission_request' || type === 'tool_approval_needed') {
         const hadPendingBefore = Boolean(findNextPending());
         const node = resolveOrCreate({
             requestId: event.requestId || '',
@@ -537,7 +537,7 @@ export function applyToolTraceEventToCard(card, event, {
         }
         syncCardActiveTool();
         const nextPending = findNextPending();
-        return {node, nextPending, stillWaiting: Boolean(nextPending)};
+        return {node, nextPending, stillWaiting: Boolean(nextPending), allToolDotsDirty: Boolean(card.allToolDotsDirty)};
     }
 
     if (type === 'tool_batch_end') {
@@ -579,7 +579,7 @@ export function applyToolTraceEventToCard(card, event, {
         }
         syncCardActiveTool();
         const nextPending = findNextPending();
-        return {node: null, nextPending, stillWaiting: Boolean(nextPending)};
+        return {node: null, nextPending, stillWaiting: Boolean(nextPending), allToolDotsDirty: Boolean(card.allToolDotsDirty)};
     }
 
     if (type === 'agent_settled' || type === 'turn_settled') {
@@ -606,11 +606,11 @@ export function applyToolTraceEventToCard(card, event, {
             card.dirty.tools = true;
             card.dirty.toolsUrgent = true;
         }
-        return {node: null, nextPending: null, stillWaiting: false};
+        return {node: null, nextPending: null, stillWaiting: false, allToolDotsDirty: Boolean(card.allToolDotsDirty)};
     }
 
     const nextPending = findNextPending();
-    return {node: null, nextPending, stillWaiting: Boolean(nextPending)};
+    return {node: null, nextPending, stillWaiting: Boolean(nextPending), allToolDotsDirty: Boolean(card.allToolDotsDirty)};
 }
 
 /**
@@ -619,15 +619,21 @@ export function applyToolTraceEventToCard(card, event, {
  */
 export function partitionToolDotsForLayout(toolNodes, {
     maxVisibleDots = DEFAULT_MAX_VISIBLE_TOOL_DOTS,
+    maxVisible = undefined,
     expanded = false,
+    dotsExpanded = undefined,
     selectedNodeId = null,
 } = {}) {
     const list = Array.isArray(toolNodes) ? toolNodes : [];
-    if (expanded || list.length <= maxVisibleDots) {
+    const effectiveMaxVisible = Math.max(4, Number(maxVisible ?? maxVisibleDots) || DEFAULT_MAX_VISIBLE_TOOL_DOTS);
+    const effectiveExpanded = Boolean(dotsExpanded ?? expanded);
+    if (effectiveExpanded || list.length <= effectiveMaxVisible) {
+        const visibleIds = new Set(list.map(n => n.id));
         return {
             isFolded: false,
             foldedCount: 0,
-            visibleIds: new Set(list.map(n => n.id)),
+            visibleIds,
+            visibleNodes: list,
         };
     }
 
@@ -647,7 +653,7 @@ export function partitionToolDotsForLayout(toolNodes, {
         }
     }
 
-    const budget = Math.max(4, maxVisibleDots - 1);
+    const budget = Math.max(4, effectiveMaxVisible - 1);
     const visibleIds = new Set(pinnedIds);
     for (let i = list.length - 1; i >= 0 && visibleIds.size < budget; i--) {
         visibleIds.add(list[i].id);
@@ -655,10 +661,12 @@ export function partitionToolDotsForLayout(toolNodes, {
 
     const foldedCount = Math.max(0, list.length - visibleIds.size);
     if (foldedCount <= 1) {
+        const allIds = new Set(list.map(n => n.id));
         return {
             isFolded: false,
             foldedCount: 0,
-            visibleIds: new Set(list.map(n => n.id)),
+            visibleIds: allIds,
+            visibleNodes: list,
         };
     }
 
@@ -666,6 +674,7 @@ export function partitionToolDotsForLayout(toolNodes, {
         isFolded: true,
         foldedCount,
         visibleIds,
+        visibleNodes: list.filter(n => visibleIds.has(n.id)),
     };
 }
 
@@ -1476,3 +1485,77 @@ export class HistoryWindowController {
         return {removedCards, truncated: true, needsRemountWindow: false};
     }
 }
+
+/**
+ * Derives a unified, single-source-of-truth runtime & UI state from `TurnController` and `card` (Stage R12.3).
+ * Guarantees:
+ * 1. `TurnController.state`, `activeToolIds`, `pendingApprovals`, and `card.toolNodes` are derived from the same
+ *    event stream without divergent mutable boolean flags.
+ * 2. Permission confirmation transitions (`pending_approval` / `sending_approval` -> `running` / `denied`)
+ *    are driven strictly by authoritative `permission_resolved` bridge events.
+ */
+export function deriveUnifiedTurnRuntimeState({
+    turnController = null,
+    card = null,
+    connectionError = '',
+    saveWarning = '',
+} = {}) {
+    const activeTurn = turnController?.activeTurn || turnController || null;
+    const tcState = turnController
+        ? String(turnController.state || activeTurn?.state || 'idle')
+        : 'idle';
+    const tcBusy = Boolean(
+        turnController &&
+        (tcState === 'starting' || tcState === 'streaming' || tcState === 'awaiting_approval')
+    );
+    const tcActiveToolCount = activeTurn?.activeToolIds instanceof Set
+        ? activeTurn.activeToolIds.size
+        : Number(turnController?.activeToolCount || 0);
+    const tcPendingApprovalCount = activeTurn?.pendingApprovals instanceof Set
+        ? activeTurn.pendingApprovals.size
+        : Number(turnController?.pendingApprovalCount || 0);
+
+    const toolNodes = Array.isArray(card?.toolNodes) ? card.toolNodes : [];
+    const cardRunningNodes = toolNodes.filter(n => n && n.status === 'running');
+    const cardAwaitingNodes = toolNodes.filter(
+        n => n && (n.status === 'pending_approval' || n.status === 'sending_approval')
+    );
+    const firstAwaiting = cardAwaitingNodes[0] || null;
+    const lastRunning = cardRunningNodes[cardRunningNodes.length - 1] || null;
+
+    const hasPendingApproval = tcPendingApprovalCount > 0 || cardAwaitingNodes.length > 0;
+    let phase = 'ready';
+    if (hasPendingApproval) {
+        phase = 'waiting_approval';
+    } else if (tcBusy) {
+        phase = (tcState === 'starting' && tcActiveToolCount === 0 && cardRunningNodes.length === 0)
+            ? 'sending'
+            : 'executing';
+    } else if (saveWarning && !connectionError) {
+        phase = 'save_failed';
+    } else if (connectionError) {
+        phase = /network|timeout|connection|reset|stream|eof|broken pipe|网络|连接|中断|超时/i.test(connectionError)
+            ? 'network_interrupted'
+            : 'error';
+    }
+
+    const inSync = !turnController || !card || (
+        cardRunningNodes.length === tcActiveToolCount &&
+        cardAwaitingNodes.length === tcPendingApprovalCount &&
+        Boolean(card.activeTool) === (cardRunningNodes.length > 0 || cardAwaitingNodes.length > 0)
+    );
+
+    return {
+        phase,
+        busy: tcBusy,
+        turnState: tcState,
+        hasPendingApproval,
+        pendingApprovalCount: Math.max(tcPendingApprovalCount, cardAwaitingNodes.length),
+        activeToolCount: Math.max(tcActiveToolCount, cardRunningNodes.length),
+        pendingToolName: firstAwaiting?.toolName || '',
+        pendingIsQuestion: Boolean(firstAwaiting?.isQuestion),
+        activeToolName: lastRunning?.toolName || '',
+        inSync,
+    };
+}
+
