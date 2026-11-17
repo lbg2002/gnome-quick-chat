@@ -101,10 +101,10 @@
 
 ### R9. OpenAI 网络与模型能力（P1）
 
-- [ ] 检查 backends/openaiAdapter.js:225–249 模型发现完成后预算重算是否仍保留当前问题；验证从存储内容构造的 messages 包含当前问题且不重复。上下文过长显式拒绝/裁剪历史，保留当前问题和输出预算；finish_reason=length 应显式 partial。
-- [ ] 除 R5 有界 /models 外，模型目录结果绑定端点/配置 generation；只更新对应适配器，切换 API 时取消旧请求。模型 metadata 缓存按端点和模型隔离，手动指定模型不被自动发现覆盖。
-- [ ] 审查 attachCrossOriginRedirectGuard（35–48）及 prefs 网络路径：只删除 Authorization 还不能保证 307/308 不会把带附件的 POST 正文转发到不同 origin；对于聊天 POST 默认拒绝跨 origin/HTTPS 降级重定向，确需允许时重新明确用户许可，GET 同样不能转发旧凭据。测试 localhost 两个 origin，捕获实际请求而不仅测试 URL 判断函数。
-- [ ] 兼容 API 能力不一致时仅给出明确诊断，不自动重复提交有副作用的操作；按实际支持显示 reasoning effort、usage、模型上下文、流式错误/完成状态。失败消息不注入后续正文。
+- [x] 检查 backends/openaiAdapter.js:225–249 模型发现完成后预算重算是否仍保留当前问题；验证从存储内容构造的 messages 包含当前问题且不重复。上下文过长显式拒绝/裁剪历史，保留当前问题和输出预算；finish_reason=length 应显式 partial。
+- [x] 除 R5 有界 /models 外，模型目录结果绑定端点/配置 generation；只更新对应适配器，切换 API 时取消旧请求。模型 metadata 缓存按端点和模型隔离，手动指定模型不被自动发现覆盖。
+- [x] 审查 attachCrossOriginRedirectGuard（35–48）及 prefs 网络路径：只删除 Authorization 还不能保证 307/308 不会把带附件的 POST 正文转发到不同 origin；对于聊天 POST 默认拒绝跨 origin/HTTPS 降级重定向，确需允许时重新明确用户许可，GET 同样不能转发旧凭据。测试 localhost 两个 origin，捕获实际请求而不仅测试 URL 判断函数。
+- [x] 兼容 API 能力不一致时仅给出明确诊断，不自动重复提交有副作用的操作；按实际支持显示 reasoning effort、usage、模型上下文、流式错误/完成状态。失败消息不注入后续正文。
 
 ### R10. 生产路径集成测试（P1，所有阶段共同验收）
 

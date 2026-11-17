@@ -19,7 +19,7 @@ export const DEFAULT_MAX_HISTORY_CHARS = 28000;
 export const DEFAULT_MAX_SINGLE_PROMPT_CHARS = 64000;
 
 const INTERNAL_ENV_HEADER_RE = /^\[Ubuntu GNOME 用户目录环境：[^\n]*\]\n/;
-const UI_ERROR_BANNER_PREFIX_RE = /^(?:⚠️\s*(?:错误|请求失败|连接失败|执行失败|历史未保存)|\[网络中断|\[连接异常)/;
+const UI_ERROR_BANNER_PREFIX_RE = /^(?:⚠️\s*(?:错误|请求失败|连接失败|执行失败|历史未保存|HTTP\s+\d+|拉取\s+\/models\s+失败)|\[网络中断|\[连接异常|HTTP\s+[45]\d\d\b)/i;
 
 export function stripInternalPromptHeaders(text) {
     if (typeof text !== 'string' || !text) return '';
@@ -47,10 +47,10 @@ export function extractCleanMessageText(message) {
     const stripped = stripInternalPromptHeaders(rawText).trim();
     if (!stripped) return '';
 
-    // Never feed UI-only error banners back into model context!
+    // Never feed UI-only error banners or failed turn error payloads back into model context!
     if (message.role === 'assistant') {
-        if (message.status === 'failed' && !rawText.trim()) return '';
-        if (UI_ERROR_BANNER_PREFIX_RE.test(stripped) && message.errorMessage) return '';
+        if (message.status === 'failed') return '';
+        if (UI_ERROR_BANNER_PREFIX_RE.test(stripped) && (message.errorMessage || stripped.startsWith('⚠️'))) return '';
     }
     return stripped;
 }
@@ -319,6 +319,15 @@ export function groupContextTurns(sanitizedMessages) {
     return groups;
 }
 
+export function resolveEffectiveReserveOutputTokens(contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS, explicitReserve = undefined) {
+    const ctx = Math.max(64, Number(contextWindowTokens) || DEFAULT_CONTEXT_WINDOW_TOKENS);
+    const requested = Number(explicitReserve);
+    if (Number.isFinite(requested) && requested > 0) {
+        return Math.max(16, Math.min(requested, Math.floor(ctx * 0.5)));
+    }
+    return Math.max(32, Math.min(DEFAULT_RESERVE_OUTPUT_TOKENS, Math.floor(ctx * 0.25)));
+}
+
 /**
  * Validates and bounds the user's current prompt against single-prompt and token-window limits.
  * Never silently drops user input: returns `rejected: true` or `truncated: true` with an explicit Chinese notice.
@@ -326,7 +335,7 @@ export function groupContextTurns(sanitizedMessages) {
 export function preparePromptWithinBudget(rawPromptText, {
     systemPrompt = '',
     contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS,
-    reserveOutputTokens = DEFAULT_RESERVE_OUTPUT_TOKENS,
+    reserveOutputTokens = undefined,
     maxPromptChars = DEFAULT_MAX_SINGLE_PROMPT_CHARS,
     allowTruncate = false,
 } = {}) {
@@ -341,8 +350,10 @@ export function preparePromptWithinBudget(rawPromptText, {
         };
     }
 
+    const effectiveCtx = Math.max(64, Number(contextWindowTokens) || DEFAULT_CONTEXT_WINDOW_TOKENS);
+    const effectiveReserve = resolveEffectiveReserveOutputTokens(effectiveCtx, reserveOutputTokens);
     const sysTokens = estimateTextTokens(systemPrompt) + 8;
-    const availableInputTokens = Math.max(512, contextWindowTokens - reserveOutputTokens - sysTokens);
+    const availableInputTokens = Math.max(16, effectiveCtx - effectiveReserve - sysTokens);
     const promptTokens = estimateTextTokens(text) + 6;
     const exceedsChars = text.length > maxPromptChars;
     const exceedsTokens = promptTokens > availableInputTokens;
@@ -354,6 +365,9 @@ export function preparePromptWithinBudget(rawPromptText, {
             truncated: false,
             promptText: text,
             estimatedTokens: promptTokens,
+            availableInputTokens,
+            reserveOutputTokens: effectiveReserve,
+            contextWindowTokens: effectiveCtx,
             warning: '',
         };
     }
@@ -365,16 +379,19 @@ export function preparePromptWithinBudget(rawPromptText, {
             truncated: false,
             promptText: text,
             estimatedTokens: promptTokens,
+            availableInputTokens,
+            reserveOutputTokens: effectiveReserve,
+            contextWindowTokens: effectiveCtx,
             warning: exceedsChars
                 ? `当前提问长度（${text.length} 字符）超过单次上限（${maxPromptChars} 字符），请精简或分段提问`
-                : `当前提问预计占用约 ${promptTokens} tokens，超过模型输入窗口上限（可用约 ${availableInputTokens} tokens），请精简内容后重试`,
+                : `当前提问预计占用约 ${promptTokens} tokens，超过模型输入窗口上限（可用约 ${availableInputTokens} tokens，总窗口 ${effectiveCtx} tokens，预留输出 ${effectiveReserve} tokens），请精简内容后重试`,
         };
     }
 
     const charRatio = exceedsChars ? maxPromptChars / text.length : 1;
-    const tokenRatio = exceedsTokens ? (availableInputTokens * 0.92) / promptTokens : 1;
+    const tokenRatio = exceedsTokens ? (availableInputTokens * 0.90) / promptTokens : 1;
     const ratio = Math.max(0.05, Math.min(charRatio, tokenRatio));
-    const keepLen = Math.max(128, Math.floor(text.length * ratio));
+    const keepLen = Math.max(64, Math.floor(text.length * ratio));
     const truncatedText = `${text.slice(0, keepLen)}\n\n[注：原始输入过长，已按上下文窗口上限保留前 ${keepLen} 字符]`;
 
     return {
@@ -383,6 +400,9 @@ export function preparePromptWithinBudget(rawPromptText, {
         truncated: true,
         promptText: truncatedText,
         estimatedTokens: estimateTextTokens(truncatedText) + 6,
+        availableInputTokens,
+        reserveOutputTokens: effectiveReserve,
+        contextWindowTokens: effectiveCtx,
         warning: `当前提问超出上下文预算，已保留前 ${keepLen} 字符`,
     };
 }
@@ -406,13 +426,15 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
 
     const maxMessages = Math.max(1, Number(opts.maxMessages ?? DEFAULT_MAX_HISTORY_MESSAGES));
     const maxChars = Math.max(128, Number(opts.maxChars ?? DEFAULT_MAX_HISTORY_CHARS));
-    const contextWindowTokens = Math.max(1024, Number(opts.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS));
-    const reserveOutputTokens = Math.max(256, Number(opts.reserveOutputTokens ?? DEFAULT_RESERVE_OUTPUT_TOKENS));
+    const maxSinglePromptChars = Math.max(maxChars, Number(opts.maxSinglePromptChars ?? DEFAULT_MAX_SINGLE_PROMPT_CHARS));
+    const contextWindowTokens = Math.max(64, Number(opts.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS));
+    const reserveOutputTokens = resolveEffectiveReserveOutputTokens(contextWindowTokens, opts.reserveOutputTokens);
     const systemTokens = opts.systemPrompt ? estimateTextTokens(opts.systemPrompt) + 8 : 0;
-    const separateCurrentTokens = opts.currentPrompt ? estimateTextTokens(opts.currentPrompt) + 8 : 0;
-    const separateCurrentChars = opts.currentPrompt ? String(opts.currentPrompt).length : 0;
+    const hasSeparateCurrentPrompt = Boolean(opts.currentPrompt && String(opts.currentPrompt).trim());
+    const separateCurrentTokens = hasSeparateCurrentPrompt ? estimateTextTokens(opts.currentPrompt) + 8 : 0;
+    const separateCurrentChars = hasSeparateCurrentPrompt ? String(opts.currentPrompt).length : 0;
 
-    const maxHistoryTokens = Math.max(256, contextWindowTokens - reserveOutputTokens - systemTokens - separateCurrentTokens);
+    const maxHistoryTokens = Math.max(16, contextWindowTokens - reserveOutputTokens - systemTokens - separateCurrentTokens);
     const maxHistoryChars = Math.max(128, maxChars - separateCurrentChars);
 
     const sanitized = sanitizeMessagesForModelContext(messages, {
@@ -420,8 +442,8 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
         targetEndpoint: opts.targetEndpoint || '',
         allowCrossContextAttachments: Boolean(opts.allowCrossContextAttachments),
         stripAllPriorAttachments: Boolean(opts.stripAllPriorAttachments),
-        preserveAttachmentMessageId: opts.preserveAttachmentMessageId || '',
-        isPriorHistoryOnly: Boolean(opts.currentPrompt && String(opts.currentPrompt).trim()),
+        preserveAttachmentMessageId: opts.preserveAttachmentMessageId || opts.currentUserMessageId || '',
+        isPriorHistoryOnly: hasSeparateCurrentPrompt,
     });
     if (!sanitized.length) return [];
 
@@ -433,7 +455,6 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
     let usedChars = 0;
     let usedTokens = 0;
 
-    const hasSeparateCurrentPrompt = Boolean(opts.currentPrompt && String(opts.currentPrompt).trim());
     const cleanSeparateCurrent = hasSeparateCurrentPrompt
         ? stripInternalPromptHeaders(String(opts.currentPrompt)).trim()
         : '';
@@ -443,7 +464,7 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
         const isNewestTurn = i === turnGroups.length - 1;
         const hasAssistantReply = group.some(m => m.role === 'assistant');
 
-        // R3: If a prior turn group has NO assistant reply (e.g. CLI spawn failed, request failed,
+        // R3 & R9: If a prior turn group has NO assistant reply (e.g. CLI spawn failed, request failed,
         // or turn was cancelled before any output), do NOT re-inject the unanswered user prompt
         // into subsequent turns (prevents both duplicate prompt injection on retry and unintended
         // re-execution of side-effecting requests).
@@ -462,10 +483,12 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
         const groupMsgCount = group.length;
         const groupChars = group.reduce((sum, m) => sum + m.content.length, 0);
         const groupTokens = group.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+        const isTrailingCurrentPrompt = !hasSeparateCurrentPrompt && isNewestTurn && !hasAssistantReply;
+        const charCeilingForGroup = isTrailingCurrentPrompt ? maxSinglePromptChars : maxHistoryChars;
 
         if (
             usedMessages + groupMsgCount <= maxMessages &&
-            usedChars + groupChars <= maxHistoryChars &&
+            usedChars + groupChars <= charCeilingForGroup &&
             usedTokens + groupTokens <= maxHistoryTokens
         ) {
             selectedGroupsReversed.push(group.map(m => ({
@@ -479,15 +502,26 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
             continue;
         }
 
-        // If even the newest group exceeds the budget AND it is the trailing current user message,
-        // bound it explicitly instead of blowing past the ceiling or returning empty context!
-        if (!hasSeparateCurrentPrompt && isNewestTurn && selectedGroupsReversed.length === 0) {
+        // R9.1: If the newest group is the trailing current user question and exceeds the budget:
+        // - If `rejectOversizedCurrentPrompt` is set, reject explicitly rather than silently dropping;
+        // - Otherwise bound it within `maxHistoryTokens` and `maxHistoryChars` so the current question
+        //   is always retained and output budget (`reserveOutputTokens`) is respected.
+        if (isTrailingCurrentPrompt && selectedGroupsReversed.length === 0) {
             const latestUser = group[0];
             if (latestUser && latestUser.role === 'user') {
-                const boundedContent = latestUser.content.length > maxHistoryChars
-                    ? `${latestUser.content.slice(0, Math.max(64, maxHistoryChars - 36))}\n[内容过长已按预算截断]`
-                    : latestUser.content;
-                selectedGroupsReversed.push([{role: 'user', content: boundedContent}]);
+                if (opts.rejectOversizedCurrentPrompt) {
+                    throw new Error(
+                        `当前提问预计占用约 ${groupTokens} tokens，超过模型输入窗口上限（可用约 ${maxHistoryTokens} tokens，总窗口 ${contextWindowTokens} tokens，预留输出 ${reserveOutputTokens} tokens），请精简内容后重试`
+                    );
+                }
+                const bounded = preparePromptWithinBudget(latestUser.content, {
+                    systemPrompt: opts.systemPrompt || '',
+                    contextWindowTokens,
+                    reserveOutputTokens,
+                    maxPromptChars: maxHistoryChars,
+                    allowTruncate: true,
+                });
+                selectedGroupsReversed.push([{role: 'user', content: bounded.promptText || latestUser.content}]);
             }
         }
         break;

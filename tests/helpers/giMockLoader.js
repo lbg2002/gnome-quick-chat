@@ -868,6 +868,9 @@ export function createMockGio() {
                             else cb(this, {_ok: true});
                         });
                     },
+                    replace_contents_bytes_async(bytes, etag, backup, flags, cancellable, cb) {
+                        return this.replace_contents_async(bytes, etag, backup, flags, cancellable, cb);
+                    },
                     replace_contents_finish(res) {
                         if (res?._err) throw res._err;
                         return [true, ''];
@@ -1059,6 +1062,13 @@ export function registerGiMocks() {
                         msg._status = res.statusCode || 200;
                         msg._reasonPhrase = res.statusMessage || 'OK';
                         msg._resHeaders = res.headers || {};
+
+                        msg._emit('got-headers');
+                        if (cancelled || msg._aborted || cancellable?.is_cancelled?.()) {
+                            res.resume();
+                            finishWithError(new Error(msg._abortReason || 'Operation was cancelled'));
+                            return;
+                        }
 
                         const status = msg._status;
                         const location = res.headers?.location;

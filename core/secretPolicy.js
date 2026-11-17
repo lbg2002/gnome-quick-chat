@@ -145,6 +145,30 @@ export function inspectEndpointSecurity(rawBaseUrl = '') {
     };
 }
 
+export function resolveRedirectTargetUrl(initialUrl, redirectedUrl) {
+    const rawTarget = String(redirectedUrl || '').trim();
+    if (!rawTarget) return '';
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawTarget)) {
+        return rawTarget;
+    }
+    try {
+        const base = parseUrlPortable(String(initialUrl || ''));
+        const scheme = base.protocol.toLowerCase();
+        const host = base.hostname.toLowerCase();
+        const portSuffix = base.port ? `:${base.port}` : '';
+        if (rawTarget.startsWith('//')) {
+            return `${scheme}${rawTarget}`;
+        }
+        if (rawTarget.startsWith('/')) {
+            return `${scheme}//${host}${portSuffix}${rawTarget}`;
+        }
+        const basePath = String(base.pathname || '/').replace(/\/[^/]*$/, '/');
+        return `${scheme}//${host}${portSuffix}${basePath}${rawTarget}`;
+    } catch (_) {
+        return rawTarget;
+    }
+}
+
 /**
  * Returns `true` if an HTTP redirect changes `scheme`, `hostname`, or effective `port`
  * (including any `https:` -> `http:` downgrade), requiring `Authorization` to be stripped!
@@ -152,7 +176,8 @@ export function inspectEndpointSecurity(rawBaseUrl = '') {
 export function shouldStripAuthOnRedirect(initialUrl, redirectedUrl) {
     try {
         const a = parseUrlPortable(String(initialUrl || ''));
-        const b = parseUrlPortable(String(redirectedUrl || ''));
+        const resolvedTarget = resolveRedirectTargetUrl(initialUrl, redirectedUrl);
+        const b = parseUrlPortable(resolvedTarget);
         const schemeA = a.protocol.toLowerCase();
         const schemeB = b.protocol.toLowerCase();
         if (schemeA !== schemeB) return true;
@@ -164,6 +189,119 @@ export function shouldStripAuthOnRedirect(initialUrl, redirectedUrl) {
         return true;
     }
 }
+
+/**
+ * Evaluates HTTP redirect security policy (Stage R9):
+ * 1. Any `https:` -> `http:` downgrade is blocked immediately on all HTTP methods (`GET`, `POST`, etc.)
+ *    and strips credentials + request body.
+ * 2. Any cross-origin redirect on `POST` (or non-GET/HEAD requests, such as `POST /chat/completions`
+ *    carrying user prompts and embedded attachments) is rejected by default (`allowCrossOriginPost === false`),
+ *    clearing the request body and stripping `Authorization` before the foreign origin is contacted.
+ * 3. Cross-origin `GET` redirects (such as `GET /models`) strip `Authorization` / credentials before following.
+ */
+export function evaluateRedirectPolicy(initialUrl, redirectedUrl, {
+    method = 'GET',
+    status = 302,
+    allowCrossOriginPost = false,
+} = {}) {
+    const cleanMethod = String(method || 'GET').trim().toUpperCase();
+    const isReadOnlyMethod = cleanMethod === 'GET' || cleanMethod === 'HEAD';
+    const resolvedTarget = resolveRedirectTargetUrl(initialUrl, redirectedUrl);
+
+    let a;
+    let b;
+    try {
+        a = parseUrlPortable(String(initialUrl || ''));
+        b = parseUrlPortable(resolvedTarget);
+    } catch (_) {
+        return {
+            allowed: false,
+            isCrossOrigin: true,
+            isHttpsDowngrade: false,
+            stripAuthorization: true,
+            clearRequestBody: true,
+            initialOrigin: '',
+            targetOrigin: '',
+            resolvedTargetUrl: resolvedTarget,
+            reason: 'invalid_redirect_url',
+            message: '检测到目标地址无效的 HTTP 重定向，已阻止转发请求与凭据',
+        };
+    }
+
+    const schemeA = a.protocol.toLowerCase();
+    const schemeB = b.protocol.toLowerCase();
+    if ((schemeA !== 'http:' && schemeA !== 'https:') || (schemeB !== 'http:' && schemeB !== 'https:')) {
+        return {
+            allowed: false,
+            isCrossOrigin: true,
+            isHttpsDowngrade: false,
+            stripAuthorization: true,
+            clearRequestBody: true,
+            initialOrigin: '',
+            targetOrigin: '',
+            resolvedTargetUrl: resolvedTarget,
+            reason: 'unsupported_redirect_scheme',
+            message: `检测到不支持的重定向协议 (${schemeB || 'unknown'})，已阻止转发请求`,
+        };
+    }
+
+    const portA = normalizeEffectivePort(schemeA, a.port);
+    const portB = normalizeEffectivePort(schemeB, b.port);
+    const defaultPortA = schemeA === 'https:' ? '443' : '80';
+    const defaultPortB = schemeB === 'https:' ? '443' : '80';
+    const initialOrigin = `${schemeA}//${a.hostname.toLowerCase()}${portA && portA !== defaultPortA ? `:${portA}` : ''}`;
+    const targetOrigin = `${schemeB}//${b.hostname.toLowerCase()}${portB && portB !== defaultPortB ? `:${portB}` : ''}`;
+
+    const isHttpsDowngrade = schemeA === 'https:' && schemeB !== 'https:';
+    const isCrossOrigin =
+        schemeA !== schemeB ||
+        a.hostname.toLowerCase() !== b.hostname.toLowerCase() ||
+        portA !== portB;
+
+    if (isHttpsDowngrade) {
+        return {
+            allowed: false,
+            isCrossOrigin: true,
+            isHttpsDowngrade: true,
+            stripAuthorization: true,
+            clearRequestBody: true,
+            initialOrigin,
+            targetOrigin,
+            resolvedTargetUrl: resolvedTarget,
+            reason: 'https_downgrade',
+            message: `拒绝 HTTPS 降级重定向（HTTP ${status || 302}: ${initialOrigin} -> ${targetOrigin}），已阻止发送凭据与正文`,
+        };
+    }
+
+    if (isCrossOrigin && !isReadOnlyMethod && !allowCrossOriginPost) {
+        return {
+            allowed: false,
+            isCrossOrigin: true,
+            isHttpsDowngrade: false,
+            stripAuthorization: true,
+            clearRequestBody: true,
+            initialOrigin,
+            targetOrigin,
+            resolvedTargetUrl: resolvedTarget,
+            reason: 'cross_origin_post_redirect',
+            message: `拒绝跨源重定向转发聊天请求（HTTP ${status || 307}: ${initialOrigin} -> ${targetOrigin}），已阻止向未授权来源发送提问与附件正文`,
+        };
+    }
+
+    return {
+        allowed: true,
+        isCrossOrigin,
+        isHttpsDowngrade: false,
+        stripAuthorization: isCrossOrigin,
+        clearRequestBody: false,
+        initialOrigin,
+        targetOrigin,
+        resolvedTargetUrl: resolvedTarget,
+        reason: isCrossOrigin ? 'cross_origin_stripped_auth' : 'same_origin',
+        message: '',
+    };
+}
+
 
 function encodePlaintextMap(mapObj) {
     const clean = {};

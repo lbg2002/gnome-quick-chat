@@ -12,6 +12,8 @@
  *    never trapping models beyond the first 10 items!
  */
 
+import {normalizeEndpointKeyIdentity} from './secretPolicy.js';
+
 export const DEFAULT_CLI_CACHE_TTL_MS = 60_000;
 export const DEFAULT_CATALOG_CACHE_TTL_MS = 45_000;
 export const MAX_PROVIDER_CONFIG_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on local config JSON/TOML
@@ -19,6 +21,12 @@ export const DEFAULT_PICKER_PAGE_SIZE = 8;
 
 export function makeModelEntryKey(backend, providerId, modelId) {
     return `${String(backend || '').trim()}::${String(providerId || '').trim()}::${String(modelId || '').trim()}`;
+}
+
+export function makeEndpointModelMetadataKey(endpointOrUrl, modelId) {
+    const cleanEndpoint = normalizeEndpointKeyIdentity(endpointOrUrl) || String(endpointOrUrl || '').trim().toLowerCase() || '__default__';
+    const cleanModel = String(modelId || '').trim();
+    return `${cleanEndpoint}::${cleanModel}`;
 }
 
 export function sanitizeProviderCatalogSecrets(catalog) {
@@ -302,3 +310,86 @@ export function recordRecentModelKey(recentKeys, targetKey, maxRecent = 12) {
     const without = current.filter(k => k !== cleanTarget);
     return [cleanTarget, ...without].slice(0, maxRecent);
 }
+
+/**
+ * Per-endpoint + model metadata cache (`contextWindowTokens`, `supportsReasoningEffort`, etc.).
+ * Ensures two different OpenAI-compatible endpoints sharing the same model name (e.g. `gpt-4o` or `qwen-coder`)
+ * never overwrite or pollute each other's context window or capability metadata (Stage R9).
+ */
+export class EndpointModelMetadataCache {
+    constructor({maxEntries = 1000} = {}) {
+        this._maxEntries = Math.max(32, Number(maxEntries) || 1000);
+        this._byEndpointAndModel = new Map();
+    }
+
+    _resolveEndpointKey(endpointOrUrl) {
+        return normalizeEndpointKeyIdentity(endpointOrUrl) || String(endpointOrUrl || '').trim().toLowerCase() || '__default__';
+    }
+
+    set(endpointOrUrl, modelId, metadata = {}) {
+        const cleanModel = String(modelId || '').trim();
+        if (!cleanModel || !metadata || typeof metadata !== 'object') return null;
+        const endpointKey = this._resolveEndpointKey(endpointOrUrl);
+        const compositeKey = `${endpointKey}::${cleanModel}`;
+        const existing = this._byEndpointAndModel.get(compositeKey) || {};
+        const merged = {
+            ...existing,
+            ...metadata,
+            endpointKey,
+            modelId: cleanModel,
+        };
+        if (this._byEndpointAndModel.has(compositeKey)) {
+            this._byEndpointAndModel.delete(compositeKey);
+        } else if (this._byEndpointAndModel.size >= this._maxEntries) {
+            const oldestKey = this._byEndpointAndModel.keys().next().value;
+            if (oldestKey !== undefined) {
+                this._byEndpointAndModel.delete(oldestKey);
+            }
+        }
+        this._byEndpointAndModel.set(compositeKey, merged);
+        return merged;
+    }
+
+    setBatch(endpointOrUrl, metadataById = {}) {
+        if (!metadataById || typeof metadataById !== 'object') return;
+        for (const [modelId, meta] of Object.entries(metadataById)) {
+            this.set(endpointOrUrl, modelId, meta);
+        }
+    }
+
+    get(endpointOrUrl, modelId) {
+        const cleanModel = String(modelId || '').trim();
+        if (!cleanModel) return null;
+        const endpointKey = this._resolveEndpointKey(endpointOrUrl);
+        return this._byEndpointAndModel.get(`${endpointKey}::${cleanModel}`) || null;
+    }
+
+    getEndpointMap(endpointOrUrl) {
+        const endpointKey = this._resolveEndpointKey(endpointOrUrl);
+        const prefix = `${endpointKey}::`;
+        const out = {};
+        for (const [key, value] of this._byEndpointAndModel.entries()) {
+            if (key.startsWith(prefix)) {
+                out[value.modelId] = {...value};
+            }
+        }
+        return out;
+    }
+
+    clearEndpoint(endpointOrUrl) {
+        const endpointKey = this._resolveEndpointKey(endpointOrUrl);
+        const prefix = `${endpointKey}::`;
+        for (const key of Array.from(this._byEndpointAndModel.keys())) {
+            if (key.startsWith(prefix)) {
+                this._byEndpointAndModel.delete(key);
+            }
+        }
+    }
+
+    clearAll() {
+        this._byEndpointAndModel.clear();
+    }
+}
+
+export const defaultEndpointModelMetadataCache = new EndpointModelMetadataCache();
+

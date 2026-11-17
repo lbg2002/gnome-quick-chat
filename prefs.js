@@ -54,6 +54,9 @@ import {
     sanitizeDiagnosticSnapshot,
 } from './core/diagnosticsReport.js';
 import {
+    defaultEndpointModelMetadataCache,
+} from './core/modelCatalogCache.js';
+import {
     parseModelsResponse,
     redactSensitiveText,
 } from './runtime/sseParser.js';
@@ -1616,13 +1619,21 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 rebuildProviderAndModelUi(`❌ 无效的接口地址：${modelsUrl}`, true);
                 return;
             }
-            attachCrossOriginRedirectGuard(msg, modelsUrl);
+            const redirectGuardState = {blockedError: null, policy: null, strippedAuth: false, signalIds: []};
+            attachCrossOriginRedirectGuard(msg, modelsUrl, {
+                method: 'GET',
+                cancellable: reqCancellable,
+                state: redirectGuardState,
+            });
             msg.get_request_headers().append('Accept', 'application/json');
             if (targetApiKey) {
                 msg.get_request_headers().append('Authorization', `Bearer ${targetApiKey}`);
             }
 
-            readSoupResponseBytesBoundedAsync(session, msg, {cancellable: reqCancellable}).then(
+            readSoupResponseBytesBoundedAsync(session, msg, {
+                cancellable: reqCancellable,
+                redirectGuardState,
+            }).then(
                 ({status, bytes: rawData}) => {
                     if (
                         reqGen !== modelsRefreshGeneration ||
@@ -1642,6 +1653,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                         preferredModel: preferred,
                         apiKey: targetApiKey,
                     });
+                    if (parsed.metadataById && Object.keys(parsed.metadataById).length > 0) {
+                        defaultEndpointModelMetadataCache.setBatch(targetEndpointSlot, parsed.metadataById);
+                    }
                     const ids = parsed.models;
                     if (!ids.length) {
                         rebuildProviderAndModelUi('⚠️ 在线接口未返回模型列表，已使用本地配置', true);
@@ -1652,7 +1666,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                         if (hasKey('openai-cached-models')) {
                             s.set_strv('openai-cached-models', ids.slice(0, 120));
                         }
-                        if (!preferred && parsed.selectedModel) {
+                        const currentManualModel = getStr('openai-model', '').trim();
+                        if (!currentManualModel && !preferred && parsed.selectedModel) {
                             registry.updateBackendProfile('openai', {model: parsed.selectedModel});
                         }
                         rebuildProviderAndModelUi(`✓ 连接成功：从 ${modelsUrl} 拉取到 ${ids.length} 个在线模型`, true);
@@ -1668,7 +1683,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     if (
                         reqGen !== modelsRefreshGeneration ||
                         configGenSnapshot !== registry.generation ||
-                        reqCancellable.is_cancelled() ||
+                        (!redirectGuardState.blockedError && reqCancellable.is_cancelled()) ||
                         ((eff === 'openai' || eff === 'unconfigured') &&
                             normalizeEndpointKeyIdentity(getStr('openai-base-url', '').trim()) !== targetEndpointSlot)
                     ) {
@@ -1676,7 +1691,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     }
                     refreshBtn.sensitive = true;
                     refreshBtnContent.label = '查询 / 刷新模型';
-                    const cleanErr = redactSensitiveText(err?.message || String(err), {
+                    const rawErr = redirectGuardState.blockedError || err;
+                    const cleanErr = redactSensitiveText(rawErr?.message || String(rawErr), {
                         apiKey: targetApiKey,
                         maxChars: 200,
                     });

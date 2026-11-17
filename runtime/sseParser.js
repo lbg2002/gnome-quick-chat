@@ -17,6 +17,7 @@ export const DEFAULT_SSE_LIMITS = Object.freeze({
     maxNonSseBytes: 2 * 1024 * 1024, // 2 MiB for non-streaming JSON fallback body
     maxErrorBodyBytes: 32 * 1024,    // 32 KiB for HTTP non-2xx error body
     maxModelsBodyBytes: 1024 * 1024, // 1 MiB for GET /models catalog response
+    maxModelsResponseBytes: 1024 * 1024, // 1 MiB alias used by OpenAIAdapter
 });
 
 export const DEFAULT_TIMEOUT_POLICY = Object.freeze({
@@ -70,21 +71,91 @@ export function supportsOpenAIReasoningEffort(modelId, explicitCapability = null
     return REASONING_EFFORT_MODEL_RE.test(clean);
 }
 
+/**
+ * Normalizes OpenAI-compatible `usage` objects into consistent token counters.
+ */
+export function normalizeOpenAIUsage(rawUsage) {
+    if (!rawUsage || typeof rawUsage !== 'object') return null;
+    const promptTokens = Number(rawUsage.prompt_tokens ?? rawUsage.input_tokens ?? rawUsage.promptTokens ?? 0) || 0;
+    const completionTokens = Number(rawUsage.completion_tokens ?? rawUsage.output_tokens ?? rawUsage.completionTokens ?? 0) || 0;
+    const totalTokens = Number(rawUsage.total_tokens ?? rawUsage.totalTokens ?? (promptTokens + completionTokens)) || 0;
+    const reasoningTokens = Number(
+        rawUsage.completion_tokens_details?.reasoning_tokens ??
+        rawUsage.output_tokens_details?.reasoning_tokens ??
+        rawUsage.reasoning_tokens ??
+        rawUsage.reasoningTokens ??
+        0
+    ) || 0;
+    if (promptTokens <= 0 && completionTokens <= 0 && totalTokens <= 0) {
+        return {...rawUsage};
+    }
+    return {
+        ...rawUsage,
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: totalTokens,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        ...(reasoningTokens > 0 ? {reasoningTokens} : {}),
+    };
+}
+
+/**
+ * Diagnoses OpenAI-compatible API capability mismatches without auto-retrying side-effecting requests (Stage R9).
+ */
+export function diagnoseOpenAICapabilityError(status, rawBodyOrMessage = '') {
+    const text = String(rawBodyOrMessage || '').toLowerCase();
+    if (!text) return '';
+    if (
+        text.includes('reasoning_effort') ||
+        (text.includes('reasoning') && (text.includes('unrecognized') || text.includes('unsupported') || text.includes('unknown')))
+    ) {
+        return '诊断：当前兼容接口或模型不支持 reasoning_effort（思考强度）参数，可在设置中调整或切换模型（未自动重发）';
+    }
+    if (
+        text.includes('context_length_exceeded') ||
+        text.includes('maximum context length') ||
+        text.includes('too many tokens') ||
+        (text.includes('context') && text.includes('exceed'))
+    ) {
+        return '诊断：请求内容超出远端模型上下文窗口上限，请精简提问、移除大附件或新建会话（未自动重发）';
+    }
+    if (
+        text.includes('model_not_found') ||
+        (text.includes('model') && (text.includes('does not exist') || text.includes('not found')))
+    ) {
+        return '诊断：远端接口不存在该模型 ID，请点击刷新模型列表或检查模型名称';
+    }
+    if (
+        (status === 400 || status === 422 || status === 501) &&
+        (text.includes('stream') && (text.includes('unsupported') || text.includes('not support')))
+    ) {
+        return '诊断：当前兼容接口不支持 SSE 流式输出参数';
+    }
+    return '';
+}
+
 export function formatSanitizedHttpError(status, reasonPhrase = '', rawBody = '', {apiKey = ''} = {}) {
     const base = `HTTP ${status}${reasonPhrase ? ` (${reasonPhrase})` : ''}`;
     const trimmed = String(rawBody || '').trim();
     if (!trimmed) return base;
+
+    const diag = diagnoseOpenAICapabilityError(status, trimmed);
+    const diagSuffix = diag ? ` · ${diag}` : '';
 
     if (trimmed.startsWith('{')) {
         try {
             const parsed = JSON.parse(trimmed);
             const msg = parsed?.error?.message || parsed?.message || parsed?.detail || '';
             if (msg) {
-                return redactSensitiveText(`${base}: ${msg}`, {apiKey, maxChars: 280});
+                const subDiag = diagnoseOpenAICapabilityError(status, `${msg} ${ parsed?.error?.code || '' }`) || diag;
+                const suffix = subDiag ? ` · ${subDiag}` : '';
+                return redactSensitiveText(`${base}: ${msg}${suffix}`, {apiKey, maxChars: 320});
             }
         } catch (_) {}
     }
-    return redactSensitiveText(`${base}: ${trimmed.replace(/\s+/g, ' ')}`, {apiKey, maxChars: 240});
+    return redactSensitiveText(`${base}: ${trimmed.replace(/\s+/g, ' ')}${diagSuffix}`, {apiKey, maxChars: 280});
 }
 
 /**
@@ -94,8 +165,10 @@ export function formatSanitizedHttpError(status, reasonPhrase = '', rawBody = ''
 export function parseModelsResponse(status, rawBytesOrText, {
     preferredModel = '',
     maxBytes = DEFAULT_SSE_LIMITS.maxModelsBodyBytes,
+    maxResponseBytes = 0,
     apiKey = '',
 } = {}) {
+    const effectiveMaxBytes = Math.max(1024, Number(maxResponseBytes || maxBytes) || DEFAULT_SSE_LIMITS.maxModelsBodyBytes);
     const isBytes = rawBytesOrText instanceof Uint8Array;
     const byteLength = isBytes
         ? rawBytesOrText.byteLength
@@ -108,8 +181,8 @@ export function parseModelsResponse(status, rawBytesOrText, {
         throw new Error(`拉取 /models 失败（${formatSanitizedHttpError(status, '', preview, {apiKey})}）`);
     }
 
-    if (byteLength > maxBytes) {
-        throw new Error(`/models 响应体积超过安全上限（${Math.ceil(byteLength / 1024)} KB > ${Math.ceil(maxBytes / 1024)} KB）`);
+    if (byteLength > effectiveMaxBytes) {
+        throw new Error(`/models 响应体积超过安全上限（${Math.ceil(byteLength / 1024)} KB > ${Math.ceil(effectiveMaxBytes / 1024)} KB）`);
     }
 
     const bodyText = isBytes
@@ -149,10 +222,29 @@ export function parseModelsResponse(status, rawBytesOrText, {
             item?.context_window ||
             item?.max_context_length ||
             item?.input_token_limit ||
+            item?.top_provider?.context_length ||
             0
         );
+        let explicitReasoningCap = null;
+        if (typeof item?.supports_reasoning === 'boolean') {
+            explicitReasoningCap = item.supports_reasoning;
+        } else if (typeof item?.supportsReasoningEffort === 'boolean') {
+            explicitReasoningCap = item.supportsReasoningEffort;
+        } else if (typeof item?.capabilities?.reasoning === 'boolean') {
+            explicitReasoningCap = item.capabilities.reasoning;
+        } else if (Array.isArray(item?.supported_parameters)) {
+            explicitReasoningCap = item.supported_parameters.includes('reasoning_effort') ||
+                item.supported_parameters.includes('reasoning');
+        }
+        const meta = {};
         if (contextWindow > 0) {
-            metadataById[id] = {contextWindowTokens: contextWindow};
+            meta.contextWindowTokens = contextWindow;
+        }
+        if (explicitReasoningCap !== null) {
+            meta.supportsReasoningEffort = explicitReasoningCap;
+        }
+        if (Object.keys(meta).length > 0) {
+            metadataById[id] = meta;
         }
     }
 
@@ -504,9 +596,11 @@ export class OpenAISseParser {
                 try {
                     const obj = JSON.parse(joined);
                     if (obj?.error) {
+                        const rawMsg = obj.error?.message || JSON.stringify(obj.error);
+                        const diag = diagnoseOpenAICapabilityError(400, `${rawMsg} ${obj.error?.code || ''}`);
                         const errMsg = redactSensitiveText(
-                            obj.error?.message || JSON.stringify(obj.error),
-                            {apiKey: this._apiKey, maxChars: 280}
+                            diag ? `${rawMsg} · ${diag}` : rawMsg,
+                            {apiKey: this._apiKey, maxChars: 300}
                         );
                         return {
                             events: trailingEvents,

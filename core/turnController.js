@@ -883,6 +883,9 @@ export class TurnController {
             status: explicitStatus = '',
             errorText = '',
             finishReason = turn.finishReason || '',
+            usage = turn.usage || null,
+            contextWindowTokens = turn.contextWindowTokens || 0,
+            reasoningEffort = turn.reasoningEffort || '',
             aborted = turn.aborted,
             timedOut = turn.timedOut,
             interrupted = turn.interrupted,
@@ -895,6 +898,15 @@ export class TurnController {
         const cleanFinishReason = typeof finishReason === 'string' ? finishReason.trim() : '';
         if (cleanFinishReason) {
             turn.finishReason = cleanFinishReason;
+        }
+        if (usage && typeof usage === 'object') {
+            turn.usage = usage;
+        }
+        if (Number(contextWindowTokens) > 0) {
+            turn.contextWindowTokens = Number(contextWindowTokens);
+        }
+        if (typeof reasoningEffort === 'string' && reasoningEffort.trim()) {
+            turn.reasoningEffort = reasoningEffort.trim();
         }
         turn.aborted = Boolean(aborted || explicitStatus === 'cancelled');
         turn.timedOut = Boolean(timedOut || explicitStatus === 'timed_out');
@@ -973,7 +985,7 @@ export class TurnController {
             return false;
         }
 
-        const isPartial = turn.state !== 'completed';
+        const isPartial = turn.state !== 'completed' || turn.finishReason === 'length';
 
         if (turn.text) {
             const contentParts = [];
@@ -989,6 +1001,9 @@ export class TurnController {
                 status: turn.state,
                 ...(isPartial ? {partial: true} : {}),
                 ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
+                ...(turn.usage ? {usage: turn.usage} : {}),
+                ...(turn.contextWindowTokens ? {contextWindowTokens: turn.contextWindowTokens} : {}),
+                ...(turn.reasoningEffort ? {reasoningEffort: turn.reasoningEffort} : {}),
                 ...(turn.error && !turn.aborted ? {errorMessage: turn.error} : {}),
             };
             try { onPersistAssistant?.(persistedMsg); } catch (_) {}
@@ -1003,6 +1018,9 @@ export class TurnController {
                     status: turn.state,
                     partial: isPartial,
                     ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
+                    ...(turn.usage ? {usage: turn.usage} : {}),
+                    ...(turn.contextWindowTokens ? {contextWindowTokens: turn.contextWindowTokens} : {}),
+                    ...(turn.reasoningEffort ? {reasoningEffort: turn.reasoningEffort} : {}),
                     message: {
                         id: turn.messageId,
                         role: 'assistant',
@@ -1010,6 +1028,9 @@ export class TurnController {
                         status: turn.state,
                         ...(isPartial ? {partial: true} : {}),
                         ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
+                        ...(turn.usage ? {usage: turn.usage} : {}),
+                        ...(turn.contextWindowTokens ? {contextWindowTokens: turn.contextWindowTokens} : {}),
+                        ...(turn.reasoningEffort ? {reasoningEffort: turn.reasoningEffort} : {}),
                         ...(turn.error && !turn.aborted ? {errorMessage: turn.error} : {}),
                     },
                 });
@@ -1045,10 +1066,14 @@ export class TurnController {
             clientGeneration: turn.clientGeneration,
             type: 'agent_settled',
             status: turn.state,
+            ...(turn.finishReason === 'length' ? {partial: true} : {}),
             aborted: turn.state === 'cancelled',
             timedOut: turn.state === 'timed_out',
             interrupted: turn.state === 'interrupted',
             ...(turn.finishReason ? {finishReason: turn.finishReason} : {}),
+            ...(turn.usage ? {usage: turn.usage} : {}),
+            ...(turn.contextWindowTokens ? {contextWindowTokens: turn.contextWindowTokens} : {}),
+            ...(turn.reasoningEffort ? {reasoningEffort: turn.reasoningEffort} : {}),
             errorMessage: turn.error || '',
         });
         return true;

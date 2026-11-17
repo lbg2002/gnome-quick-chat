@@ -49,7 +49,10 @@ import {
     appendBoundedInMemoryText,
     applyToolTraceEventToCard,
 } from './core/renderScheduler.js';
-import {loadOpenAIApiKey} from './core/secretStore.js';
+import {
+    loadOpenAIApiKey,
+    normalizeEndpointKeyIdentity,
+} from './core/secretStore.js';
 import {
     buildContinuationPrompt,
     planSessionRetentionCleanup,
@@ -1750,6 +1753,17 @@ export default class QuickChat extends Extension {
         if (!event || !this._panel || !this._chatController) return;
 
         if (event.type === 'models_discovered' && event.backend === 'openai' && Array.isArray(event.models)) {
+            if (
+                event.clientGeneration !== undefined &&
+                this._chatController?.clientGeneration !== undefined &&
+                Number(event.clientGeneration) !== Number(this._chatController.clientGeneration)
+            ) {
+                return;
+            }
+            const currentEndpointKey = normalizeEndpointKeyIdentity(this._getSettingString('openai-base-url', ''));
+            if (event.endpointKey && currentEndpointKey && event.endpointKey !== currentEndpointKey) {
+                return;
+            }
             if (this._hasKey('openai-cached-models') && event.models.length > 0) {
                 const seen = new Set();
                 const ids = [];
@@ -2013,7 +2027,8 @@ export default class QuickChat extends Extension {
             const text = messageText(event.message);
             const thinking = messageThinking(event.message);
             const finishReason = String(event.finishReason || event.message?.finishReason || '');
-            const isPartial = Boolean(event.partial || event.message?.partial);
+            const isPartial = Boolean(event.partial || event.message?.partial || finishReason === 'length');
+            const usage = event.usage || event.message?.usage || null;
             if (text || thinking || event.message.errorMessage) {
                 const card = this._ensureLiveCard(event);
                 if (text && card.text !== text) {
@@ -2033,6 +2048,7 @@ export default class QuickChat extends Extension {
                 }
                 if (finishReason) card.finishReason = finishReason;
                 if (isPartial) card.partial = true;
+                if (usage) card.usage = usage;
                 card.activeTool = false;
                 this._panel.historyWindow?.updateStoredMessageById(card.messageId, {
                     text: card.text,
@@ -2040,6 +2056,7 @@ export default class QuickChat extends Extension {
                     modelId: card.modelId || this._modelLabel || '',
                     ...(finishReason ? {finishReason} : {}),
                     ...(isPartial ? {partial: true} : {}),
+                    ...(usage ? {usage} : {}),
                     ...(event.message.errorMessage ? {errorMessage: event.message.errorMessage} : {}),
                 });
                 card.flushRender();
@@ -2063,6 +2080,7 @@ export default class QuickChat extends Extension {
                 finishReason === 'length' ||
                 (terminalStatus !== 'completed' && Boolean(this._live?.text?.trim()))
             );
+            const usage = event.usage || this._live?.usage || null;
             const finishedText = this._live?.text || '';
             const settledCard = this._live;
             const settledTurnId = event.turnId || activeTurn?.turnId || settledCard?.turnId || '';
@@ -2082,6 +2100,7 @@ export default class QuickChat extends Extension {
                 settledCard.status = terminalStatus;
                 settledCard.partial = isPartial;
                 if (finishReason) settledCard.finishReason = finishReason;
+                if (usage) settledCard.usage = usage;
                 settledCard.activeTool = false;
                 settledCard.dirty.tools = true;
                 settledCard.dirty.toolsUrgent = true;
@@ -2093,6 +2112,7 @@ export default class QuickChat extends Extension {
                     status: terminalStatus,
                     partial: isPartial,
                     ...(settledCard.finishReason ? {finishReason: settledCard.finishReason} : {}),
+                    ...(settledCard.usage ? {usage: settledCard.usage} : {}),
                 });
                 settledCard.flushRender();
             }
@@ -2139,11 +2159,15 @@ export default class QuickChat extends Extension {
                 const msg = event.errorMessage || '执行失败';
                 this._panel.setStatusIndicator('error', `错误：${msg}`);
                 this._syncDiagnosticsSnapshot({lastConnectionError: msg});
+            } else if (terminalStatus === 'completed' && finishReason === 'length') {
+                const usageHint = usage?.totalTokens ? ` · 本轮 ${usage.totalTokens} tokens` : '';
+                this._panel.setStatusIndicator('ready', `⚠️ 输出达长度上限 (length)${usageHint} · 可点击继续生成`);
             } else if (
                 !this._panel.lastStatusText.startsWith('错误：') &&
                 !this._panel.lastStatusText.startsWith('⚠️ 历史未保存')
             ) {
-                this._panel.setStatusIndicator('ready', this._idleStatus || '随问');
+                const usageHint = usage?.totalTokens ? ` · ${usage.totalTokens} tokens` : '';
+                this._panel.setStatusIndicator('ready', `${this._idleStatus || '随问'}${usageHint}`);
             }
 
             this._updateAiTabBadge();
