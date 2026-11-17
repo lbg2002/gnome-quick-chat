@@ -211,6 +211,7 @@ export default class QuickChat extends Extension {
                 onEntryKeyPress: event => this._onEntryKeyPress(event),
                 onEntryTextChanged: text => this._onEntryTextChanged(text),
                 onDismissMigrationNotice: () => this._modelPicker?.dismissMigrationNotice(),
+                onLoadOlderArchivePage: pageSize => this._loadOlderArchivePage(pageSize),
             });
 
             const wrapper = this._panel.build({showNotificationTab: true});
@@ -1061,11 +1062,34 @@ export default class QuickChat extends Extension {
         });
     }
 
+    async _loadOlderArchivePage(pageSize = 20) {
+        if (!this._isSessionUnlockedAndAlive() || !this._chatController?.client || !this._panel?.historyWindow) {
+            return null;
+        }
+        const beforeIndex = Number(this._panel.historyWindow.externalArchivedCount || 0);
+        if (beforeIndex <= 0) return null;
+        try {
+            const data = await this._chatController.client.request('get_archive_page', {
+                beforeIndex,
+                limit: pageSize,
+            });
+            return {
+                messages: detailedMessages(data?.messages || []),
+                olderRemainingCount: Number(data?.olderRemainingCount ?? 0),
+                pageStartIndex: Number(data?.pageStartIndex ?? 0),
+                pageEndIndex: Number(data?.pageEndIndex ?? 0),
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
     _onClientStateReady({state, messages, config}) {
         this._live = null;
         this._panel?.renderInitialHistory(
             detailedMessages(messages),
-            userText => this._recordPromptHistory(userText)
+            userText => this._recordPromptHistory(userText),
+            {externalArchivedCount: Number(state?.archivedMessageCount || 0)}
         );
         this._refreshAttachmentBarUi();
 
@@ -2309,8 +2333,10 @@ export default class QuickChat extends Extension {
     _rememberPreviousNonEmptySessionId(sessionId) {
         if (!this._hasKey('previous-session-id')) return;
         const cleanId = String(sessionId || '').trim();
-        const hasMessages = Boolean((this._panel?.historyWindow?.allMessages?.length || 0) > 0);
-        if (cleanId && hasMessages) {
+        const totalMessages =
+            (this._panel?.historyWindow?.allMessages?.length || 0) +
+            (this._panel?.historyWindow?.externalArchivedCount || 0);
+        if (cleanId && totalMessages > 0) {
             this._settings.set_string('previous-session-id', cleanId);
         }
     }
@@ -2331,9 +2357,12 @@ export default class QuickChat extends Extension {
                 maxSessions: this._getSettingInt('session-retention-max-count', 20),
                 maxAgeDays: this._getSettingInt('session-retention-max-days', 30),
             });
+            const hotCount = this._panel.historyWindow?.allMessages?.length || 0;
+            const archivedCount = this._panel.historyWindow?.externalArchivedCount || 0;
             this._panel.renderSessionMenuState({
                 currentSessionId,
-                messageCount: this._panel.historyWindow?.allMessages?.length || 0,
+                messageCount: hotCount + archivedCount,
+                archivedCount,
                 previousSessionId,
                 previousPreview: prevObj?.preview || '',
                 cleanupPlan,

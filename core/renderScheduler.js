@@ -9,6 +9,8 @@ export const DEFAULT_INITIAL_HISTORY_COUNT = 24;
 export const DEFAULT_HISTORY_PAGE_SIZE = 24;
 export const DEFAULT_MAX_MOUNTED_ACTORS = 48;
 export const DEFAULT_MAX_VISIBLE_TOOL_DOTS = 10;
+export const DEFAULT_HOT_DATA_CACHE_LIMIT = 120;
+export const DEFAULT_MAX_INDEXED_MESSAGES = 1200;
 
 export const UI_BUFFER_CAPS = Object.freeze({
     maxThinkingDisplayBytes: 24 * 1024, // 24 KiB in thinking drawer unless expanded
@@ -56,6 +58,93 @@ function capMessageRecordBytes(msg, maxFieldBytes) {
         }
     }
     return cloned || msg;
+}
+
+function demoteMessageToIndexEntry(msg, compactPreviewBytes = 1024) {
+    if (!msg || typeof msg !== 'object') return msg;
+    if (msg.isPagedIndexEntry && !msg.thinking) {
+        return capMessageRecordBytes(msg, compactPreviewBytes);
+    }
+    const capped = capMessageRecordBytes(
+        {
+            id: String(msg.id || ''),
+            ...(msg.revision ? {revision: Number(msg.revision)} : {}),
+            ...(msg.turnId ? {turnId: String(msg.turnId)} : {}),
+            ...(msg.replyTo ? {replyTo: String(msg.replyTo)} : {}),
+            role: msg.role || 'assistant',
+            text: String(msg.text || ''),
+            ...(msg.displayText && msg.displayText !== msg.text ? {displayText: String(msg.displayText)} : {}),
+            thinking: '',
+            createdAt: String(msg.createdAt || ''),
+            ts: Number(msg.ts || 0),
+            backend: String(msg.backend || ''),
+            modelId: String(msg.modelId || ''),
+            status: String(msg.status || 'completed'),
+            ...(msg.partial ? {partial: true} : {}),
+            ...(msg.finishReason ? {finishReason: String(msg.finishReason)} : {}),
+            ...(msg.errorMessage ? {errorMessage: String(msg.errorMessage)} : {}),
+            compactedInDataLayer: true,
+            isPagedIndexEntry: true,
+        },
+        compactPreviewBytes
+    );
+    capped.compactedInDataLayer = true;
+    capped.isPagedIndexEntry = true;
+    return capped;
+}
+
+/**
+ * Releases all Actor, trace node, renderState, closure, and timer references on an evicted or destroyed card (Stage R8).
+ */
+export function releaseCardRuntimeReferences(card, {clearTimer = null} = {}) {
+    if (!card || typeof card !== 'object') return;
+    if (card.renderTimer) {
+        if (typeof clearTimer === 'function') {
+            try { clearTimer(card.renderTimer); } catch (_) {}
+        }
+        card.renderTimer = 0;
+    }
+    if (card.copyBtn?._copyResetTimer) {
+        if (typeof clearTimer === 'function') {
+            try { clearTimer(card.copyBtn._copyResetTimer); } catch (_) {}
+        }
+        card.copyBtn._copyResetTimer = 0;
+    }
+    if (card.drawerCopyBtn?._copyResetTimer) {
+        if (typeof clearTimer === 'function') {
+            try { clearTimer(card.drawerCopyBtn._copyResetTimer); } catch (_) {}
+        }
+        card.drawerCopyBtn._copyResetTimer = 0;
+    }
+    if (Array.isArray(card.toolNodes)) {
+        for (const node of card.toolNodes) {
+            if (!node || typeof node !== 'object') continue;
+            node.dot = null;
+            node.questionOptionButtons = null;
+            node.customAnswerEntry = null;
+            node.input = null;
+        }
+        card.toolNodes = [];
+    }
+    try { card.dirtyToolNodeIds?.clear?.(); } catch (_) {}
+    if (card.box) {
+        try { card.box.remove_all_transitions?.(); } catch (_) {}
+        try { card.box.destroy?.(); } catch (_) {}
+        card.box = null;
+    }
+    card.renderState = null;
+    card.traceBox = null;
+    card.dotsFlow = null;
+    card.detailDrawer = null;
+    card.bodyBox = null;
+    card.roleLabel = null;
+    card.copyBtn = null;
+    card.continueBtn = null;
+    card.drawerCopyBtn = null;
+    card.flushRender = null;
+    card.scheduleRender = null;
+    card.syncContinueVisibility = null;
+    card.released = true;
 }
 
 const BACKEND_FALLBACK_LABELS = Object.freeze({
@@ -673,6 +762,10 @@ export class HistoryWindowController {
         maxMountedActors = DEFAULT_MAX_MOUNTED_ACTORS,
         maxSingleMessageDataBytes = UI_BUFFER_CAPS.maxSingleMessageDataBytes,
         maxHistoryDataBytes = UI_BUFFER_CAPS.maxHistoryDataBytes,
+        maxHotCachedMessages = DEFAULT_HOT_DATA_CACHE_LIMIT,
+        maxHotDataMessages = null,
+        maxIndexedMessages = DEFAULT_MAX_INDEXED_MESSAGES,
+        clearTimer = null,
     } = {}) {
         this._initialPageSize = Math.max(2, Number(initialPageSize) || DEFAULT_INITIAL_HISTORY_COUNT);
         this._pageSize = Math.max(2, Number(pageSize) || DEFAULT_HISTORY_PAGE_SIZE);
@@ -685,21 +778,42 @@ export class HistoryWindowController {
             4096,
             Number(maxHistoryDataBytes) || UI_BUFFER_CAPS.maxHistoryDataBytes
         );
+        this._maxHotCachedMessages = Math.max(
+            this._maxMounted,
+            Number(maxHotDataMessages ?? maxHotCachedMessages) || DEFAULT_HOT_DATA_CACHE_LIMIT
+        );
+        this._maxIndexedMessages = Math.max(
+            this._maxHotCachedMessages,
+            Number(maxIndexedMessages) || DEFAULT_MAX_INDEXED_MESSAGES
+        );
+        this._clearTimer = typeof clearTimer === 'function' ? clearTimer : null;
 
         this.allMessages = [];
+        this.paginationIndex = new Map();
         this.mountedCards = [];
         this.windowStart = 0;
         this.windowEnd = 0;
         this.totalDataBytes = 0;
         this.compactedCount = 0;
+        this.hotCachedCount = 0;
+        this.pagedIndexEntryCount = 0;
+        this.externalArchivedCount = 0;
+    }
+
+    get mountedCount() {
+        return this.mountedCards.length;
     }
 
     get hasOlder() {
-        return this.windowStart > 0;
+        return this.windowStart > 0 || this.externalArchivedCount > 0;
     }
 
     get olderRemainingCount() {
-        return Math.max(0, this.windowStart);
+        return Math.max(0, this.windowStart) + Math.max(0, this.externalArchivedCount);
+    }
+
+    get totalLogicalCount() {
+        return this.allMessages.length + Math.max(0, this.externalArchivedCount);
     }
 
     get hasNewer() {
@@ -710,23 +824,74 @@ export class HistoryWindowController {
         return Math.max(0, this.allMessages.length - this.windowEnd);
     }
 
+    setExternalArchivedCount(count = 0) {
+        this.externalArchivedCount = Math.max(0, Number(count) || 0);
+    }
+
+    _rebuildPaginationIndex() {
+        this.paginationIndex.clear();
+        let hotCount = 0;
+        let pagedCount = 0;
+        for (let i = 0; i < this.allMessages.length; i++) {
+            const msg = this.allMessages[i];
+            if (!msg || typeof msg !== 'object') continue;
+            const isPaged = Boolean(msg.isPagedIndexEntry);
+            if (isPaged) pagedCount++;
+            else hotCount++;
+            if (msg.id) {
+                this.paginationIndex.set(msg.id, {
+                    id: msg.id,
+                    revision: Number(msg.revision || 0),
+                    index: i,
+                    role: msg.role || 'assistant',
+                    turnId: msg.turnId || '',
+                    replyTo: msg.replyTo || '',
+                    createdAt: msg.createdAt || '',
+                    ts: Number(msg.ts || 0),
+                    modelId: msg.modelId || '',
+                    backend: msg.backend || '',
+                    status: msg.status || 'completed',
+                    isHotCached: !isPaged,
+                    isPagedIndexEntry: isPaged,
+                });
+            }
+        }
+        this.hotCachedCount = hotCount;
+        this.pagedIndexEntryCount = pagedCount;
+    }
+
     _enforceDataBudget() {
+        const compactPreviewBytes = Math.min(2048, Math.max(256, Math.floor(this._maxSingleMessageDataBytes / 8)));
+        const hotTailStart = Math.max(0, this.allMessages.length - this._maxHotCachedMessages);
+
+        // Pass 0 (R8): Demote off-window older messages outside the hot cache window into compact index entries!
+        for (let i = 0; i < this.allMessages.length; i++) {
+            const inMountedWindow = i >= this.windowStart && i < this.windowEnd;
+            const inHotTail = i >= hotTailStart;
+            if (!inMountedWindow && !inHotTail) {
+                const prev = this.allMessages[i];
+                if (prev && !prev.isPagedIndexEntry) {
+                    this.allMessages[i] = demoteMessageToIndexEntry(prev, compactPreviewBytes);
+                    this.compactedCount++;
+                }
+            } else {
+                this.allMessages[i] = capMessageRecordBytes(this.allMessages[i], this._maxSingleMessageDataBytes);
+            }
+        }
+
         let total = 0;
         for (let i = 0; i < this.allMessages.length; i++) {
-            this.allMessages[i] = capMessageRecordBytes(this.allMessages[i], this._maxSingleMessageDataBytes);
             total += estimateMessageDataBytes(this.allMessages[i]);
         }
 
         if (total > this._maxHistoryDataBytes) {
-            const compactPreviewBytes = Math.min(2048, Math.max(256, Math.floor(this._maxSingleMessageDataBytes / 8)));
             // Pass 1: compact off-window older messages first (indices < windowStart)
             for (let i = 0; i < this.windowStart && total > this._maxHistoryDataBytes; i++) {
                 const msg = this.allMessages[i];
                 if (!msg || msg.compactedInDataLayer) continue;
                 const beforeBytes = estimateMessageDataBytes(msg);
-                const compacted = capMessageRecordBytes(msg, compactPreviewBytes);
+                const compacted = demoteMessageToIndexEntry(msg, compactPreviewBytes);
                 if (compacted !== msg) {
-                    compacted.compactedInDataLayer = true;
                     this.allMessages[i] = compacted;
                     const afterBytes = estimateMessageDataBytes(compacted);
                     total -= Math.max(0, beforeBytes - afterBytes);
@@ -747,29 +912,47 @@ export class HistoryWindowController {
                     this.compactedCount++;
                 }
             }
-            // Pass 3: if still exceeding budget and there are unmounted older entries before windowStart, drop oldest unmounted entries
-            while (this.windowStart > 0 && total > this._maxHistoryDataBytes && this.allMessages.length > this._maxMounted) {
-                const removed = this.allMessages.shift();
-                total -= estimateMessageDataBytes(removed);
-                this.windowStart = Math.max(0, this.windowStart - 1);
-                this.windowEnd = Math.max(this.windowStart, this.windowEnd - 1);
-                this.compactedCount++;
-            }
+        }
+
+        // Pass 3: if exceeding byte budget or maxIndexedMessages and there are unmounted older entries before windowStart,
+        // evict oldest unmounted entries from memory into externalArchivedCount
+        while (
+            this.windowStart > 0 &&
+            this.allMessages.length > this._maxMounted &&
+            (total > this._maxHistoryDataBytes || this.allMessages.length > this._maxIndexedMessages)
+        ) {
+            const removed = this.allMessages.shift();
+            total -= estimateMessageDataBytes(removed);
+            this.windowStart = Math.max(0, this.windowStart - 1);
+            this.windowEnd = Math.max(this.windowStart, this.windowEnd - 1);
+            this.externalArchivedCount++;
+            this.compactedCount++;
         }
 
         this.totalDataBytes = Math.max(0, total);
+        this._rebuildPaginationIndex();
     }
 
     clear() {
+        for (const card of this.mountedCards) {
+            releaseCardRuntimeReferences(card, {clearTimer: this._clearTimer});
+        }
         this.allMessages = [];
+        this.paginationIndex.clear();
         this.mountedCards = [];
         this.windowStart = 0;
         this.windowEnd = 0;
         this.totalDataBytes = 0;
         this.compactedCount = 0;
+        this.hotCachedCount = 0;
+        this.pagedIndexEntryCount = 0;
+        this.externalArchivedCount = 0;
     }
 
-    reset(allDetailedMessages = []) {
+    reset(allDetailedMessages = [], {externalArchivedCount = 0} = {}) {
+        for (const card of this.mountedCards) {
+            releaseCardRuntimeReferences(card, {clearTimer: this._clearTimer});
+        }
         this.allMessages = Array.isArray(allDetailedMessages)
             ? allDetailedMessages.map(m => capMessageRecordBytes(m, this._maxSingleMessageDataBytes))
             : [];
@@ -778,12 +961,51 @@ export class HistoryWindowController {
         this.windowStart = Math.max(0, total - this._initialPageSize);
         this.windowEnd = total;
         this.compactedCount = 0;
+        this.externalArchivedCount = Math.max(0, Number(externalArchivedCount) || 0);
         this._enforceDataBudget();
         return {
             initialSlice: this.allMessages.slice(this.windowStart, this.windowEnd),
             windowStart: this.windowStart,
             windowEnd: this.windowEnd,
         };
+    }
+
+    /**
+     * Prepends a page of older archived messages loaded from `archive.jsonl` into the front
+     * of `allMessages` without losing current scroll window offsets (Stage R8).
+     */
+    prependArchivedMessages(archivedDetailedMessages = [], {remainingOlderCount = null} = {}) {
+        const list = Array.isArray(archivedDetailedMessages) ? archivedDetailedMessages : [];
+        if (list.length === 0) {
+            if (remainingOlderCount !== null) {
+                this.externalArchivedCount = Math.max(0, Number(remainingOlderCount) || 0);
+            }
+            return {insertedCount: 0};
+        }
+
+        const existingIds = new Set(this.allMessages.map(m => m?.id).filter(Boolean));
+        const toInsert = [];
+        for (const item of list) {
+            if (!item || typeof item !== 'object') continue;
+            if (item.id && existingIds.has(item.id)) continue;
+            if (item.id) existingIds.add(item.id);
+            toInsert.push(capMessageRecordBytes(item, this._maxSingleMessageDataBytes));
+        }
+
+        if (toInsert.length > 0) {
+            this.allMessages.splice(0, 0, ...toInsert);
+            this.windowStart += toInsert.length;
+            this.windowEnd += toInsert.length;
+        }
+
+        if (remainingOlderCount !== null) {
+            this.externalArchivedCount = Math.max(0, Number(remainingOlderCount) || 0);
+        } else {
+            this.externalArchivedCount = Math.max(0, this.externalArchivedCount - toInsert.length);
+        }
+
+        this._enforceDataBudget();
+        return {insertedCount: toInsert.length};
     }
 
     registerMountedInitialCards(cards) {
@@ -829,10 +1051,12 @@ export class HistoryWindowController {
         const evictedBottomCards = [];
         while (evictBottomCount > 0 && this.mountedCards.length > 1) {
             const removed = this.mountedCards.pop();
+            releaseCardRuntimeReferences(removed, {clearTimer: this._clearTimer});
             evictedBottomCards.push(removed);
             this.windowEnd = Math.max(this.windowStart, this.windowEnd - 1);
             evictBottomCount--;
         }
+        this._enforceDataBudget();
         return evictedBottomCards;
     }
 
@@ -863,6 +1087,7 @@ export class HistoryWindowController {
                 }
                 this.mountedCards.shift();
                 this.windowStart++;
+                releaseCardRuntimeReferences(candidate, {clearTimer: this._clearTimer});
                 evictedTopCards.push(candidate);
             }
         }
@@ -880,7 +1105,12 @@ export class HistoryWindowController {
         for (let i = this.allMessages.length - 1; i >= 0; i--) {
             if (this.allMessages[i]?.id === messageId) {
                 this.allMessages[i] = capMessageRecordBytes(
-                    {...this.allMessages[i], ...patch},
+                    {
+                        ...this.allMessages[i],
+                        ...patch,
+                        isPagedIndexEntry: false,
+                        compactedInDataLayer: false,
+                    },
                     this._maxSingleMessageDataBytes
                 );
                 this._enforceDataBudget();
@@ -899,6 +1129,13 @@ export class HistoryWindowController {
 
         const replyToId = String(assistantCard.replyTo || '').trim();
         if (replyToId) {
+            const indexHit = this.paginationIndex.get(replyToId);
+            if (indexHit && this.allMessages[indexHit.index]?.role === 'user') {
+                const exactUser = this.allMessages[indexHit.index];
+                if (exactUser?.text?.trim()) {
+                    return exactUser.text.trim();
+                }
+            }
             const exactUser = this.allMessages.find(m => m && m.id === replyToId && m.role === 'user');
             if (exactUser && exactUser.text?.trim()) {
                 return exactUser.text.trim();
@@ -1029,19 +1266,27 @@ export class HistoryWindowController {
 
         if (cutAllIdx <= this.windowStart) {
             // Cut point is earlier than the currently mounted window: clear all mounted cards and reset window to tail!
-            removedCards.push(...this.mountedCards);
+            for (const c of this.mountedCards) {
+                releaseCardRuntimeReferences(c, {clearTimer: this._clearTimer});
+                removedCards.push(c);
+            }
             this.mountedCards = [];
             this.windowStart = Math.max(0, this.allMessages.length - this._initialPageSize);
             this.windowEnd = this.allMessages.length;
+            this._enforceDataBudget();
             return {removedCards, truncated: true, needsRemountWindow: true};
         }
 
         const mountedCutOffset = cutAllIdx - this.windowStart;
         if (mountedCutOffset < this.mountedCards.length) {
             const tailRemoved = this.mountedCards.splice(mountedCutOffset);
-            removedCards.push(...tailRemoved);
+            for (const c of tailRemoved) {
+                releaseCardRuntimeReferences(c, {clearTimer: this._clearTimer});
+                removedCards.push(c);
+            }
         }
         this.windowEnd = Math.min(this.allMessages.length, this.windowStart + this.mountedCards.length);
+        this._enforceDataBudget();
         return {removedCards, truncated: true, needsRemountWindow: false};
     }
 }

@@ -627,6 +627,8 @@ export class BackendClient {
                 committedRevision: this._store?.revision || 0,
                 durableRevision: this._store?.durableRevision || 0,
                 failedRevisions: this._store?.failedRevisions || [],
+                archivedMessageCount: this._store?.archivedMessageCount || 0,
+                totalLogicalMessageCount: this._store?.totalLogicalMessageCount || (this._store?.messages?.length || 0),
             };
         }
         if (type === 'get_models') {
@@ -636,7 +638,43 @@ export class BackendClient {
             });
         }
         if (type === 'get_messages') {
-            return {messages: this._store ? [...this._store.messages] : []};
+            if (!this._store) {
+                return {messages: [], archivedCount: 0, totalLogicalMessageCount: 0};
+            }
+            if (fields.includeArchived) {
+                const full = await this._store.loadFullLogicalHistory({
+                    includeRewound: Boolean(fields.includeRewound),
+                });
+                return {
+                    messages: full.messages,
+                    archivedCount: full.archivedCount,
+                    totalLogicalMessageCount: full.messages.length,
+                };
+            }
+            return {
+                messages: [...this._store.messages],
+                archivedCount: this._store.archivedMessageCount || 0,
+                totalLogicalMessageCount: this._store.totalLogicalMessageCount || this._store.messages.length,
+            };
+        }
+        if (type === 'get_archive_page') {
+            if (!this._store) {
+                return {
+                    messages: [],
+                    hasMoreOlder: false,
+                    remainingOlderCount: 0,
+                    nextBeforeArchiveOffset: 0,
+                    nextBeforeRevision: 0,
+                    totalArchivedCount: 0,
+                };
+            }
+            return this._store.loadArchivedHistoryPage({
+                beforeRevision: Number(fields.beforeRevision || 0),
+                beforeMessageId: String(fields.beforeMessageId || ''),
+                beforeArchiveOffset: Number.isInteger(fields.beforeArchiveOffset) ? fields.beforeArchiveOffset : null,
+                limit: Number(fields.limit || 30),
+                includeRewound: Boolean(fields.includeRewound),
+            });
         }
         if (type === 'flush_session') {
             if (!this._store) {
@@ -716,12 +754,19 @@ export class BackendClient {
         }
         if (type === 'export_session') {
             const {exportSessionToPrivateFileAsync} = await import('./core/sessionStore.js');
+            const includeRewound = Boolean(fields.includeRewound);
+            const fullHistory = this._store
+                ? await this._store.loadFullLogicalHistory({includeRewound})
+                : {messages: [], archivedCount: 0, rewoundMessages: []};
             return exportSessionToPrivateFileAsync(
-                this._store ? [...this._store.messages] : [],
+                fullHistory.messages,
                 this._store?.meta || {},
                 {
                     sessionId: this._sessionId,
                     format: fields.format === 'json' ? 'json' : 'markdown',
+                    includeRewound,
+                    rewoundMessages: fullHistory.rewoundMessages,
+                    archivedCount: fullHistory.archivedCount,
                 }
             );
         }

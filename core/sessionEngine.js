@@ -24,6 +24,11 @@ export const MAX_SINGLE_JSONL_RECORD_BYTES = 2 * 1024 * 1024; // 2 MiB safety ca
 export const MAX_SESSION_META_BYTES = 256 * 1024; // 256 KiB cap for meta.json
 export const MAX_SESSION_LINE_BYTES = 512 * 1024; // 512 KiB cap per line on load
 export const MAX_SESSION_HOT_FILE_BYTES = 8 * 1024 * 1024; // 8 MiB cap for hot messages.jsonl
+export const MAX_SESSION_ARCHIVE_FILE_BYTES = 16 * 1024 * 1024; // 16 MiB cap for archive.jsonl
+export const MAX_SESSION_ARCHIVE_MESSAGES = 5000; // Max retained compacted messages in archive.jsonl
+export const MAX_SESSION_REWOUND_FILE_BYTES = 2 * 1024 * 1024; // 2 MiB cap for rewound.jsonl
+export const MAX_SESSION_REWOUND_MESSAGES = 500; // Max retained rewound branch messages
+export const MAX_SESSION_CORRUPT_BACKUP_BYTES = 512 * 1024; // 512 KiB cap for corrupt backup files
 export const VALID_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 const UTF8_ENCODER = new TextEncoder();
@@ -76,10 +81,11 @@ export function resolveSafeSessionPaths(sessionsRootDir, sessionId) {
     const metaPath = `${dir}/meta.json`;
     const jsonlPath = `${dir}/messages.jsonl`;
     const archivePath = `${dir}/archive.jsonl`;
+    const rewoundPath = `${dir}/rewound.jsonl`;
     const corruptPath = `${dir}/corrupt.jsonl`;
     const legacyPath = `${prefix}${validId}.qc.json`;
 
-    for (const candidate of [dir, metaPath, jsonlPath, archivePath, corruptPath, legacyPath]) {
+    for (const candidate of [dir, metaPath, jsonlPath, archivePath, rewoundPath, corruptPath, legacyPath]) {
         if (!candidate.startsWith(prefix) || candidate === rootDir) {
             throw new Error(`会话路径越界保护已拦截：${candidate}`);
         }
@@ -92,6 +98,7 @@ export function resolveSafeSessionPaths(sessionsRootDir, sessionId) {
         metaPath,
         jsonlPath,
         archivePath,
+        rewoundPath,
         corruptPath,
         legacyPath,
     };
@@ -210,6 +217,22 @@ export function normalizeStoredMessage(raw, {
         ? raw.displayText.slice(0, 65536)
         : '';
 
+    const archiveKind = raw.archiveKind === 'rewound_branch'
+        ? 'rewound_branch'
+        : (raw.archiveKind === 'compacted' ? 'compacted' : '');
+    const archivedAt = typeof raw.archivedAt === 'string' && raw.archivedAt.trim()
+        ? raw.archivedAt.trim().slice(0, 48)
+        : '';
+    const rewoundAt = typeof raw.rewoundAt === 'string' && raw.rewoundAt.trim()
+        ? raw.rewoundAt.trim().slice(0, 48)
+        : '';
+    const rewindFromMessageId = typeof raw.rewindFromMessageId === 'string' && raw.rewindFromMessageId.trim()
+        ? raw.rewindFromMessageId.trim().slice(0, 128)
+        : '';
+    const rewindRevision = Number.isInteger(raw.rewindRevision) && raw.rewindRevision > 0
+        ? raw.rewindRevision
+        : 0;
+
     const record = {
         id,
         ...(turnId ? {turnId} : {}),
@@ -228,24 +251,59 @@ export function normalizeStoredMessage(raw, {
         ...(bounded.truncated ? {truncated: true} : {}),
         ...(finishReason ? {finishReason} : {}),
         ...(typeof raw.errorMessage === 'string' && raw.errorMessage ? {errorMessage: raw.errorMessage} : {}),
+        ...(archiveKind ? {archiveKind} : {}),
+        ...(archivedAt ? {archivedAt} : {}),
+        ...(rewoundAt ? {rewoundAt} : {}),
+        ...(rewindFromMessageId ? {rewindFromMessageId} : {}),
+        ...(rewindRevision > 0 ? {rewindRevision} : {}),
     };
 
     return record;
 }
 
+function isRewoundRecord(raw) {
+    if (!raw || typeof raw !== 'object') return false;
+    return raw.archiveKind === 'rewound_branch' || Boolean(raw.rewoundAt);
+}
+
+function buildArchiveIndexDescriptor(msg, archiveIndex = 0) {
+    if (!msg || typeof msg !== 'object') return null;
+    const textPreview = extractReadableMessageBody(msg).slice(0, 240);
+    return {
+        id: String(msg.id || ''),
+        revision: Number(msg.revision || 0),
+        role: msg.role || 'assistant',
+        turnId: String(msg.turnId || ''),
+        replyTo: String(msg.replyTo || ''),
+        createdAt: String(msg.createdAt || ''),
+        ts: Number(msg.ts || 0),
+        backend: String(msg.backend || ''),
+        modelId: String(msg.modelId || ''),
+        status: String(msg.status || 'completed'),
+        ...(msg.partial ? {partial: true} : {}),
+        ...(msg.finishReason ? {finishReason: msg.finishReason} : {}),
+        previewText: textPreview,
+        archiveIndex,
+    };
+}
+
 /**
- * Deduplicates loaded records by `id` while strictly preserving original conversation order.
+ * Deduplicates loaded records by `id` (and explicit positive `revision` when the same revision
+ * was replayed) while strictly preserving original conversation order.
  * If a later JSONL entry updates an existing `id` with an equal or higher `revision`,
  * it updates that slot in place without duplicating the message.
  */
 export function deduplicateMessagesPreservingOrder(rawRecords, metaDefaults = {}) {
     const ordered = [];
     const indexById = new Map();
+    const indexByExplicitRev = new Map();
     let maxRev = 0;
     let lastUserId = '';
 
     for (let i = 0; i < rawRecords.length; i++) {
         const candidate = rawRecords[i];
+        if (!candidate || typeof candidate !== 'object') continue;
+        const hasExplicitRev = Number.isInteger(candidate.revision) && candidate.revision > 0;
         const nextRev = maxRev + 1;
         const normalized = normalizeStoredMessage(candidate, {
             fallbackIndex: i,
@@ -267,14 +325,64 @@ export function deduplicateMessagesPreservingOrder(rawRecords, metaDefaults = {}
             const existing = ordered[existingIdx];
             if (normalized.revision >= existing.revision) {
                 ordered[existingIdx] = normalized;
+                if (hasExplicitRev) {
+                    indexByExplicitRev.set(normalized.revision, existingIdx);
+                }
             }
+        } else if (
+            hasExplicitRev &&
+            indexByExplicitRev.has(normalized.revision) &&
+            ordered[indexByExplicitRev.get(normalized.revision)]?.role === normalized.role &&
+            extractReadableMessageBody(ordered[indexByExplicitRev.get(normalized.revision)]) === extractReadableMessageBody(normalized)
+        ) {
+            const existingIdx = indexByExplicitRev.get(normalized.revision);
+            ordered[existingIdx] = normalized;
+            indexById.set(normalized.id, existingIdx);
         } else {
-            indexById.set(normalized.id, ordered.length);
+            const newIdx = ordered.length;
+            indexById.set(normalized.id, newIdx);
+            if (hasExplicitRev) {
+                indexByExplicitRev.set(normalized.revision, newIdx);
+            }
             ordered.push(normalized);
         }
     }
 
     return {messages: ordered, maxRevision: maxRev};
+}
+
+function capJsonlRecordsToBudget(records, {
+    maxMessages = MAX_SESSION_ARCHIVE_MESSAGES,
+    maxBytes = MAX_SESSION_ARCHIVE_FILE_BYTES,
+} = {}) {
+    const list = Array.isArray(records) ? records : [];
+    const safeMaxCount = Math.max(1, Number(maxMessages) || MAX_SESSION_ARCHIVE_MESSAGES);
+    const safeMaxBytes = Math.max(4096, Number(maxBytes) || MAX_SESSION_ARCHIVE_FILE_BYTES);
+
+    const countSliced = list.length > safeMaxCount ? list.slice(list.length - safeMaxCount) : [...list];
+    const keptReversed = [];
+    let usedBytes = 0;
+    let truncated = list.length > countSliced.length;
+
+    for (let i = countSliced.length - 1; i >= 0; i--) {
+        const line = JSON.stringify(countSliced[i]) + '\n';
+        const lineBytes = UTF8_ENCODER.encode(line).byteLength;
+        if (keptReversed.length > 0 && usedBytes + lineBytes > safeMaxBytes) {
+            truncated = true;
+            break;
+        }
+        keptReversed.push({record: countSliced[i], line});
+        usedBytes += lineBytes;
+    }
+
+    keptReversed.reverse();
+    return {
+        records: keptReversed.map(item => item.record),
+        body: keptReversed.map(item => item.line).join(''),
+        usedBytes,
+        truncated,
+        droppedCount: Math.max(0, list.length - keptReversed.length),
+    };
 }
 
 /**
@@ -361,19 +469,28 @@ function sleepMs(ms) {
 }
 
 export class SessionStoreEngine {
-    constructor(sessionId, {
-        sessionsRootDir,
-        io,
-        maxHotMessages = DEFAULT_HOT_MESSAGE_LIMIT,
-        maxLineBytes = MAX_SESSION_LINE_BYTES,
-        maxHotFileBytes = MAX_SESSION_HOT_FILE_BYTES,
-        maxRetainedLines = 600,
-        keepArchive = true,
-        maxWriteRetries = 2,
-        retryDelayMs = 20,
-        onSaveError = null,
-        buildContextSignature = null,
-    } = {}) {
+    constructor(sessionIdOrOptions, maybeOptions = {}) {
+        const isFirstObj = sessionIdOrOptions && typeof sessionIdOrOptions === 'object';
+        const sessionId = isFirstObj ? sessionIdOrOptions.sessionId : sessionIdOrOptions;
+        const {
+            sessionsRootDir,
+            io,
+            maxHotMessages = DEFAULT_HOT_MESSAGE_LIMIT,
+            maxLineBytes = MAX_SESSION_LINE_BYTES,
+            maxHotFileBytes = MAX_SESSION_HOT_FILE_BYTES,
+            maxArchiveFileBytes = MAX_SESSION_ARCHIVE_FILE_BYTES,
+            maxArchiveMessages = MAX_SESSION_ARCHIVE_MESSAGES,
+            maxRewoundFileBytes = MAX_SESSION_REWOUND_FILE_BYTES,
+            maxRewoundMessages = MAX_SESSION_REWOUND_MESSAGES,
+            maxCorruptBackupBytes = MAX_SESSION_CORRUPT_BACKUP_BYTES,
+            maxRetainedLines = 600,
+            keepArchive = true,
+            maxWriteRetries = 2,
+            retryDelayMs = 20,
+            onSaveError = null,
+            buildContextSignature = null,
+        } = isFirstObj ? sessionIdOrOptions : (maybeOptions || {});
+
         if (!io || typeof io !== 'object') {
             throw new Error('SessionStoreEngine 需要有效的异步 I/O 适配器');
         }
@@ -384,13 +501,19 @@ export class SessionStoreEngine {
         this.metaPath = paths.metaPath;
         this.jsonlPath = paths.jsonlPath;
         this.archivePath = paths.archivePath;
+        this.rewoundPath = paths.rewoundPath;
         this.corruptPath = paths.corruptPath;
         this.legacyPath = paths.legacyPath;
 
         this._io = io;
         this._maxHotMessages = Math.max(4, Number(maxHotMessages) || DEFAULT_HOT_MESSAGE_LIMIT);
-        this._maxLineBytes = Math.max(4096, Number(maxLineBytes) || MAX_SESSION_LINE_BYTES);
-        this._maxHotFileBytes = Math.max(32768, Number(maxHotFileBytes) || MAX_SESSION_HOT_FILE_BYTES);
+        this._maxLineBytes = Math.max(512, Number(maxLineBytes) || MAX_SESSION_LINE_BYTES);
+        this._maxHotFileBytes = Math.max(4096, Number(maxHotFileBytes) || MAX_SESSION_HOT_FILE_BYTES);
+        this._maxArchiveFileBytes = Math.max(4096, Number(maxArchiveFileBytes) || MAX_SESSION_ARCHIVE_FILE_BYTES);
+        this._maxArchiveMessages = Math.max(10, Number(maxArchiveMessages) || MAX_SESSION_ARCHIVE_MESSAGES);
+        this._maxRewoundFileBytes = Math.max(4096, Number(maxRewoundFileBytes) || MAX_SESSION_REWOUND_FILE_BYTES);
+        this._maxRewoundMessages = Math.max(4, Number(maxRewoundMessages) || MAX_SESSION_REWOUND_MESSAGES);
+        this._maxCorruptBackupBytes = Math.max(2048, Number(maxCorruptBackupBytes) || MAX_SESSION_CORRUPT_BACKUP_BYTES);
         this._maxRetainedLines = Math.max(this._maxHotMessages, Number(maxRetainedLines) || 600);
         this._keepArchive = Boolean(keepArchive);
         this._maxWriteRetries = Math.max(0, Number(maxWriteRetries ?? 2));
@@ -407,9 +530,12 @@ export class SessionStoreEngine {
             remoteSessionId: '',
             remoteSyncedRevision: 0,
             committedRevision: 0,
+            archivedMessageCount: 0,
+            rewoundBranchCount: 0,
             updatedAt: 0,
         };
         this._messages = [];
+        this._archiveIndex = [];
         this._syncingCoord = false;
         this._revision = 0;
         this._durableRevision = 0;
@@ -434,6 +560,69 @@ export class SessionStoreEngine {
 
     set messages(next) {
         this._messages = Array.isArray(next) ? next : [];
+    }
+
+    get archiveIndex() {
+        if (this._loaded && !this._syncingCoord) {
+            this._syncFromCoordinator();
+        }
+        return this._archiveIndex.map(cloneDeepJson);
+    }
+
+    get archivedMessageCount() {
+        if (this._loaded && !this._syncingCoord) {
+            this._syncFromCoordinator();
+        }
+        return this._archiveIndex.length;
+    }
+
+    get totalLogicalMessageCount() {
+        return this.archivedMessageCount + this.messages.length;
+    }
+
+    /**
+     * Builds a fast revision lookup index across both archived and hot messages (Stage R8).
+     */
+    getRevisionIndex() {
+        if (this._loaded && !this._syncingCoord) {
+            this._syncFromCoordinator();
+        }
+        const map = new Map();
+        for (let i = 0; i < this._archiveIndex.length; i++) {
+            const entry = this._archiveIndex[i];
+            const rev = Number(entry?.revision || 0);
+            if (rev > 0) {
+                map.set(rev, {
+                    location: 'archive',
+                    index: i,
+                    id: entry.id,
+                    revision: rev,
+                    role: entry.role,
+                    turnId: entry.turnId || '',
+                });
+            }
+        }
+        for (let i = 0; i < this._messages.length; i++) {
+            const msg = this._messages[i];
+            const rev = Number(msg?.revision || 0);
+            if (rev > 0) {
+                map.set(rev, {
+                    location: 'hot',
+                    index: i,
+                    id: msg.id,
+                    revision: rev,
+                    role: msg.role,
+                    turnId: msg.turnId || '',
+                });
+            }
+        }
+        return map;
+    }
+
+    lookupByRevision(revision) {
+        const rev = Number(revision || 0);
+        if (rev <= 0) return null;
+        return this.getRevisionIndex().get(rev) || null;
     }
 
     get revision() {
@@ -485,6 +674,7 @@ export class SessionStoreEngine {
             revision: this._revision,
             durableRevision: Math.max(this._durableRevision, existing?.durableRevision || 0),
             messages: this._messages.map(cloneDeepJson),
+            archiveIndex: this._archiveIndex.map(cloneDeepJson),
             meta: cloneDeepJson(this.meta),
             needsLeadingNewlineOnAppend: this._needsLeadingNewlineOnAppend,
             lastOperation: operation,
@@ -501,12 +691,19 @@ export class SessionStoreEngine {
         if (coord.revision < this._revision) {
             return false;
         }
-        if (coord.revision === this._revision && coord.messages.length === this._messages.length) {
+        if (
+            coord.revision === this._revision &&
+            coord.messages.length === this._messages.length &&
+            (coord.archiveIndex?.length || 0) === this._archiveIndex.length
+        ) {
             return false;
         }
 
         this._syncingCoord = true;
         try {
+            if (Array.isArray(coord.archiveIndex)) {
+                this._archiveIndex = coord.archiveIndex.map(cloneDeepJson);
+            }
             if (coord.lastOperation === 'rewind_from_user_turn' || coord.lastOperation === 'rewind_rollback') {
                 this._messages = coord.messages.map(cloneDeepJson);
                 this._revision = coord.revision;
@@ -518,13 +715,15 @@ export class SessionStoreEngine {
                         modelId: '',
                     }
                 );
-                this._messages = messages;
+                const archiveIds = new Set(this._archiveIndex.map(a => a.id));
+                this._messages = messages.filter(m => !archiveIds.has(m.id));
                 this._revision = Math.max(this._revision, coord.revision, maxRevision);
             }
 
             this.meta = {
                 ...this.meta,
                 ...cloneDeepJson(coord.meta || {}),
+                archivedMessageCount: this._archiveIndex.length,
                 committedRevision: this._revision,
             };
             this._durableRevision = Math.max(this._durableRevision, Number(coord.durableRevision || 0));
@@ -540,6 +739,166 @@ export class SessionStoreEngine {
             return this._buildContextSignature(backend, config);
         }
         return `${backend}:${config?.provider || ''}:${config?.model || config?.openaiModel || ''}`;
+    }
+
+    async _readJsonlFileBoundedInternal(filePath, {
+        maxLineBytes = this._maxLineBytes,
+        maxTotalBytes = this._maxHotFileBytes,
+        maxRetainedLines = this._maxRetainedLines,
+    } = {}) {
+        if (!filePath || !(await this._io.exists(filePath))) {
+            return {
+                exists: false,
+                rawParsed: [],
+                corruptLines: [],
+                endsWithNewline: true,
+                truncatedFile: false,
+                linesRawSnapshot: '',
+            };
+        }
+
+        const rawParsed = [];
+        const corruptLines = [];
+        let linesRawSnapshot = '';
+        let endsWithNewline = true;
+        let truncatedFile = false;
+
+        if (typeof this._io.readJsonlBounded === 'function') {
+            const bounded = await this._io.readJsonlBounded(filePath, {
+                maxLineBytes,
+                maxTotalBytes,
+                maxRetainedLines,
+            });
+            if (bounded.truncatedFile || bounded.truncatedTotalBytes) {
+                truncatedFile = true;
+            }
+            if (Array.isArray(bounded.corruptLines) && bounded.corruptLines.length > 0) {
+                corruptLines.push(...bounded.corruptLines);
+            }
+            for (const entry of (bounded.lines || [])) {
+                const trimmed = String(entry.raw || entry.text || '').trim();
+                if (!trimmed) continue;
+                try {
+                    const obj = JSON.parse(trimmed);
+                    if (obj && typeof obj === 'object') {
+                        rawParsed.push(obj);
+                    } else {
+                        corruptLines.push({lineNumber: entry.lineNumber, raw: trimmed.slice(0, 65536)});
+                    }
+                } catch (_) {
+                    corruptLines.push({lineNumber: entry.lineNumber, raw: trimmed.slice(0, 65536)});
+                }
+            }
+            if (bounded.totalBytesRead > 0 && !bounded.endsWithNewline) {
+                endsWithNewline = false;
+            }
+        } else {
+            const linesRaw = String((await this._io.readText(filePath, maxTotalBytes)) || '');
+            linesRawSnapshot = linesRaw;
+            const encodedTotal = UTF8_ENCODER.encode(linesRaw);
+            let boundedRaw = linesRaw;
+            if (encodedTotal.byteLength > maxTotalBytes) {
+                truncatedFile = true;
+                boundedRaw = new TextDecoder('utf-8', {fatal: false}).decode(
+                    encodedTotal.subarray(0, maxTotalBytes)
+                );
+            }
+            const rawLines = boundedRaw.split(/\r?\n/);
+
+            for (let idx = 0; idx < rawLines.length; idx++) {
+                const trimmed = rawLines[idx].trim();
+                if (!trimmed) continue;
+                const lineByteLen = UTF8_ENCODER.encode(trimmed).byteLength;
+                if (lineByteLen > maxLineBytes) {
+                    corruptLines.push({
+                        lineNumber: idx + 1,
+                        raw: trimmed.slice(0, 4096),
+                        reason: 'line_too_large',
+                    });
+                    continue;
+                }
+                try {
+                    const obj = JSON.parse(trimmed);
+                    if (obj && typeof obj === 'object') {
+                        rawParsed.push(obj);
+                        if (rawParsed.length > maxRetainedLines) {
+                            rawParsed.shift();
+                        }
+                    } else {
+                        corruptLines.push({lineNumber: idx + 1, raw: trimmed});
+                    }
+                } catch (_) {
+                    corruptLines.push({lineNumber: idx + 1, raw: trimmed});
+                }
+            }
+            if (linesRaw && !linesRaw.endsWith('\n')) {
+                endsWithNewline = false;
+            }
+        }
+
+        return {
+            exists: true,
+            rawParsed,
+            corruptLines,
+            endsWithNewline,
+            truncatedFile,
+            linesRawSnapshot,
+        };
+    }
+
+    async _writeBoundedCorruptIsolation(corruptLines = [], sourceTag = 'messages.jsonl') {
+        if (!Array.isArray(corruptLines) || corruptLines.length === 0) return;
+        const newEntries = corruptLines.map(item => ({
+            isolatedAt: new Date().toISOString(),
+            source: sourceTag,
+            lineNumber: item.lineNumber,
+            ...(item.reason ? {reason: item.reason} : {}),
+            raw: String(item.raw || '').slice(0, 16384),
+        }));
+
+        let existingEntries = [];
+        try {
+            if (await this._io.exists(this.corruptPath)) {
+                const rawExisting = String((await this._io.readText(this.corruptPath, this._maxCorruptBackupBytes)) || '');
+                for (const line of rawExisting.split(/\r?\n/)) {
+                    const trimmed = line.trim();
+                    if (!trimmed) continue;
+                    try {
+                        const parsed = JSON.parse(trimmed);
+                        if (parsed && typeof parsed === 'object') {
+                            existingEntries.push(parsed);
+                        }
+                    } catch (_) {}
+                }
+            }
+        } catch (_) {}
+
+        const combined = [...existingEntries, ...newEntries];
+        const capped = capJsonlRecordsToBudget(combined, {
+            maxMessages: 200,
+            maxBytes: this._maxCorruptBackupBytes,
+        });
+        if (!capped.truncated && typeof this._io.appendLine === 'function') {
+            const newLinesBody = newEntries.map(entry => JSON.stringify(entry)).join('\n') + '\n';
+            await this._io.appendLine(this.corruptPath, newLinesBody);
+        } else {
+            await this._io.replaceFile(this.corruptPath, capped.body);
+        }
+    }
+
+    async _ensureBoundedCorruptBackup(corruptOriginalSnapshot = null) {
+        const backupPath = `${this.jsonlPath}.corrupt-backup`;
+        if (await this._io.exists(backupPath)) return;
+        const rawOrig = corruptOriginalSnapshot !== null
+            ? String(corruptOriginalSnapshot)
+            : ((await this._io.exists(this.jsonlPath))
+                ? String((await this._io.readText(this.jsonlPath, this._maxCorruptBackupBytes)) || '')
+                : '');
+        const encoded = UTF8_ENCODER.encode(rawOrig);
+        const boundedStr = encoded.byteLength > this._maxCorruptBackupBytes
+            ? new TextDecoder('utf-8', {fatal: false}).decode(encoded.subarray(0, this._maxCorruptBackupBytes))
+            : rawOrig;
+        await this._io.replaceFile(backupPath, boundedStr);
     }
 
     /**
@@ -581,8 +940,9 @@ export class SessionStoreEngine {
     async _loadFromDiskInternal() {
         const metaExists = await this._io.exists(this.metaPath);
         const jsonlExists = await this._io.exists(this.jsonlPath);
+        const archiveExists = await this._io.exists(this.archivePath);
 
-        if (metaExists || jsonlExists) {
+        if (metaExists || jsonlExists || archiveExists) {
             if (metaExists) {
                 try {
                     const metaRaw = await this._io.readText(this.metaPath);
@@ -598,114 +958,186 @@ export class SessionStoreEngine {
                 }
             }
 
+            let hotMessages = [];
+            let hotMaxRevision = 0;
+            const allCorruptLines = [];
+
             if (jsonlExists) {
-                const rawParsed = [];
-                const corruptLines = [];
-                let linesRawSnapshot = '';
-
-                if (typeof this._io.readJsonlBounded === 'function') {
-                    const bounded = await this._io.readJsonlBounded(this.jsonlPath, {
-                        maxLineBytes: this._maxLineBytes,
-                        maxTotalBytes: this._maxHotFileBytes,
-                        maxRetainedLines: this._maxRetainedLines,
-                    });
-                    if (bounded.truncatedFile) {
-                        this.truncatedHotFileOnLoad = true;
-                    }
-                    if (Array.isArray(bounded.corruptLines) && bounded.corruptLines.length > 0) {
-                        corruptLines.push(...bounded.corruptLines);
-                    }
-                    for (const entry of (bounded.lines || [])) {
-                        const trimmed = String(entry.raw || '').trim();
-                        if (!trimmed) continue;
-                        try {
-                            const obj = JSON.parse(trimmed);
-                            if (obj && typeof obj === 'object') {
-                                rawParsed.push(obj);
-                            } else {
-                                corruptLines.push({lineNumber: entry.lineNumber, raw: trimmed.slice(0, 65536)});
-                            }
-                        } catch (_) {
-                            corruptLines.push({lineNumber: entry.lineNumber, raw: trimmed.slice(0, 65536)});
-                        }
-                    }
-                    if (bounded.totalBytesRead > 0 && !bounded.endsWithNewline) {
-                        this._needsLeadingNewlineOnAppend = true;
-                    }
-                } else {
-                    const linesRaw = String((await this._io.readText(this.jsonlPath)) || '');
-                    linesRawSnapshot = linesRaw;
-                    const encodedTotal = UTF8_ENCODER.encode(linesRaw);
-                    let boundedRaw = linesRaw;
-                    if (encodedTotal.byteLength > this._maxHotFileBytes) {
-                        this.truncatedHotFileOnLoad = true;
-                        boundedRaw = new TextDecoder('utf-8', {fatal: false}).decode(
-                            encodedTotal.subarray(0, this._maxHotFileBytes)
-                        );
-                    }
-                    const rawLines = boundedRaw.split(/\r?\n/);
-
-                    for (let idx = 0; idx < rawLines.length; idx++) {
-                        const trimmed = rawLines[idx].trim();
-                        if (!trimmed) continue;
-                        const lineByteLen = UTF8_ENCODER.encode(trimmed).byteLength;
-                        if (lineByteLen > this._maxLineBytes) {
-                            corruptLines.push({
-                                lineNumber: idx + 1,
-                                raw: trimmed.slice(0, 4096),
-                                reason: 'line_too_large',
-                            });
-                            continue;
-                        }
-                        try {
-                            const obj = JSON.parse(trimmed);
-                            if (obj && typeof obj === 'object') {
-                                rawParsed.push(obj);
-                                if (rawParsed.length > this._maxRetainedLines) {
-                                    rawParsed.shift();
-                                }
-                            } else {
-                                corruptLines.push({lineNumber: idx + 1, raw: trimmed});
-                            }
-                        } catch (_) {
-                            corruptLines.push({lineNumber: idx + 1, raw: trimmed});
-                        }
-                    }
-                    if (linesRaw && !linesRaw.endsWith('\n')) {
-                        this._needsLeadingNewlineOnAppend = true;
+                const hotRead = await this._readJsonlFileBoundedInternal(this.jsonlPath, {
+                    maxLineBytes: this._maxLineBytes,
+                    maxTotalBytes: this._maxHotFileBytes,
+                    maxRetainedLines: this._maxRetainedLines,
+                });
+                if (hotRead.truncatedFile) {
+                    this.truncatedHotFileOnLoad = true;
+                }
+                if (hotRead.corruptLines.length > 0) {
+                    allCorruptLines.push(...hotRead.corruptLines.map(c => ({...c, source: 'messages.jsonl'})));
+                    if (this._initialCorruptSnapshot === null) {
+                        this._initialCorruptSnapshot = hotRead.linesRawSnapshot;
                     }
                 }
-
-                const {messages, maxRevision} = deduplicateMessagesPreservingOrder(rawParsed, {
+                if (!hotRead.endsWithNewline) {
+                    this._needsLeadingNewlineOnAppend = true;
+                }
+                const dedupHot = deduplicateMessagesPreservingOrder(hotRead.rawParsed, {
                     backend: this.meta.backend || '',
                     modelId: '',
                 });
-                this._messages = messages;
-                this._revision = Math.max(Number(this.meta.committedRevision || 0), maxRevision, messages.length);
-                this._durableRevision = this._revision;
-                this.meta.committedRevision = this._revision;
-
-                if (corruptLines.length > 0) {
-                    this.corruptLineCount += corruptLines.length;
-                    if (this._initialCorruptSnapshot === null) {
-                        this._initialCorruptSnapshot = linesRawSnapshot;
-                    }
-                    // Isolate corrupt lines to corrupt.jsonl WITHOUT overwriting the sole messages.jsonl copy!
-                    const isolationPayload = corruptLines
-                        .map(item => JSON.stringify({
-                            isolatedAt: new Date().toISOString(),
-                            lineNumber: item.lineNumber,
-                            ...(item.reason ? {reason: item.reason} : {}),
-                            raw: String(item.raw || '').slice(0, 65536),
-                        }))
-                        .join('\n') + '\n';
-                    this._enqueueWrite('isolate_corrupt_lines', async () => {
-                        await this._io.appendLine(this.corruptPath, isolationPayload);
-                    }, {isAuxWrite: true});
-                }
-            } else {
-                this._durableRevision = this._revision;
+                hotMessages = dedupHot.messages;
+                hotMaxRevision = dedupHot.maxRevision;
             }
+
+            let archiveMessages = [];
+            let archiveMaxRevision = 0;
+            let legacyRewoundFromArchive = [];
+            let archiveHadDuplicatesOrRewound = false;
+
+            if (archiveExists) {
+                const archRead = await this._readJsonlFileBoundedInternal(this.archivePath, {
+                    maxLineBytes: this._maxLineBytes,
+                    maxTotalBytes: this._maxArchiveFileBytes,
+                    maxRetainedLines: this._maxArchiveMessages,
+                });
+                if (archRead.corruptLines.length > 0) {
+                    allCorruptLines.push(...archRead.corruptLines.map(c => ({...c, source: 'archive.jsonl'})));
+                }
+                const activeRawArchive = [];
+                for (const rawObj of archRead.rawParsed) {
+                    if (isRewoundRecord(rawObj)) {
+                        legacyRewoundFromArchive.push(rawObj);
+                        archiveHadDuplicatesOrRewound = true;
+                    } else {
+                        activeRawArchive.push(rawObj);
+                    }
+                }
+                const dedupArch = deduplicateMessagesPreservingOrder(activeRawArchive, {
+                    backend: this.meta.backend || '',
+                    modelId: '',
+                });
+                if (dedupArch.messages.length < activeRawArchive.length) {
+                    archiveHadDuplicatesOrRewound = true;
+                }
+                archiveMessages = dedupArch.messages.map(m => ({
+                    ...m,
+                    archiveKind: 'compacted',
+                }));
+                archiveMaxRevision = dedupArch.maxRevision;
+            }
+
+            // R8: Idempotent crash-window recovery (`archive append` + `hot replace`)!
+            // If a crash occurred after appending to `archive.jsonl` and before replacing `messages.jsonl`,
+            // overlapping messages exist in both `archiveMessages` and `hotMessages`.
+            let needsCrashHealWrite = archiveHadDuplicatesOrRewound;
+            if (archiveMessages.length > 0 && hotMessages.length > 0) {
+                const archiveIdSet = new Set(archiveMessages.map(m => m.id));
+                const archiveRevSet = new Set(
+                    archiveMessages.map(m => Number(m.revision || 0)).filter(r => r > 0)
+                );
+                const hasOverlap = hotMessages.some(
+                    m => archiveIdSet.has(m.id) || (m.revision > 0 && archiveRevSet.has(m.revision))
+                );
+
+                if (hasOverlap || hotMessages.length > this._maxHotMessages) {
+                    needsCrashHealWrite = true;
+                    const merged = deduplicateMessagesPreservingOrder(
+                        [...archiveMessages, ...hotMessages],
+                        {
+                            backend: this.meta.backend || '',
+                            modelId: '',
+                        }
+                    );
+                    if (merged.messages.length > this._maxHotMessages) {
+                        const reCompacted = compactMessagesByWholeTurn(merged.messages, {
+                            maxMessages: this._maxHotMessages,
+                            targetMessages: Math.max(2, Math.floor(this._maxHotMessages * DEFAULT_COMPACT_TARGET_RATIO)),
+                        });
+                        archiveMessages = reCompacted.evicted.map(m => ({
+                            ...m,
+                            archiveKind: 'compacted',
+                        }));
+                        hotMessages = reCompacted.retained.map(m => {
+                            const copy = {...m};
+                            delete copy.archiveKind;
+                            delete copy.archivedAt;
+                            return copy;
+                        });
+                    } else {
+                        // Keep already-archived prefix in archiveMessages and strip duplicates from hotMessages
+                        const filteredHot = hotMessages.filter(
+                            m => !archiveIdSet.has(m.id) && !(m.revision > 0 && archiveRevSet.has(m.revision))
+                        );
+                        if (filteredHot.length > 0) {
+                            hotMessages = filteredHot;
+                        } else {
+                            // All messages were in both files: keep latest turn in hotMessages, older in archiveMessages
+                            const turns = groupMessagesIntoCompleteTurns(merged.messages);
+                            hotMessages = turns.at(-1) || merged.messages;
+                            const hotIdSet = new Set(hotMessages.map(m => m.id));
+                            archiveMessages = merged.messages
+                                .filter(m => !hotIdSet.has(m.id))
+                                .map(m => ({...m, archiveKind: 'compacted'}));
+                        }
+                    }
+                }
+            }
+
+            if (archiveMessages.length > this._maxArchiveMessages) {
+                archiveMessages = archiveMessages.slice(archiveMessages.length - this._maxArchiveMessages);
+                needsCrashHealWrite = true;
+            }
+
+            this._archiveIndex = archiveMessages.map((m, idx) => buildArchiveIndexDescriptor(m, idx)).filter(Boolean);
+            this._messages = hotMessages;
+            this._revision = Math.max(
+                Number(this.meta.committedRevision || 0),
+                hotMaxRevision,
+                archiveMaxRevision,
+                this._archiveIndex.length + this._messages.length
+            );
+            this._durableRevision = this._revision;
+            this.meta.committedRevision = this._revision;
+            this.meta.archivedMessageCount = this._archiveIndex.length;
+
+            if (allCorruptLines.length > 0) {
+                this.corruptLineCount += allCorruptLines.length;
+                const corruptSnap = allCorruptLines.map(cloneDeepJson);
+                this._enqueueWrite('isolate_corrupt_lines', async () => {
+                    await this._writeBoundedCorruptIsolation(corruptSnap, 'load');
+                }, {isAuxWrite: true});
+            }
+
+            if (needsCrashHealWrite) {
+                const healArchiveSnap = archiveMessages.map(cloneDeepJson);
+                const healHotSnap = this._messages.map(cloneDeepJson);
+                const healRewoundSnap = legacyRewoundFromArchive.map(m => ({
+                    ...cloneDeepJson(m),
+                    archiveKind: 'rewound_branch',
+                }));
+                const healMetaSnap = cloneDeepJson(this.meta);
+                const hadCorrupt = this.corruptLineCount > 0;
+                const origCorruptSnap = this._initialCorruptSnapshot;
+                this._needsLeadingNewlineOnAppend = false;
+
+                this._enqueueWrite('heal_archive_hot_crash_window', async () => {
+                    if (hadCorrupt) {
+                        await this._ensureBoundedCorruptBackup(origCorruptSnap);
+                    }
+                    if (healRewoundSnap.length > 0) {
+                        await this._appendBoundedRewoundRecords(healRewoundSnap);
+                    }
+                    const cappedArch = capJsonlRecordsToBudget(healArchiveSnap, {
+                        maxMessages: this._maxArchiveMessages,
+                        maxBytes: this._maxArchiveFileBytes,
+                    });
+                    await this._io.replaceFile(this.archivePath, cappedArch.body);
+                    const hotBody = healHotSnap.map(m => JSON.stringify(m)).join('\n')
+                        + (healHotSnap.length ? '\n' : '');
+                    await this._io.replaceFile(this.jsonlPath, hotBody);
+                    await this._io.replaceFile(this.metaPath, JSON.stringify(healMetaSnap, null, 2));
+                }, {revision: this._revision, isFullSnapshot: true});
+            }
+
             const coord = sharedSessionCoordinatorState.get(this._coordKey);
             if (coord && coord.revision > this._revision && sharedSessionWriteChains.has(this._coordKey)) {
                 this._syncFromCoordinator();
@@ -733,8 +1165,14 @@ export class SessionStoreEngine {
                         {backend: parsed.backend || ''}
                     );
                     const compacted = compactMessagesByWholeTurn(messages, {maxMessages: this._maxHotMessages});
+                    const evictedWithKind = compacted.evicted.map(m => ({
+                        ...m,
+                        archiveKind: 'compacted',
+                        archivedAt: new Date().toISOString(),
+                    }));
+                    this._archiveIndex = evictedWithKind.map((m, idx) => buildArchiveIndexDescriptor(m, idx)).filter(Boolean);
                     this.messages = compacted.retained;
-                    this._revision = Math.max(maxRevision, this.messages.length);
+                    this._revision = Math.max(maxRevision, messages.length);
                     this.meta = {
                         ...this.meta,
                         schemaVersion: 2,
@@ -744,16 +1182,20 @@ export class SessionStoreEngine {
                         remoteSessionId: parsed.remoteSessionId || '',
                         remoteSyncedRevision: 0,
                         committedRevision: this._revision,
+                        archivedMessageCount: this._archiveIndex.length,
                         updatedAt: parsed.updatedAt || Date.now(),
                     };
                     this._publishToCoordinator('migrate_legacy_json', {forceOverwrite: true});
                     const snapshotMessages = this.messages.map(cloneDeepJson);
                     const snapshotMeta = cloneDeepJson(this.meta);
-                    const snapshotEvicted = compacted.evicted;
+                    const snapshotEvicted = evictedWithKind;
                     this._enqueueWrite('migrate_legacy_json', async () => {
                         if (this._keepArchive && snapshotEvicted.length > 0) {
-                            const archiveBody = snapshotEvicted.map(m => JSON.stringify(m)).join('\n') + '\n';
-                            await this._io.appendLine(this.archivePath, archiveBody);
+                            const cappedArch = capJsonlRecordsToBudget(snapshotEvicted, {
+                                maxMessages: this._maxArchiveMessages,
+                                maxBytes: this._maxArchiveFileBytes,
+                            });
+                            await this._io.replaceFile(this.archivePath, cappedArch.body);
                         }
                         const body = snapshotMessages.map(m => JSON.stringify(m)).join('\n') + (snapshotMessages.length ? '\n' : '');
                         await this._io.replaceFile(this.jsonlPath, body);
@@ -887,6 +1329,71 @@ export class SessionStoreEngine {
         return this.setRemoteSessionId(clean, backend || this.meta.backend, config, {markSynced: true});
     }
 
+    async _appendBoundedRewoundRecords(rewoundRecords = []) {
+        if (!Array.isArray(rewoundRecords) || rewoundRecords.length === 0) return;
+        let existing = [];
+        try {
+            if (await this._io.exists(this.rewoundPath)) {
+                const readRes = await this._readJsonlFileBoundedInternal(this.rewoundPath, {
+                    maxLineBytes: this._maxLineBytes,
+                    maxTotalBytes: this._maxRewoundFileBytes,
+                    maxRetainedLines: this._maxRewoundMessages,
+                });
+                existing = readRes.rawParsed;
+            }
+        } catch (_) {}
+
+        const combined = [...existing, ...rewoundRecords].map(m => ({
+            ...m,
+            archiveKind: 'rewound_branch',
+        }));
+        const capped = capJsonlRecordsToBudget(combined, {
+            maxMessages: this._maxRewoundMessages,
+            maxBytes: this._maxRewoundFileBytes,
+        });
+        await this._io.replaceFile(this.rewoundPath, capped.body);
+    }
+
+    async _appendOrRewriteBoundedArchiveRecords(evictedRecords = [], {forceRewrite = false} = {}) {
+        if (!Array.isArray(evictedRecords) || evictedRecords.length === 0) return;
+        const normalizedEvicted = evictedRecords.map(m => ({
+            ...m,
+            archiveKind: 'compacted',
+            archivedAt: m.archivedAt || new Date().toISOString(),
+        }));
+
+        if (!forceRewrite && this._archiveIndex.length <= this._maxArchiveMessages) {
+            const archiveLines = normalizedEvicted.map(m => JSON.stringify(m)).join('\n') + '\n';
+            await this._io.appendLine(this.archivePath, archiveLines);
+            return;
+        }
+
+        let existing = [];
+        try {
+            if (await this._io.exists(this.archivePath)) {
+                const archRead = await this._readJsonlFileBoundedInternal(this.archivePath, {
+                    maxLineBytes: this._maxLineBytes,
+                    maxTotalBytes: this._maxArchiveFileBytes,
+                    maxRetainedLines: this._maxArchiveMessages,
+                });
+                existing = archRead.rawParsed.filter(m => !isRewoundRecord(m));
+            }
+        } catch (_) {}
+
+        const dedup = deduplicateMessagesPreservingOrder(
+            [...existing, ...normalizedEvicted],
+            {backend: this.meta.backend || '', modelId: ''}
+        );
+        const capped = capJsonlRecordsToBudget(
+            dedup.messages.map(m => ({...m, archiveKind: 'compacted'})),
+            {
+                maxMessages: this._maxArchiveMessages,
+                maxBytes: this._maxArchiveFileBytes,
+            }
+        );
+        await this._io.replaceFile(this.archivePath, capped.body);
+    }
+
     /**
      * Appends a message using strictly immutable snapshots captured at call time.
      * Even if message #201 triggers whole-turn compaction while #202 and #203 are appended
@@ -903,6 +1410,14 @@ export class SessionStoreEngine {
                 break;
             }
         }
+        if (!lastUserId) {
+            for (let i = this._archiveIndex.length - 1; i >= 0; i--) {
+                if (this._archiveIndex[i]?.role === 'user' && this._archiveIndex[i]?.id) {
+                    lastUserId = this._archiveIndex[i].id;
+                    break;
+                }
+            }
+        }
 
         const effectiveModelId = String(
             message?.modelId ||
@@ -916,7 +1431,7 @@ export class SessionStoreEngine {
         const record = normalizeStoredMessage(
             {...message, revision: rev},
             {
-                fallbackIndex: this.messages.length,
+                fallbackIndex: this._archiveIndex.length + this.messages.length,
                 nextRevision: rev,
                 defaultBackend: backend || this.meta.backend || '',
                 defaultModelId: effectiveModelId,
@@ -949,6 +1464,8 @@ export class SessionStoreEngine {
         // Capture immutable snapshots synchronously BEFORE yielding to async queue!
         const recordLineSnapshot = JSON.stringify(record);
         let compactionResult = {compacted: false, retained: null, evicted: []};
+        let evictedForArchive = [];
+        let forceArchiveRewrite = false;
         let fullSnapshotForInPlaceUpdate = null;
 
         if (this.messages.length > this._maxHotMessages) {
@@ -957,12 +1474,38 @@ export class SessionStoreEngine {
                 targetMessages: Math.max(2, Math.floor(this._maxHotMessages * DEFAULT_COMPACT_TARGET_RATIO)),
             });
             if (compactionResult.compacted) {
+                const archivedAtIso = new Date().toISOString();
+                evictedForArchive = compactionResult.evicted.map(m => ({
+                    ...cloneDeepJson(m),
+                    archiveKind: 'compacted',
+                    archivedAt: archivedAtIso,
+                }));
                 this.messages = compactionResult.retained.map(cloneDeepJson);
+
+                if (this._keepArchive && evictedForArchive.length > 0) {
+                    const existingArchIds = new Set(this._archiveIndex.map(a => a.id));
+                    for (const ev of evictedForArchive) {
+                        if (!existingArchIds.has(ev.id)) {
+                            existingArchIds.add(ev.id);
+                            const desc = buildArchiveIndexDescriptor(ev, this._archiveIndex.length);
+                            if (desc) this._archiveIndex.push(desc);
+                        } else {
+                            forceArchiveRewrite = true;
+                        }
+                    }
+                    if (this._archiveIndex.length > this._maxArchiveMessages) {
+                        this._archiveIndex = this._archiveIndex
+                            .slice(this._archiveIndex.length - this._maxArchiveMessages)
+                            .map((entry, idx) => ({...entry, archiveIndex: idx}));
+                        forceArchiveRewrite = true;
+                    }
+                }
             }
         } else if (replacedInPlace) {
             fullSnapshotForInPlaceUpdate = this.messages.map(cloneDeepJson);
         }
 
+        this.meta.archivedMessageCount = this._archiveIndex.length;
         this._publishToCoordinator('append_message');
 
         const metaSnapshot = cloneDeepJson(this.meta);
@@ -984,17 +1527,12 @@ export class SessionStoreEngine {
             if (isFullSnapshotWrite) {
                 // Never overwrite the sole copy if corrupt lines were seen earlier without backing up first!
                 if (hadPriorCorruptLines) {
-                    const backupPath = `${this.jsonlPath}.corrupt-backup`;
-                    if (!(await this._io.exists(backupPath))) {
-                        const rawOrig = corruptOriginalSnapshot !== null
-                            ? corruptOriginalSnapshot
-                            : ((await this._io.exists(this.jsonlPath)) ? await this._io.readText(this.jsonlPath) : '');
-                        await this._io.replaceFile(backupPath, rawOrig);
-                    }
+                    await this._ensureBoundedCorruptBackup(corruptOriginalSnapshot);
                 }
-                if (!archiveWritten && this._keepArchive && compactionResult.evicted.length > 0) {
-                    const archiveLines = compactionResult.evicted.map(m => JSON.stringify(m)).join('\n') + '\n';
-                    await this._io.appendLine(this.archivePath, archiveLines);
+                if (!archiveWritten && this._keepArchive && evictedForArchive.length > 0) {
+                    await this._appendOrRewriteBoundedArchiveRecords(evictedForArchive, {
+                        forceRewrite: forceArchiveRewrite,
+                    });
                     archiveWritten = true;
                 }
                 if (!jsonlWritten) {
@@ -1025,12 +1563,14 @@ export class SessionStoreEngine {
      * Rewinds session history cleanly to the point right BEFORE `targetMessageId`'s user turn
      * (used by in-place Regenerate `↻` and Edit Question `✎`).
      *
-     * Architectural Invariant (Stage F3 & R3):
+     * Architectural Invariant (Stage F3, R3 & R8):
      * 1. Because external CLI `resume` (`--resume` / `codex exec resume`) cannot roll back remote session turns,
      *    rewinding history ALWAYS invalidates `remoteSessionId` (`remoteSessionReset: true`) so the next turn
      *    starts a fresh CLI session and reconstructs exact local context via `buildCrossBackendPromptWithContext`.
      * 2. Transactional durability (R3): captures pre-rewind snapshot; if the disk write fails after retries,
-     *    rolls back in-memory `messages`, `meta`, and `_revision` so memory, disk, and UI never diverge!
+     *    rolls back in-memory `messages`, `archiveIndex`, `meta`, and `_revision` so memory, disk, and UI never diverge!
+     * 3. Branch separation (R8): rewound/replaced messages are written to `rewound.jsonl` (`archiveKind: 'rewound_branch'`),
+     *    NEVER mixed into `archive.jsonl` (`compacted`), and NEVER re-injected into model context or default exports!
      */
     rewindFromUserMessage(targetMessageId, {archiveRemoved = true} = {}) {
         this._syncFromCoordinator();
@@ -1047,14 +1587,24 @@ export class SessionStoreEngine {
         }
 
         let splitIdx = this.messages.findIndex(m => m && m.id === cleanId);
+        let splitInArchiveIdx = -1;
+
         if (splitIdx >= 0 && this.messages[splitIdx]?.role !== 'user') {
             const targetMsg = this.messages[splitIdx];
             const replyTo = String(targetMsg?.replyTo || '').trim();
             if (replyTo) {
                 const replyUserIdx = this.messages.findIndex(m => m && m.id === replyTo && m.role === 'user');
-                if (replyUserIdx >= 0) splitIdx = replyUserIdx;
+                if (replyUserIdx >= 0) {
+                    splitIdx = replyUserIdx;
+                } else {
+                    const archReplyIdx = this._archiveIndex.findIndex(a => a && a.id === replyTo && a.role === 'user');
+                    if (archReplyIdx >= 0) {
+                        splitInArchiveIdx = archReplyIdx;
+                        splitIdx = -1;
+                    }
+                }
             }
-            if (this.messages[splitIdx]?.role !== 'user') {
+            if (splitIdx >= 0 && this.messages[splitIdx]?.role !== 'user') {
                 for (let i = splitIdx - 1; i >= 0; i--) {
                     if (this.messages[i]?.role === 'user') {
                         splitIdx = i;
@@ -1064,7 +1614,32 @@ export class SessionStoreEngine {
             }
         }
 
-        if (splitIdx < 0 || this.messages[splitIdx]?.role !== 'user') {
+        if (splitIdx < 0 && splitInArchiveIdx < 0) {
+            let archIdx = this._archiveIndex.findIndex(a => a && a.id === cleanId);
+            if (archIdx >= 0 && this._archiveIndex[archIdx]?.role !== 'user') {
+                const replyTo = String(this._archiveIndex[archIdx]?.replyTo || '').trim();
+                if (replyTo) {
+                    const replyArchIdx = this._archiveIndex.findIndex(a => a && a.id === replyTo && a.role === 'user');
+                    if (replyArchIdx >= 0) archIdx = replyArchIdx;
+                }
+                if (this._archiveIndex[archIdx]?.role !== 'user') {
+                    for (let i = archIdx - 1; i >= 0; i--) {
+                        if (this._archiveIndex[i]?.role === 'user') {
+                            archIdx = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (archIdx >= 0 && this._archiveIndex[archIdx]?.role === 'user') {
+                splitInArchiveIdx = archIdx;
+            }
+        }
+
+        if (
+            (splitIdx < 0 || this.messages[splitIdx]?.role !== 'user') &&
+            (splitInArchiveIdx < 0 || this._archiveIndex[splitInArchiveIdx]?.role !== 'user')
+        ) {
             return {
                 ok: false,
                 error: '未在当前会话中找到对应的提问记录',
@@ -1077,21 +1652,61 @@ export class SessionStoreEngine {
 
         // Capture full pre-rewind state for transactional rollback if disk commit fails
         const prevMessagesSnapshot = this.messages.map(cloneDeepJson);
+        const prevArchiveIndexSnapshot = this._archiveIndex.map(cloneDeepJson);
         const prevMetaSnapshot = cloneDeepJson(this.meta);
         const prevRevision = this._revision;
         const prevNeedsNewline = this._needsLeadingNewlineOnAppend;
 
-        const targetUserMessage = cloneDeepJson(this.messages[splitIdx]);
-        const removedMessages = this.messages.slice(splitIdx).map(cloneDeepJson);
-        const retainedSnapshot = this.messages.slice(0, splitIdx).map(cloneDeepJson);
-        this.messages = retainedSnapshot.map(cloneDeepJson);
+        let targetUserMessage = null;
+        let removedMessages = [];
+        let retainedSnapshot = [];
+        let retainedArchiveIndexSnapshot = this._archiveIndex.map(cloneDeepJson);
+        let removedArchiveDescriptors = [];
+
+        if (splitInArchiveIdx >= 0) {
+            const archTargetDesc = this._archiveIndex[splitInArchiveIdx];
+            targetUserMessage = {
+                id: archTargetDesc.id,
+                revision: archTargetDesc.revision,
+                role: 'user',
+                content: archTargetDesc.previewText || '',
+                createdAt: archTargetDesc.createdAt || '',
+                ts: archTargetDesc.ts || 0,
+                backend: archTargetDesc.backend || '',
+                modelId: archTargetDesc.modelId || '',
+            };
+            removedArchiveDescriptors = this._archiveIndex.slice(splitInArchiveIdx).map(cloneDeepJson);
+            retainedArchiveIndexSnapshot = this._archiveIndex.slice(0, splitInArchiveIdx).map(cloneDeepJson);
+            removedMessages = [
+                ...removedArchiveDescriptors.map(d => ({
+                    id: d.id,
+                    revision: d.revision,
+                    role: d.role,
+                    content: d.previewText || '',
+                    createdAt: d.createdAt || '',
+                    ts: d.ts || 0,
+                })),
+                ...this.messages.map(cloneDeepJson),
+            ];
+            retainedSnapshot = [];
+            this._archiveIndex = retainedArchiveIndexSnapshot.map(cloneDeepJson);
+            this.messages = [];
+        } else {
+            targetUserMessage = cloneDeepJson(this.messages[splitIdx]);
+            removedMessages = this.messages.slice(splitIdx).map(cloneDeepJson);
+            retainedSnapshot = this.messages.slice(0, splitIdx).map(cloneDeepJson);
+            this.messages = retainedSnapshot.map(cloneDeepJson);
+        }
 
         const hadRemoteSession = Boolean(this.meta.remoteSessionId);
         const rev = ++this._revision;
+        const rewoundAtIso = new Date().toISOString();
         this.meta.remoteSessionId = '';
         this.meta.remoteSyncedRevision = 0;
         this.meta.lastRemoteResetReason = 'history_rewound';
         this.meta.committedRevision = rev;
+        this.meta.archivedMessageCount = this._archiveIndex.length;
+        this.meta.rewoundBranchCount = Number(this.meta.rewoundBranchCount || 0) + removedMessages.length;
         this.meta.updatedAt = Date.now();
         this._needsLeadingNewlineOnAppend = false;
 
@@ -1100,24 +1715,62 @@ export class SessionStoreEngine {
         const metaSnapshot = cloneDeepJson(this.meta);
         const hadPriorCorruptLines = this.corruptLineCount > 0;
         const corruptOriginalSnapshot = this._initialCorruptSnapshot;
-        let archiveWritten = false;
+        let rewoundWritten = false;
+        let archiveTruncatedWritten = splitInArchiveIdx < 0;
         let jsonlWritten = false;
 
         const writePromise = this._enqueueWrite('rewind_from_user_turn', async () => {
             if (hadPriorCorruptLines) {
-                const backupPath = `${this.jsonlPath}.corrupt-backup`;
-                if (!(await this._io.exists(backupPath))) {
-                    const rawOrig = corruptOriginalSnapshot !== null
-                        ? corruptOriginalSnapshot
-                        : ((await this._io.exists(this.jsonlPath)) ? await this._io.readText(this.jsonlPath) : '');
-                    await this._io.replaceFile(backupPath, rawOrig);
+                await this._ensureBoundedCorruptBackup(corruptOriginalSnapshot);
+            }
+
+            let fullRemovedFromArchive = [];
+            let retainedArchiveRecords = [];
+            if (!archiveTruncatedWritten && splitInArchiveIdx >= 0 && (await this._io.exists(this.archivePath))) {
+                const archRead = await this._readJsonlFileBoundedInternal(this.archivePath, {
+                    maxLineBytes: this._maxLineBytes,
+                    maxTotalBytes: this._maxArchiveFileBytes,
+                    maxRetainedLines: this._maxArchiveMessages,
+                });
+                const dedupArch = deduplicateMessagesPreservingOrder(
+                    archRead.rawParsed.filter(m => !isRewoundRecord(m)),
+                    {backend: metaSnapshot.backend || '', modelId: ''}
+                );
+                const exactCut = dedupArch.messages.findIndex(m => m.id === targetUserMessage.id);
+                const cutAt = exactCut >= 0 ? exactCut : Math.min(splitInArchiveIdx, dedupArch.messages.length);
+                retainedArchiveRecords = dedupArch.messages.slice(0, cutAt).map(m => ({
+                    ...m,
+                    archiveKind: 'compacted',
+                }));
+                fullRemovedFromArchive = dedupArch.messages.slice(cutAt);
+            }
+
+            if (!rewoundWritten && archiveRemoved && this._keepArchive) {
+                const rawBranchToRewind = splitInArchiveIdx >= 0
+                    ? [...fullRemovedFromArchive, ...prevMessagesSnapshot]
+                    : removedMessages;
+                if (rawBranchToRewind.length > 0) {
+                    const taggedRewound = rawBranchToRewind.map(m => ({
+                        ...cloneDeepJson(m),
+                        archiveKind: 'rewound_branch',
+                        rewoundAt: rewoundAtIso,
+                        rewindFromMessageId: targetUserMessage.id,
+                        rewindRevision: rev,
+                    }));
+                    await this._appendBoundedRewoundRecords(taggedRewound);
                 }
+                rewoundWritten = true;
             }
-            if (!archiveWritten && archiveRemoved && this._keepArchive && removedMessages.length > 0) {
-                const archiveLines = removedMessages.map(m => JSON.stringify(m)).join('\n') + '\n';
-                await this._io.appendLine(this.archivePath, archiveLines);
-                archiveWritten = true;
+
+            if (!archiveTruncatedWritten && splitInArchiveIdx >= 0) {
+                const cappedArch = capJsonlRecordsToBudget(retainedArchiveRecords, {
+                    maxMessages: this._maxArchiveMessages,
+                    maxBytes: this._maxArchiveFileBytes,
+                });
+                await this._io.replaceFile(this.archivePath, cappedArch.body);
+                archiveTruncatedWritten = true;
             }
+
             if (!jsonlWritten) {
                 const jsonlBody = retainedSnapshot.map(m => JSON.stringify(m)).join('\n')
                     + (retainedSnapshot.length ? '\n' : '');
@@ -1131,6 +1784,7 @@ export class SessionStoreEngine {
             dontRecordFailedWriteOnRollback: true,
             onRollback: () => {
                 this.messages = prevMessagesSnapshot.map(cloneDeepJson);
+                this._archiveIndex = prevArchiveIndexSnapshot.map(cloneDeepJson);
                 this.meta = cloneDeepJson(prevMetaSnapshot);
                 this._revision = prevRevision;
                 this._needsLeadingNewlineOnAppend = prevNeedsNewline;
@@ -1142,9 +1796,174 @@ export class SessionStoreEngine {
             ok: true,
             targetUserMessage,
             removedMessages,
-            retainedCount: this.messages.length,
+            retainedCount: this._archiveIndex.length + this.messages.length,
             remoteSessionReset: hadRemoteSession,
             writePromise,
+        };
+    }
+
+    /**
+     * Loads a paginated slice of older compacted messages from `archive.jsonl` (Stage R8).
+     * Excludes rewound/replaced branches by default (`includeRewound = false`) and deduplicates
+     * against hot `this.messages` so archived messages are never duplicated or mixed with rewound history.
+     */
+    async loadArchivedHistoryPage({
+        beforeRevision = 0,
+        beforeMessageId = '',
+        beforeArchiveOffset = null,
+        beforeIndex = null,
+        limit = 30,
+        includeRewound = false,
+    } = {}) {
+        const activeChain = sharedSessionWriteChains.get(this._coordKey);
+        if (activeChain) {
+            try { await activeChain; } catch (_) {}
+        }
+        this._syncFromCoordinator();
+
+        if (!(await this._io.exists(this.archivePath))) {
+            return {
+                messages: [],
+                hasMoreOlder: false,
+                remainingOlderCount: 0,
+                olderRemainingCount: 0,
+                pageStartIndex: 0,
+                pageEndIndex: 0,
+                nextBeforeArchiveOffset: 0,
+                nextBeforeRevision: 0,
+                totalArchivedCount: 0,
+            };
+        }
+
+        const archRead = await this._readJsonlFileBoundedInternal(this.archivePath, {
+            maxLineBytes: this._maxLineBytes,
+            maxTotalBytes: this._maxArchiveFileBytes,
+            maxRetainedLines: this._maxArchiveMessages,
+        });
+        const filteredRaw = includeRewound
+            ? archRead.rawParsed
+            : archRead.rawParsed.filter(m => !isRewoundRecord(m));
+        const dedupArch = deduplicateMessagesPreservingOrder(filteredRaw, {
+            backend: this.meta.backend || '',
+            modelId: '',
+        });
+
+        const hotIdSet = new Set(this.messages.map(m => m.id));
+        const hotRevSet = new Set(this.messages.map(m => Number(m.revision || 0)).filter(r => r > 0));
+        const activeArchived = dedupArch.messages.filter(
+            m => !hotIdSet.has(m.id) && !(m.revision > 0 && hotRevSet.has(m.revision))
+        );
+
+        const effectiveOffset = Number.isInteger(beforeArchiveOffset) && beforeArchiveOffset >= 0
+            ? beforeArchiveOffset
+            : (Number.isInteger(beforeIndex) && beforeIndex >= 0 ? beforeIndex : null);
+
+        let endIdx = activeArchived.length;
+        if (effectiveOffset !== null) {
+            endIdx = Math.min(activeArchived.length, effectiveOffset);
+        } else if (beforeMessageId) {
+            const foundIdx = activeArchived.findIndex(m => m.id === beforeMessageId);
+            if (foundIdx >= 0) {
+                endIdx = foundIdx;
+            }
+        } else if (Number(beforeRevision) > 0) {
+            const cutoffRev = Number(beforeRevision);
+            const firstAtOrAfter = activeArchived.findIndex(m => Number(m.revision || 0) >= cutoffRev);
+            if (firstAtOrAfter >= 0) {
+                endIdx = firstAtOrAfter;
+            }
+        }
+
+        const pageSize = Math.max(1, Number(limit) || 30);
+        const startIdx = Math.max(0, endIdx - pageSize);
+        const pageMessages = activeArchived.slice(startIdx, endIdx);
+
+        return {
+            messages: pageMessages,
+            hasMoreOlder: startIdx > 0,
+            remainingOlderCount: startIdx,
+            olderRemainingCount: startIdx,
+            pageStartIndex: startIdx,
+            pageEndIndex: endIdx,
+            nextBeforeArchiveOffset: startIdx,
+            nextBeforeRevision: pageMessages[0]?.revision || 0,
+            totalArchivedCount: activeArchived.length,
+        };
+    }
+
+    /**
+     * Loads the complete logical conversation (`archive.jsonl` + `messages.jsonl`) deduplicated
+     * by `id`/`revision` in chronological order (Stage R8).
+     * By default (`includeRewound = false`), rewound/edited history branches are strictly excluded.
+     */
+    async loadFullLogicalHistory({includeRewound = false} = {}) {
+        const activeChain = sharedSessionWriteChains.get(this._coordKey);
+        if (activeChain) {
+            try { await activeChain; } catch (_) {}
+        }
+        this._syncFromCoordinator();
+
+        let archiveMessages = [];
+        let legacyRewoundInArchive = [];
+        if (await this._io.exists(this.archivePath)) {
+            const archRead = await this._readJsonlFileBoundedInternal(this.archivePath, {
+                maxLineBytes: this._maxLineBytes,
+                maxTotalBytes: this._maxArchiveFileBytes,
+                maxRetainedLines: this._maxArchiveMessages,
+            });
+            const activeRaw = [];
+            for (const item of archRead.rawParsed) {
+                if (isRewoundRecord(item)) {
+                    legacyRewoundInArchive.push(item);
+                } else {
+                    activeRaw.push(item);
+                }
+            }
+            const dedupArch = deduplicateMessagesPreservingOrder(activeRaw, {
+                backend: this.meta.backend || '',
+                modelId: '',
+            });
+            archiveMessages = dedupArch.messages;
+        }
+
+        const mergedActive = deduplicateMessagesPreservingOrder(
+            [...archiveMessages, ...this.messages],
+            {
+                backend: this.meta.backend || '',
+                modelId: '',
+            }
+        );
+
+        let rewoundMessages = [];
+        if (includeRewound) {
+            let fromRewoundFile = [];
+            if (await this._io.exists(this.rewoundPath)) {
+                const rwRead = await this._readJsonlFileBoundedInternal(this.rewoundPath, {
+                    maxLineBytes: this._maxLineBytes,
+                    maxTotalBytes: this._maxRewoundFileBytes,
+                    maxRetainedLines: this._maxRewoundMessages,
+                });
+                fromRewoundFile = rwRead.rawParsed;
+            }
+            const dedupRewound = deduplicateMessagesPreservingOrder(
+                [...legacyRewoundInArchive, ...fromRewoundFile],
+                {backend: this.meta.backend || '', modelId: ''}
+            );
+            rewoundMessages = dedupRewound.messages.map(m => ({
+                ...m,
+                archiveKind: 'rewound_branch',
+            }));
+        }
+
+        const hotIdSet = new Set(this.messages.map(m => m.id));
+        const effectiveArchivedCount = mergedActive.messages.filter(m => !hotIdSet.has(m.id)).length;
+
+        return {
+            messages: mergedActive.messages,
+            archivedCount: effectiveArchivedCount,
+            hotCount: this.messages.length,
+            rewoundMessages,
+            rewoundBranches: rewoundMessages,
         };
     }
 
@@ -1159,8 +1978,9 @@ export class SessionStoreEngine {
             modelId: '',
         });
         this.messages = messages;
-        this._revision = Math.max(this._revision, maxRevision, messages.length);
+        this._revision = Math.max(this._revision, maxRevision, this._archiveIndex.length + messages.length);
         this.meta.committedRevision = this._revision;
+        this.meta.archivedMessageCount = this._archiveIndex.length;
         this.meta.updatedAt = Date.now();
         this._needsLeadingNewlineOnAppend = false;
 
@@ -1363,25 +2183,54 @@ function extractReadableMessageBody(msg) {
     return '';
 }
 
+export function formatSessionByteSize(bytes = 0) {
+    const n = Math.max(0, Number(bytes) || 0);
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
 /**
- * Exports a session's conversation messages as clean Markdown or JSON (Stage F3 & F4).
+ * Exports a session's conversation messages as clean Markdown or JSON (Stage F3, F4 & R8).
+ * By default (`includeRewound = false`), exports ONLY the current active logical conversation
+ * (`archive.jsonl` + `messages.jsonl`) and excludes rewound/edited history branches.
  */
-export function exportSessionFormatted(messages = [], meta = {}, {
-    sessionId = '',
-    format = 'markdown',
-    exportedAtIso = new Date().toISOString(),
-} = {}) {
+export function exportSessionFormatted(messagesOrOptions = [], meta = {}, options = {}) {
+    const isSingleObjectCall =
+        messagesOrOptions &&
+        typeof messagesOrOptions === 'object' &&
+        !Array.isArray(messagesOrOptions);
+    const messages = isSingleObjectCall ? (messagesOrOptions.messages || []) : messagesOrOptions;
+    const effectiveMeta = isSingleObjectCall ? (messagesOrOptions.meta || {}) : (meta || {});
+    const {
+        sessionId = '',
+        format = 'markdown',
+        exportedAtIso = new Date().toISOString(),
+        includeRewound = false,
+        rewoundMessages = [],
+        archivedCount = 0,
+    } = isSingleObjectCall ? messagesOrOptions : (options || {});
+
     const validMsgs = (Array.isArray(messages) ? messages : [])
-        .filter(m => m && (m.role === 'user' || m.role === 'assistant'));
+        .filter(m => m && (m.role === 'user' || m.role === 'assistant') && (!isRewoundRecord(m) || includeRewound));
+    const validRewound = includeRewound
+        ? (Array.isArray(rewoundMessages) ? rewoundMessages : [])
+            .filter(m => m && (m.role === 'user' || m.role === 'assistant'))
+        : [];
+    const effectiveArchivedCount = Math.max(0, Number(archivedCount ?? effectiveMeta?.archivedMessageCount ?? 0));
 
     if (format === 'json') {
         return JSON.stringify({
             exportedAt: exportedAtIso,
             sessionId: String(sessionId || ''),
-            backend: String(meta?.backend || ''),
+            backend: String(effectiveMeta?.backend || ''),
+            exportScope: includeRewound ? 'full_with_rewound_branches' : 'active_logical_history_only',
+            includesRewoundBranches: Boolean(includeRewound),
+            archivedMessageCount: effectiveArchivedCount,
             messageCount: validMsgs.length,
             messages: validMsgs.map(m => ({
                 id: m.id || '',
+                revision: Number(m.revision || 0),
                 role: m.role,
                 text: extractReadableMessageBody(m),
                 createdAt: m.createdAt || '',
@@ -1391,15 +2240,36 @@ export function exportSessionFormatted(messages = [], meta = {}, {
                 ...(m.partial ? {partial: true} : {}),
                 ...(m.finishReason ? {finishReason: m.finishReason} : {}),
             })),
+            ...(includeRewound
+                ? {
+                    rewoundBranches: validRewound.map(m => ({
+                        id: m.id || '',
+                        revision: Number(m.revision || 0),
+                        role: m.role,
+                        text: extractReadableMessageBody(m),
+                        createdAt: m.createdAt || '',
+                        rewoundAt: m.rewoundAt || '',
+                        rewindFromMessageId: m.rewindFromMessageId || '',
+                    })),
+                }
+                : {}),
         }, null, 2);
     }
+
+    const scopeDesc = includeRewound
+        ? '包含当前逻辑会话及已撤销/替换的历史分支'
+        : '当前逻辑会话完整有效历史（不含已撤销/编辑替换的旧分支）';
+    const countDesc = effectiveArchivedCount > 0
+        ? `${validMsgs.length}（含已归档 ${effectiveArchivedCount} 条）`
+        : `${validMsgs.length}`;
 
     const lines = [
         '# Quick Chat（随问）对话导出',
         '',
         `- 会话 ID：\`${sessionId || 'current'}\``,
         `- 导出时间：${exportedAtIso}`,
-        `- 消息数量：${validMsgs.length}`,
+        `- 导出范围：${scopeDesc}`,
+        `- 消息数量：${countDesc}`,
         '',
         '---',
         '',
@@ -1418,11 +2288,29 @@ export function exportSessionFormatted(messages = [], meta = {}, {
         lines.push(extractReadableMessageBody(m) || '（无正文）');
         lines.push('');
     }
+
+    if (includeRewound && validRewound.length > 0) {
+        lines.push('---');
+        lines.push('');
+        lines.push('## 附：已撤销/替换的历史分支（不参与当前对话上下文）');
+        lines.push('');
+        for (const m of validRewound) {
+            const speaker = m.role === 'user'
+                ? '🙋 我 [已撤销分支]'
+                : `✦ ${m.modelId || m.backend || '助手'} [已撤销分支]`;
+            const timeTag = m.createdAt ? ` (${m.createdAt})` : '';
+            lines.push(`### ${speaker}${timeTag}`);
+            lines.push('');
+            lines.push(extractReadableMessageBody(m) || '（无正文）');
+            lines.push('');
+        }
+    }
     return lines.join('\n');
 }
 
 /**
- * Lists valid stored session directories under `sessionsRootDir` sorted newest-first (Stage F4).
+ * Lists valid stored session directories under `sessionsRootDir` sorted newest-first (Stage F4 & R8).
+ * Computes both active logical message count (`hot + archived`) and total disk byte usage (`totalBytes`, `formattedSize`).
  */
 export async function inspectSessionsWithIo(sessionsRootDir, io) {
     if (!sessionsRootDir || !io || typeof io.listDir !== 'function') return [];
@@ -1449,27 +2337,58 @@ export async function inspectSessionsWithIo(sessionsRootDir, io) {
 
         let updatedAt = 0;
         let backend = '';
-        let messageCount = 0;
+        let hotMessageCount = 0;
+        let archivedMessageCount = 0;
         let previewTitle = '';
+        let totalBytes = 0;
 
         try {
             if (await io.exists(paths.metaPath)) {
-                const metaRaw = await io.readText(paths.metaPath);
+                const metaRaw = String((await io.readText(paths.metaPath, MAX_SESSION_META_BYTES)) || '');
+                totalBytes += UTF8_ENCODER.encode(metaRaw).byteLength;
                 const metaObj = JSON.parse(metaRaw);
                 if (metaObj && typeof metaObj === 'object') {
                     updatedAt = Number(metaObj.updatedAt || 0);
                     backend = String(metaObj.backend || '');
+                    archivedMessageCount = Math.max(0, Number(metaObj.archivedMessageCount || 0));
                 }
             }
         } catch (_) {}
 
         try {
+            if (await io.exists(paths.archivePath)) {
+                const archRaw = String((await io.readText(paths.archivePath, MAX_SESSION_ARCHIVE_FILE_BYTES)) || '');
+                totalBytes += UTF8_ENCODER.encode(archRaw).byteLength;
+                const archLines = archRaw.split(/\r?\n/).filter(l => l.trim().length > 0);
+                let activeArchCount = 0;
+                for (const line of archLines) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj && !isRewoundRecord(obj)) {
+                            activeArchCount++;
+                            if (!previewTitle && obj.role === 'user') {
+                                const body = extractReadableMessageBody(obj).replace(/\s+/g, ' ');
+                                if (body) {
+                                    previewTitle = body.length > 28 ? `${body.slice(0, 28)}…` : body;
+                                }
+                            }
+                        }
+                    } catch (_) {}
+                }
+                archivedMessageCount = Math.max(archivedMessageCount, activeArchCount);
+            }
+        } catch (_) {}
+
+        try {
             if (await io.exists(paths.jsonlPath)) {
-                const rawLines = String(await io.readText(paths.jsonlPath) || '')
+                const hotRaw = String((await io.readText(paths.jsonlPath, MAX_SESSION_HOT_FILE_BYTES)) || '');
+                totalBytes += UTF8_ENCODER.encode(hotRaw).byteLength;
+                const rawLines = hotRaw
                     .split(/\r?\n/)
                     .filter(l => l.trim().length > 0);
-                messageCount = rawLines.length;
+                hotMessageCount = rawLines.length;
                 for (const line of rawLines) {
+                    if (previewTitle) break;
                     try {
                         const obj = JSON.parse(line);
                         if (obj?.role === 'user') {
@@ -1487,12 +2406,27 @@ export async function inspectSessionsWithIo(sessionsRootDir, io) {
             }
         } catch (_) {}
 
+        for (const auxPath of [paths.rewoundPath, paths.corruptPath, `${paths.jsonlPath}.corrupt-backup`]) {
+            try {
+                if (auxPath && (await io.exists(auxPath))) {
+                    const auxRaw = String((await io.readText(auxPath, MAX_SESSION_REWOUND_FILE_BYTES)) || '');
+                    totalBytes += UTF8_ENCODER.encode(auxRaw).byteLength;
+                }
+            } catch (_) {}
+        }
+
+        const messageCount = hotMessageCount + archivedMessageCount;
         if (messageCount > 0 || updatedAt > 0) {
             sessions.push({
                 sessionId: paths.sessionId,
                 updatedAt: updatedAt || 0,
                 backend,
+                hotMessageCount,
+                archivedMessageCount,
                 messageCount,
+                totalBytes,
+                formattedSize: formatSessionByteSize(totalBytes),
+                preview: previewTitle || paths.sessionId.slice(0, 8),
                 previewTitle: previewTitle || paths.sessionId.slice(0, 8),
             });
         }
@@ -1504,12 +2438,18 @@ export async function inspectSessionsWithIo(sessionsRootDir, io) {
 
 /**
  * Resolves the single best previous session to restore (`恢复上一个会话`, Stage F4).
+ * Supports both options object `(sessions, {currentSessionId, preferredPreviousId})`
+ * and positional arguments `(sessions, currentSessionId, preferredPreviousId)`.
  */
-export function resolvePreviousSessionId(sessions = [], {
-    currentSessionId = '',
-    preferredPreviousId = '',
-} = {}) {
+export function resolvePreviousSessionId(sessions = [], optionsOrCurrentId = {}, maybePreferredId = '') {
     const list = Array.isArray(sessions) ? sessions : [];
+    const currentSessionId = typeof optionsOrCurrentId === 'string'
+        ? optionsOrCurrentId
+        : String(optionsOrCurrentId?.currentSessionId || '');
+    const preferredPreviousId = typeof optionsOrCurrentId === 'string'
+        ? String(maybePreferredId || '')
+        : String(optionsOrCurrentId?.preferredPreviousId || '');
+
     const cleanPreferred = String(preferredPreviousId || '').trim();
     if (cleanPreferred && cleanPreferred !== currentSessionId) {
         const hit = list.find(s => s.sessionId === cleanPreferred && s.messageCount > 0);
@@ -1521,16 +2461,18 @@ export function resolvePreviousSessionId(sessions = [], {
 
 /**
  * Plans bounded retention cleanup for old sessions WITHOUT deleting anything automatically!
- * Actual deletion requires explicit user confirmation (Stage F4).
+ * Actual deletion requires explicit user confirmation after displaying size & retention policy (Stage F4 & R8).
  */
 export function planSessionRetentionCleanup(sessions = [], {
     currentSessionId = '',
     previousSessionId = '',
-    maxCount = 20,
+    maxCount = undefined,
+    maxSessions = undefined,
     maxAgeDays = 30,
     nowMs = Date.now(),
 } = {}) {
-    const safeMaxCount = Math.max(2, Number(maxCount) || 20);
+    const effectiveMax = maxCount ?? maxSessions ?? 20;
+    const safeMaxCount = Math.max(2, Number(effectiveMax) || 20);
     const safeMaxAgeDays = Math.max(1, Number(maxAgeDays) || 30);
     const cutoffMs = nowMs - safeMaxAgeDays * 24 * 60 * 60 * 1000;
     const protectedSet = new Set([currentSessionId, previousSessionId].filter(Boolean));
@@ -1558,8 +2500,11 @@ export function planSessionRetentionCleanup(sessions = [], {
         const expiredByAge = s.updatedAt > 0 && s.updatedAt < cutoffMs;
         const expiredByCount = unprotectedKept >= remainingSlots;
         if (expiredByAge || expiredByCount) {
+            const bytes = Math.max(0, Number(s.totalBytes || 0));
             candidatesToDelete.push({
                 ...s,
+                totalBytes: bytes,
+                formattedSize: s.formattedSize || formatSessionByteSize(bytes),
                 reason: expiredByAge ? `超过 ${safeMaxAgeDays} 天` : `超出保留上限 ${safeMaxCount} 个`,
             });
         } else {
@@ -1570,10 +2515,20 @@ export function planSessionRetentionCleanup(sessions = [], {
 
     keep.sort((a, b) => (b.updatedAt - a.updatedAt) || b.sessionId.localeCompare(a.sessionId));
 
+    const candidateTotalBytes = candidatesToDelete.reduce((sum, item) => sum + Math.max(0, Number(item.totalBytes || 0)), 0);
+    const totalStoredBytes = sorted.reduce((sum, item) => sum + Math.max(0, Number(item?.totalBytes || 0)), 0);
+    const candidateSizeSummary = formatSessionByteSize(candidateTotalBytes);
+    const totalStoredSizeSummary = formatSessionByteSize(totalStoredBytes);
+
     return {
         keep,
         candidatesToDelete,
-        policySummary: `最多保留最近 ${safeMaxCount} 个会话、${safeMaxAgeDays} 天内记录`,
+        candidateTotalBytes,
+        candidateSizeSummary,
+        totalStoredBytes,
+        totalStoredSizeSummary,
+        requiresExplicitUserConsent: true,
+        policySummary: `最多保留最近 ${safeMaxCount} 个会话、${safeMaxAgeDays} 天内记录（待清理 ${candidatesToDelete.length} 个，共 ${candidateSizeSummary}）`,
     };
 }
 
@@ -1598,12 +2553,14 @@ export async function deleteSessionDirectoryWithIo(sessionsRootDir, sessionId, i
     if (pending) {
         try { await pending; } catch (_) {}
     }
+    sharedSessionCoordinatorState.delete(coordKey);
 
     const knownFiles = [
         paths.jsonlPath,
         `${paths.jsonlPath}.corrupt-backup`,
         paths.metaPath,
         paths.archivePath,
+        paths.rewoundPath,
         paths.corruptPath,
         paths.legacyPath,
     ];
@@ -1651,7 +2608,7 @@ export async function importLegacyPiSessionWithIo({
     return {
         ok: true,
         sessionId: engine.sessionId,
-        importedCount: engine.messages.length,
+        importedCount: engine.totalLogicalMessageCount,
         error: '',
     };
 }

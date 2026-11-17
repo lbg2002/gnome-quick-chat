@@ -94,10 +94,10 @@
 
 现状：sessionEngine.js:754–766 压缩到 archive.jsonl，_loadFromDiskInternal（458–530）只读 messages.jsonl；backendClient.js:372–374 get_messages、400–409 export_session 只访问 hot messages。旧历史实际保存在归档，却不能从当前恢复和导出路径访问。rewind 也将被删除的分支写入同一 archive（861–864），与正常历史压缩混在一起。
 
-- [ ] 区分正常归档和被替换/撤销的历史分支（字段或独立文件），明确“完整导出”是否包含旧分支，默认只导出当前逻辑会话的完整有效历史。提供分页加载旧归档/按 revision 索引，避免将撤销内容重新加入模型上下文。
-- [ ] archive append + hot replace 崩溃窗口应可幂等恢复，按 ID/revision 去重；避免损坏备份/归档无上限增长。清理前显示大小与保留策略，不能无提示删除用户记录。
-- [ ] ui/chatPanel.js HistoryWindow 已限制挂载 Actor，但 allMessages 仍增长；将数据层也做热缓存+分页索引，完成后释放 card/trace/timer 引用。不要为实现分页引入数据库。
-- [ ] 测试 1000+ 消息、压缩/重启/导出、被编辑旧分支、归档损坏、分页上下滚动和 Actor 上限；完整历史与上下文预算分离。
+- [x] 区分正常归档和被替换/撤销的历史分支（字段或独立文件），明确“完整导出”是否包含旧分支，默认只导出当前逻辑会话的完整有效历史。提供分页加载旧归档/按 revision 索引，避免将撤销内容重新加入模型上下文。
+- [x] archive append + hot replace 崩溃窗口应可幂等恢复，按 ID/revision 去重；避免损坏备份/归档无上限增长。清理前显示大小与保留策略，不能无提示删除用户记录。
+- [x] ui/chatPanel.js HistoryWindow 已限制挂载 Actor，但 allMessages 仍增长；将数据层也做热缓存+分页索引，完成后释放 card/trace/timer 引用。不要为实现分页引入数据库。
+- [x] 测试 1000+ 消息、压缩/重启/导出、被编辑旧分支、归档损坏、分页上下滚动和 Actor 上限；完整历史与上下文预算分离。
 
 ### R9. OpenAI 网络与模型能力（P1）
 

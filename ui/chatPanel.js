@@ -62,6 +62,7 @@ export class ChatPanelView {
         onEntryKeyPress,
         onEntryTextChanged,
         onDismissMigrationNotice,
+        onLoadOlderArchivePage = null,
     }) {
         this._cardFactory = cardFactory;
         this._modelPicker = modelPicker;
@@ -101,6 +102,8 @@ export class ChatPanelView {
         this._onEntryKeyPress = onEntryKeyPress;
         this._onEntryTextChanged = onEntryTextChanged;
         this._onDismissMigrationNotice = onDismissMigrationNotice;
+        this._onLoadOlderArchivePage = onLoadOlderArchivePage;
+        this._archivePageLoading = false;
 
         this.historyWindow = new HistoryWindowController({
             initialPageSize: DEFAULT_INITIAL_HISTORY_COUNT,
@@ -789,6 +792,7 @@ export class ChatPanelView {
     renderSessionMenuState({
         currentSessionId = '',
         messageCount = 0,
+        archivedCount = 0,
         previousSessionId = '',
         previousPreview = '',
         cleanupPlan = null,
@@ -799,8 +803,9 @@ export class ChatPanelView {
 
         const shortCur = String(currentSessionId || '').slice(0, 8) || '未分配';
         const saveTag = saveWarning ? ` · ⚠️ ${saveWarning}` : ' · 已本地保存';
+        const archiveTag = archivedCount > 0 ? `，含 ${archivedCount} 条已归档` : '';
         this._sessionMenuBox.add_child(createWrapLabel(
-            `当前会话：${shortCur}（${messageCount} 条消息${saveTag}）`,
+            `当前会话：${shortCur}（${messageCount} 条消息${archiveTag}${saveTag}）`,
             'qc-mini-label'
         ));
 
@@ -855,6 +860,7 @@ export class ChatPanelView {
                     this.renderSessionMenuState({
                         currentSessionId,
                         messageCount,
+                        archivedCount,
                         previousSessionId,
                         previousPreview,
                         cleanupPlan,
@@ -884,6 +890,7 @@ export class ChatPanelView {
                     this.renderSessionMenuState({
                         currentSessionId,
                         messageCount,
+                        archivedCount,
                         previousSessionId,
                         previousPreview,
                         cleanupPlan,
@@ -904,12 +911,13 @@ export class ChatPanelView {
                 style_class: 'qc-session-actions',
                 y_align: Clutter.ActorAlign.CENTER,
             });
+            const sizeSummary = cleanupPlan?.candidateSizeSummary || '0 B';
             cleanupRow.add_child(createWrapLabel(
-                `发现 ${expiredCount} 个超出保留策略（${cleanupPlan.policySummary}）的旧会话`,
+                `发现 ${expiredCount} 个超出保留策略（${cleanupPlan.policySummary}，共约 ${sizeSummary}）的旧会话`,
                 'qc-mini-label'
             ));
             cleanupRow.add_child(createStButton(
-                `同意清理 (${expiredCount})`,
+                `同意清理 (${expiredCount} / ${sizeSummary})`,
                 () => {
                     const ids = cleanupPlan.candidatesToDelete.map(c => c.sessionId);
                     this.toggleSessionMenu(false);
@@ -1304,14 +1312,14 @@ export class ChatPanelView {
             this.restoreLatestHistoryWindow();
         } else {
             this.syncHistoryWindowButtons();
-            if (this.historyWindow.allMessages.length === 0) {
+            if (this.historyWindow.allMessages.length === 0 && !this.historyWindow.externalArchivedCount) {
                 this.buildEmptyState();
             }
         }
         return true;
     }
 
-    renderInitialHistory(allDetailed, onUserPromptSeen) {
+    renderInitialHistory(allDetailed, onUserPromptSeen, {externalArchivedCount = 0} = {}) {
         this.clearMessages();
         const normalized = Array.isArray(allDetailed) ? allDetailed : [];
         for (const msg of normalized) {
@@ -1319,8 +1327,11 @@ export class ChatPanelView {
                 onUserPromptSeen?.(msg.text);
             }
         }
-        const {initialSlice} = this.historyWindow.reset(normalized);
-        if (!initialSlice.length) return;
+        const {initialSlice} = this.historyWindow.reset(normalized, {externalArchivedCount});
+        if (!initialSlice.length) {
+            this.syncHistoryWindowButtons();
+            return;
+        }
 
         const mounted = initialSlice.map(msg => this.addMessage(msg.role, msg.displayText || msg.text, {
             rawPromptText: msg.text,
@@ -1393,8 +1404,34 @@ export class ChatPanelView {
         }
     }
 
-    prependOlderHistoryBatch() {
-        if (!this.historyWindow?.hasOlder || !this.messagesBox) return;
+    async prependOlderHistoryBatch() {
+        if (!this.historyWindow?.hasOlder || !this.messagesBox || this._archivePageLoading) return;
+
+        if (
+            this.historyWindow.windowStart === 0 &&
+            this.historyWindow.externalArchivedCount > 0 &&
+            typeof this._onLoadOlderArchivePage === 'function'
+        ) {
+            this._archivePageLoading = true;
+            try {
+                const archivePage = await this._onLoadOlderArchivePage(DEFAULT_HISTORY_PAGE_SIZE);
+                if (!this.historyWindow || !this.messagesBox) return;
+                if (archivePage && Array.isArray(archivePage.messages)) {
+                    this.historyWindow.prependArchivedMessages(archivePage.messages, {
+                        remainingExternalCount: Number(archivePage.olderRemainingCount ?? 0),
+                    });
+                }
+            } catch (_) {
+                // Keep UI responsive even if archive read fails
+            } finally {
+                this._archivePageLoading = false;
+            }
+        }
+
+        if (!this.historyWindow?.hasOlder || !this.messagesBox) {
+            this.syncHistoryWindowButtons();
+            return;
+        }
         const adj = this.scroll?.vadjustment;
         const prevUpper = adj ? adj.upper : 0;
         const prevValue = adj ? adj.value : 0;
@@ -1407,7 +1444,10 @@ export class ChatPanelView {
         const {slice, newWindowStart, evictBottomCount} = this.historyWindow.planPrependOlderBatch({
             protectedCard: this._getLiveCard?.(),
         });
-        if (!slice.length) return;
+        if (!slice.length) {
+            this.syncHistoryWindowButtons();
+            return;
+        }
 
         const baseInsertIdx = this._loadMoreBtn ? 1 : 0;
         const prependedCards = slice.map((msg, offset) => this.addMessage(msg.role, msg.displayText || msg.text, {
@@ -1461,6 +1501,7 @@ export class ChatPanelView {
     restoreLatestHistoryWindow() {
         if (!this.messagesBox || !this.historyWindow) return;
         const all = [...this.historyWindow.allMessages];
+        const prevArchivedCount = this.historyWindow.externalArchivedCount;
         const liveCard = this._getLiveCard?.() || null;
         const liveBox = liveCard?.box || null;
 
@@ -1483,7 +1524,7 @@ export class ChatPanelView {
         }
 
         if (!liveCard) {
-            const {initialSlice} = this.historyWindow.reset(all);
+            const {initialSlice} = this.historyWindow.reset(all, {externalArchivedCount: prevArchivedCount});
             const mounted = initialSlice.map(msg => this.addMessage(msg.role, msg.displayText || msg.text, {
                 rawPromptText: msg.text,
                 animate: false,

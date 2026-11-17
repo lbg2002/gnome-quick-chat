@@ -4,6 +4,7 @@ import St from 'gi://St';
 import {
     computeAdaptiveRenderDelayMs,
     formatMessageTimestamp,
+    releaseCardRuntimeReferences,
     resolveAssistantDisplayModel,
 } from '../core/renderScheduler.js';
 import {renderCardBodyIncremental} from './markdownRenderer.js';
@@ -102,23 +103,7 @@ export class MessageCardFactory {
 
     destroyCardActor(card) {
         if (!card) return;
-        if (card.renderTimer) {
-            this._clearTimer(card.renderTimer);
-            card.renderTimer = 0;
-        }
-        if (card.copyBtn?._copyResetTimer) {
-            this._clearTimer(card.copyBtn._copyResetTimer);
-            card.copyBtn._copyResetTimer = 0;
-        }
-        if (card.drawerCopyBtn?._copyResetTimer) {
-            this._clearTimer(card.drawerCopyBtn._copyResetTimer);
-            card.drawerCopyBtn._copyResetTimer = 0;
-        }
-        if (card.box) {
-            try { card.box.remove_all_transitions?.(); } catch (_) {}
-            try { card.box.destroy(); } catch (_) {}
-            card.box = null;
-        }
+        releaseCardRuntimeReferences(card, {clearTimer: this._clearTimer});
     }
 
     createCard(role, text, options = {}) {

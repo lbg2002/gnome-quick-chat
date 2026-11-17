@@ -116,9 +116,11 @@ let asyncError = null;
         const reloaded = new SessionStore('gjs_smoke_sess', {sessionsRootDir: tmpRoot});
         await reloaded.load('openai', {openaiModel: 'gpt-4o'});
         assert(reloaded.messages.length === 2, 'Reloaded 2 messages via Gio');
+        const fullLogical = await reloaded.loadFullLogicalHistory({includeRewound: false});
+        assert(fullLogical.messages.length === 2, 'loadFullLogicalHistory via Gio');
 
         const hw = new HistoryWindowController();
-        hw.reset(reloaded.messages);
+        hw.reset(reloaded.messages, {externalArchivedCount: reloaded.archivedMessageCount});
         assert(hw.allMessages.length === 2, 'HistoryWindowController reset');
 
         // Verify Gio private 0600/0700 Unix mode enforcement (replaces non-GIR GLib.chmod)
@@ -133,7 +135,7 @@ let asyncError = null;
         assert((dirInfo.get_attribute_uint32('unix::mode') & 0o777) === 0o700, 'Session directory mode 0700');
 
         // Cleanup isolated temp directory
-        for (const fname of ['messages.jsonl', 'meta.json']) {
+        for (const fname of ['messages.jsonl', 'meta.json', 'archive.jsonl', 'rewound.jsonl', 'corrupt.jsonl']) {
             const f = sessDir.get_child(fname);
             if (f.query_exists(null)) f.delete(null);
         }

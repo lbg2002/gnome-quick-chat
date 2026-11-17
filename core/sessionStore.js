@@ -15,13 +15,19 @@ import {
 import {buildModelSignature} from '../protocol.js';
 import {
     DEFAULT_HOT_MESSAGE_LIMIT,
+    MAX_SESSION_ARCHIVE_FILE_BYTES,
+    MAX_SESSION_ARCHIVE_MESSAGES,
+    MAX_SESSION_CORRUPT_BACKUP_BYTES,
     MAX_SESSION_HOT_FILE_BYTES,
     MAX_SESSION_LINE_BYTES,
     MAX_SESSION_META_BYTES,
+    MAX_SESSION_REWOUND_FILE_BYTES,
+    MAX_SESSION_REWOUND_MESSAGES,
     SessionStoreEngine,
     buildContinuationPrompt,
     deleteSessionDirectoryWithIo,
     exportSessionFormatted,
+    formatSessionByteSize,
     importLegacyPiSessionWithIo,
     inspectSessionsWithIo,
     planSessionRetentionCleanup,
@@ -37,6 +43,7 @@ export {
     buildModelSignature,
     buildRuntimeContextSignature,
     exportSessionFormatted,
+    formatSessionByteSize,
     planSessionRetentionCleanup,
     resolvePreviousSessionId,
     resolveSafeSessionPaths,
@@ -581,8 +588,17 @@ export async function executeApprovedSessionCleanupAsync(candidateSessionIds = [
 export async function exportSessionToPrivateFileAsync(messages, meta = {}, {
     sessionId = '',
     format = 'markdown',
+    includeRewound = false,
+    rewoundMessages = [],
+    archivedCount = 0,
 } = {}) {
-    const formatted = exportSessionFormatted(messages, meta, {sessionId, format});
+    const formatted = exportSessionFormatted(messages, meta, {
+        sessionId,
+        format,
+        includeRewound,
+        rewoundMessages,
+        archivedCount,
+    });
     const exportsDir = GLib.build_filenamev([getDataDir(), 'exports']);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const shortId = String(sessionId || 'session').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 8) || 'session';
@@ -627,7 +643,7 @@ export async function importLegacyPiSessionFileReadOnly(sourceFilePath, targetSe
 }
 
 /**
- * Gio-backed SessionStore wrapping pure-JS `SessionStoreEngine` (Stage C1/C2/F3/F4).
+ * Gio-backed SessionStore wrapping pure-JS `SessionStoreEngine` (Stage C1/C2/F3/F4/R8).
  */
 export class SessionStore extends SessionStoreEngine {
     constructor(sessionId, options = {}) {
@@ -637,6 +653,11 @@ export class SessionStore extends SessionStoreEngine {
             maxHotMessages: options.maxHotMessages ?? DEFAULT_HOT_MESSAGE_LIMIT,
             maxLineBytes: options.maxLineBytes ?? MAX_SESSION_LINE_BYTES,
             maxHotFileBytes: options.maxHotFileBytes ?? MAX_SESSION_HOT_FILE_BYTES,
+            maxArchiveFileBytes: options.maxArchiveFileBytes ?? MAX_SESSION_ARCHIVE_FILE_BYTES,
+            maxArchiveMessages: options.maxArchiveMessages ?? MAX_SESSION_ARCHIVE_MESSAGES,
+            maxRewoundFileBytes: options.maxRewoundFileBytes ?? MAX_SESSION_REWOUND_FILE_BYTES,
+            maxRewoundMessages: options.maxRewoundMessages ?? MAX_SESSION_REWOUND_MESSAGES,
+            maxCorruptBackupBytes: options.maxCorruptBackupBytes ?? MAX_SESSION_CORRUPT_BACKUP_BYTES,
             maxRetainedLines: options.maxRetainedLines ?? 600,
             keepArchive: options.keepArchive ?? true,
             maxWriteRetries: options.maxWriteRetries ?? 2,
