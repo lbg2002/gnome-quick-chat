@@ -36,10 +36,10 @@
 
 **已确认缺陷**：runtime/processManager.js:61–94 仅根据直接子进程 exited 决定是否发送 group SIGKILL。若 CLI 收到 TERM 退出而其子进程忽略 TERM，宽限期结束不会杀剩余组成员。39–50 的 signalIsolatedProcessGroup 返回 true 只是成功启动 kill 命令，不代表信号成功发送。正常完成的 trySettleWhenComplete 也调用 terminate（421–429），需要防止对已退出/复用 PGID 的进程发信号。
 
-- [ ] 采用经过验证的独立 process group 或用户级 transient scope/cgroup，记录创建身份；确认组隔离成立后才能发组信号，检查 kill 退出状态，取消后独立检查剩余成员，不以 leader 退出作为组清空依据。考虑 PID/PGID 复用和成员主动 setsid 逃逸，无法保证时诚实提示降级；不允许误杀 GNOME Shell/其他任务。正常退出与强制终止路径分开。
-- [ ] 将 read/close/finish、wait、握手 timer、审批 timer、temp file cleanup 统一收口；runtime/processManager.js:544–549、469–472 有早返回未调用对应 finish 的路径，需审查 GIO 异步资源释放，确保取消不产生长生命周期引用。
-- [ ] 现有 ZCode bridge 仍依赖内部 DenyPermissionBroker monkey patch（zcodeBridge.cjs:657–709）。宿主收到 bridge_ready/首个事件后才检查不能等同于执行前沙箱；验证实际版本中所有敏感操作均经过该 broker，握手失败时不执行任务。自定义 CLI 包装器、NODE_OPTIONS、脚本名不含 zcode、延迟初始化均需测试；不能验证则仅允许已验证受限模式或禁止该任务。不要用提示词假装强制隔离。
-- [ ] 真正生产路径测试：假 CLI leader 退出但子进程忽略 TERM、fork 后 stdout 仍打开、正常结束、握手失败、锁屏/disable 时取消；确认无残留、无误杀，并报告不受控脱离组进程的边界。
+- [x] 采用经过验证的独立 process group 或用户级 transient scope/cgroup，记录创建身份；确认组隔离成立后才能发组信号，检查 kill 退出状态，取消后独立检查剩余成员，不以 leader 退出作为组清空依据。考虑 PID/PGID 复用和成员主动 setsid 逃逸，无法保证时诚实提示降级；不允许误杀 GNOME Shell/其他任务。正常退出与强制终止路径分开。
+- [x] 将 read/close/finish、wait、握手 timer、审批 timer、temp file cleanup 统一收口；runtime/processManager.js:544–549、469–472 有早返回未调用对应 finish 的路径，需审查 GIO 异步资源释放，确保取消不产生长生命周期引用。
+- [x] 现有 ZCode bridge 仍依赖内部 DenyPermissionBroker monkey patch（zcodeBridge.cjs:657–709）。宿主收到 bridge_ready/首个事件后才检查不能等同于执行前沙箱；验证实际版本中所有敏感操作均经过该 broker，握手失败时不执行任务。自定义 CLI 包装器、NODE_OPTIONS、脚本名不含 zcode、延迟初始化均需测试；不能验证则仅允许已验证受限模式或禁止该任务。不要用提示词假装强制隔离。
+- [x] 真正生产路径测试：假 CLI leader 退出但子进程忽略 TERM、fork 后 stdout 仍打开、正常结束、握手失败、锁屏/disable 时取消；确认无残留、无误杀，并报告不受控脱离组进程的边界。
 
 ### R3. 会话可靠性、重新生成与远端同步（P0）
 

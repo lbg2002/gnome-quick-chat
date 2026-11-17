@@ -647,12 +647,70 @@ export function createMockGio() {
                 this._cmd = String(argv[0]);
                 this._args = argv.slice(1).map(String);
                 this._flags = flags;
+                this._mockProc = null;
             }
             static new(argv, flags = 0) {
                 return new Subprocess(argv, flags);
             }
+            _ensureSpawned() {
+                if (this._mockProc) return this._mockProc;
+                const stdio = [
+                    (this._flags & 1) ? 'pipe' : 'ignore',
+                    (this._flags & 2) ? 'pipe' : 'ignore',
+                    (this._flags & 4) ? 'pipe' : 'ignore',
+                ];
+                const child = spawn(this._cmd, this._args, {stdio});
+                this._mockProc = new MockSubprocess(child, this._flags);
+                return this._mockProc;
+            }
+            get_identifier() {
+                return this._ensureSpawned().get_identifier();
+            }
+            get_stdin_pipe() {
+                return this._ensureSpawned().get_stdin_pipe();
+            }
+            get_stdout_pipe() {
+                return this._ensureSpawned().get_stdout_pipe();
+            }
+            get_stderr_pipe() {
+                return this._ensureSpawned().get_stderr_pipe();
+            }
+            wait_async(cancellable, cb) {
+                return this._ensureSpawned().wait_async(cancellable, (_p, res) => cb(this, res));
+            }
+            wait_finish(res) {
+                return this._ensureSpawned().wait_finish(res);
+            }
+            get_successful() {
+                return this._mockProc ? this._mockProc.get_successful() : false;
+            }
+            get_if_exited() {
+                return this._mockProc ? this._mockProc.get_if_exited() : false;
+            }
+            get_exit_status() {
+                return this._mockProc ? this._mockProc.get_exit_status() : -1;
+            }
+            get_if_signaled() {
+                return this._mockProc ? this._mockProc.get_if_signaled() : false;
+            }
+            get_term_sig() {
+                return this._mockProc ? this._mockProc.get_term_sig() : 0;
+            }
+            send_signal(sigNum) {
+                return this._mockProc?.send_signal(sigNum);
+            }
+            force_exit() {
+                return this._mockProc?.force_exit();
+            }
             communicate_utf8(_input, _cancellable) {
                 const res = spawnSync(this._cmd, this._args, {encoding: 'utf8', timeout: 5000});
+                this._mockProc = {
+                    get_successful: () => res.status === 0 && !res.signal,
+                    get_if_exited: () => res.status !== null,
+                    get_exit_status: () => res.status ?? -1,
+                    get_if_signaled: () => Boolean(res.signal),
+                    get_term_sig: () => 0,
+                };
                 return [true, res.stdout || '', res.stderr || ''];
             }
             communicate_utf8_async(_input, _cancellable, cb) {
@@ -661,9 +719,22 @@ export function createMockGio() {
                 });
                 let out = '';
                 let err = '';
+                let exitStatus = null;
+                let exitSignal = null;
                 child.stdout?.on('data', d => { out += d.toString('utf8'); });
                 child.stderr?.on('data', d => { err += d.toString('utf8'); });
-                child.on('close', () => cb(this, {_out: out, _err: err}));
+                child.on('close', (code, sig) => {
+                    exitStatus = code;
+                    exitSignal = sig;
+                    this._mockProc = {
+                        get_successful: () => exitStatus === 0 && !exitSignal,
+                        get_if_exited: () => exitStatus !== null,
+                        get_exit_status: () => exitStatus ?? -1,
+                        get_if_signaled: () => Boolean(exitSignal),
+                        get_term_sig: () => 0,
+                    };
+                    cb(this, {_out: out, _err: err});
+                });
             }
             communicate_utf8_finish(res) {
                 return [true, res?._out || '', res?._err || ''];

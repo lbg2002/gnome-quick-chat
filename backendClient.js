@@ -184,7 +184,11 @@ export function resolveBackendRuntime(config = {}) {
             if (bridgePath && !bridgePath.includes('"')) {
                 const existingNodeOpts = GLib.getenv('NODE_OPTIONS') || '';
                 extraEnv.NODE_OPTIONS = `${existingNodeOpts} --require "${bridgePath}"`.trim();
+                extraEnv.QUICK_CHAT_FORCE_BRIDGE = '1';
             }
+        }
+        if (bridgePath) {
+            extraEnv.QUICK_CHAT_FORCE_BRIDGE = '1';
         }
 
         const cliCapabilities = probeCliCapabilities('zcode', probePrefix, probeEnv);

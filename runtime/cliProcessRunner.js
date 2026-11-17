@@ -12,6 +12,7 @@ export const MAX_CLI_TOTAL_PROMPT_BYTES = 512 * 1024;
 export const BRIDGE_EXPECTED_PROTOCOL_VERSION = 1;
 export const DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS = 5000;
 export const DEFAULT_KILL_GRACE_MS = 800;
+export const DEFAULT_POST_EXIT_PIPE_DRAIN_MS = 250;
 
 export const DEFAULT_STREAM_LIMITS = Object.freeze({
     maxLineBytes: 512 * 1024,
@@ -105,6 +106,40 @@ export function wrapArgvWithSetsid(argv, setsidPath = '') {
     };
 }
 
+/**
+ * Parses `/proc/<pid>/stat` content safely even when `(comm)` contains spaces or parentheses.
+ */
+export function parseLinuxProcStat(statText) {
+    const raw = String(statText || '').trim();
+    if (!raw) return null;
+    const firstParen = raw.indexOf('(');
+    const lastParen = raw.lastIndexOf(')');
+    if (firstParen <= 0 || lastParen <= firstParen) return null;
+
+    const pid = Number.parseInt(raw.slice(0, firstParen).trim(), 10);
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+
+    const comm = raw.slice(firstParen + 1, lastParen);
+    const rest = raw.slice(lastParen + 1).trim().split(/\s+/);
+    if (rest.length < 20) return null;
+
+    const state = rest[0] || '';
+    const ppid = Number.parseInt(rest[1], 10) || 0;
+    const pgrp = Number.parseInt(rest[2], 10) || 0;
+    const session = Number.parseInt(rest[3], 10) || 0;
+    const startTime = String(rest[19] || '');
+
+    return {
+        pid,
+        comm,
+        state,
+        ppid,
+        pgrp,
+        session,
+        startTime,
+    };
+}
+
 export function isSafeProcessGroupId(pgid, {selfPid = 0, selfPgid = 0} = {}) {
     if (!Number.isInteger(pgid) || pgid <= 1) return false;
     if (selfPid > 0 && pgid === selfPid) return false;
@@ -115,6 +150,9 @@ export function isSafeProcessGroupId(pgid, {selfPid = 0, selfPgid = 0} = {}) {
 export function buildProcessGroupKillArgv(pgid, signalName = 'TERM', killBinPath = '/bin/kill') {
     if (!isSafeProcessGroupId(pgid)) {
         throw new Error(`不安全的进程组 ID: ${pgid}`);
+    }
+    if (signalName === '0' || signalName === 0) {
+        return [killBinPath, '-0', '--', `-${pgid}`];
     }
     const sig = signalName === 'KILL' || signalName === 9 || signalName === '9' ? 'KILL' : 'TERM';
     return [killBinPath, '-s', sig, '--', `-${pgid}`];

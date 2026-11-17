@@ -723,6 +723,14 @@ function ensureStdinListener() {
     updateProcessStdinRef(defaultController.pendingRequests.size);
 }
 
+const origStdoutWrite = process.stdout.write.bind(process.stdout);
+
+function writeStdoutJsonLine(obj) {
+    try {
+        origStdoutWrite(`${JSON.stringify(obj)}\n`);
+    } catch (_) {}
+}
+
 function emitBridgeReadyOnce(extra = {}) {
     if (readyEmitted) return;
     readyEmitted = true;
@@ -733,6 +741,8 @@ function emitBridgeReadyOnce(extra = {}) {
         ...extra,
     });
 }
+
+let restorePreHandshakeGuards = null;
 
 function patchDenyPermissionBroker(BrokerClass, origDefineProp) {
     if (!BrokerClass || !BrokerClass.prototype || BrokerClass.prototype.__qcPatched) return;
@@ -745,11 +755,26 @@ function patchDenyPermissionBroker(BrokerClass, origDefineProp) {
     if (origDefineProp && Object.defineProperty !== origDefineProp) {
         Object.defineProperty = origDefineProp;
     }
+    if (typeof restorePreHandshakeGuards === 'function') {
+        restorePreHandshakeGuards();
+        restorePreHandshakeGuards = null;
+    }
     emitBridgeReadyOnce();
 }
 
 const isZCodeProcess = process.argv.some(arg => String(arg).includes('zcode'));
-if (isZCodeProcess || process.env.QUICK_CHAT_FORCE_BRIDGE === '1') {
+const isExplicitBridgeRequested =
+    process.env.QUICK_CHAT_FORCE_BRIDGE === '1' ||
+    process.env.QUICK_CHAT_REQUIRE_BRIDGE === '1';
+
+if ((isZCodeProcess || isExplicitBridgeRequested) && process.env.QUICK_CHAT_BRIDGE_ACTIVE !== '1') {
+    process.env.QUICK_CHAT_BRIDGE_ACTIVE = '1';
+    if (process.env.NODE_OPTIONS && process.env.NODE_OPTIONS.includes('zcodeBridge.cjs')) {
+        process.env.NODE_OPTIONS = process.env.NODE_OPTIONS
+            .replace(/--require\s+(?:"[^"]*zcodeBridge\.cjs"|'[^']*zcodeBridge\.cjs'|\S*zcodeBridge\.cjs)/g, '')
+            .trim();
+    }
+
     injectPromptFromFileIfConfigured(process.argv, process.env);
 
     const requireBridgeStrict = process.env.QUICK_CHAT_REQUIRE_BRIDGE === '1';
@@ -763,7 +788,73 @@ if (isZCodeProcess || process.env.QUICK_CHAT_FORCE_BRIDGE === '1') {
         process.exit(BRIDGE_FAIL_EXIT_CODE);
     }
 
+    const failUnpatchedStrict = (reasonText = '当前 ZCode 版本未命中 DenyPermissionBroker 审批钩子，已安全阻止任务执行') => {
+        if (typeof restorePreHandshakeGuards === 'function') {
+            restorePreHandshakeGuards();
+            restorePreHandshakeGuards = null;
+        }
+        emitBridgeReadyOnce({
+            patched: false,
+            fatal: true,
+            error: reasonText,
+        });
+        process.exit(BRIDGE_FAIL_EXIT_CODE);
+    };
+
     const origDefineProperty = Object.defineProperty;
+    let initTimer = null;
+
+    if (requireBridgeStrict) {
+        const cp = require('node:child_process');
+        const origCpMethods = {};
+        const guardedMethods = ['spawn', 'exec', 'execFile', 'fork', 'spawnSync', 'execSync', 'execFileSync'];
+        for (const m of guardedMethods) {
+            if (typeof cp[m] === 'function') {
+                origCpMethods[m] = cp[m];
+                cp[m] = function (..._args) {
+                    if (!brokerPatched) {
+                        failUnpatchedStrict('当前 ZCode 版本未命中 DenyPermissionBroker 审批钩子（在握手完成前尝试启动子进程），已安全阻止任务执行');
+                    }
+                    return origCpMethods[m].apply(this, _args);
+                };
+            }
+        }
+
+        process.stdout.write = function (chunk, encoding, cb) {
+            if (!brokerPatched) {
+                const str = typeof chunk === 'string' ? chunk : (Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk || ''));
+                const trimmed = str.trim();
+                if (
+                    trimmed.startsWith('{') &&
+                    (
+                        trimmed.includes('"tool.updated"') ||
+                        trimmed.includes('"model.streaming"') ||
+                        trimmed.includes('"turn.started"') ||
+                        trimmed.includes('"turn.completed"') ||
+                        trimmed.includes('"result"')
+                    )
+                ) {
+                    failUnpatchedStrict('当前 ZCode 版本未命中 DenyPermissionBroker 审批钩子，已安全阻止任务执行');
+                }
+            }
+            return origStdoutWrite(chunk, encoding, cb);
+        };
+
+        restorePreHandshakeGuards = () => {
+            if (initTimer) {
+                clearTimeout(initTimer);
+                initTimer = null;
+            }
+            if (Object.defineProperty !== origDefineProperty) {
+                Object.defineProperty = origDefineProperty;
+            }
+            for (const [m, fn] of Object.entries(origCpMethods)) {
+                cp[m] = fn;
+            }
+            process.stdout.write = origStdoutWrite;
+        };
+    }
+
     Object.defineProperty = function (target, prop, desc) {
         const res = origDefineProperty.call(this, target, prop, desc);
         if (prop === 'name' && desc && typeof target === 'function') {
@@ -781,19 +872,32 @@ if (isZCodeProcess || process.env.QUICK_CHAT_FORCE_BRIDGE === '1') {
         }
         return res;
     };
-    setImmediate(() => {
-        if (Object.defineProperty !== origDefineProperty) {
-            Object.defineProperty = origDefineProperty;
-        }
+
+    const initWaitMs = Math.max(20, Number(process.env.QUICK_CHAT_BRIDGE_INIT_WAIT_MS || 250));
+    process.once('beforeExit', () => {
         if (!brokerPatched && requireBridgeStrict) {
-            emitBridgeReadyOnce({
-                patched: false,
-                fatal: true,
-                error: '当前 ZCode 版本未命中 DenyPermissionBroker 审批钩子，已安全阻止任务执行',
-            });
-            process.exit(BRIDGE_FAIL_EXIT_CODE);
+            failUnpatchedStrict();
+        } else if (!readyEmitted) {
+            emitBridgeReadyOnce();
         }
-        emitBridgeReadyOnce();
+    });
+
+    setImmediate(() => {
+        if (brokerPatched) {
+            emitBridgeReadyOnce();
+            return;
+        }
+        if (!requireBridgeStrict) {
+            emitBridgeReadyOnce();
+            return;
+        }
+        initTimer = setTimeout(() => {
+            initTimer = null;
+            if (!brokerPatched && requireBridgeStrict) {
+                failUnpatchedStrict();
+            }
+        }, initWaitMs);
+        initTimer.unref?.();
     });
 }
 

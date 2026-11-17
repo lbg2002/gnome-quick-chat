@@ -12,9 +12,11 @@ import {
     CliTurnMonitor,
     DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS,
     DEFAULT_KILL_GRACE_MS,
+    DEFAULT_POST_EXIT_PIPE_DRAIN_MS,
     buildProcessGroupKillArgv,
     evaluateSubprocessOutcome,
     isSafeProcessGroupId,
+    parseLinuxProcStat,
     wrapArgvWithSetsid,
 } from './cliProcessRunner.js';
 import {
@@ -23,6 +25,46 @@ import {
 } from './sseParser.js';
 
 const Encoder = new TextEncoder();
+const Decoder = new TextDecoder('utf-8', {fatal: false});
+
+export function readProcStatSync(pidOrSelf = 'self') {
+    try {
+        const statPath = `/proc/${pidOrSelf}/stat`;
+        if (!GLib.file_test(statPath, GLib.FileTest.EXISTS)) return null;
+        const [ok, rawBytes] = GLib.file_get_contents(statPath);
+        if (!ok || !rawBytes) return null;
+        return parseLinuxProcStat(Decoder.decode(rawBytes));
+    } catch (_) {
+        return null;
+    }
+}
+
+export function getSelfProcessIdentity() {
+    const selfStat = readProcStatSync('self');
+    return {
+        selfPid: selfStat?.pid || 0,
+        selfPgid: selfStat?.pgrp || 0,
+    };
+}
+
+export function isProcessGroupReused(pgid, recordedLeaderStartTime = '') {
+    if (!Number.isInteger(pgid) || pgid <= 1) return true;
+    const currentStat = readProcStatSync(pgid);
+    if (!currentStat) return false;
+    if (recordedLeaderStartTime && currentStat.startTime && currentStat.startTime !== String(recordedLeaderStartTime)) {
+        return true;
+    }
+    const selfIdentity = getSelfProcessIdentity();
+    if (
+        pgid !== selfIdentity.selfPid &&
+        pgid !== selfIdentity.selfPgid &&
+        currentStat.pgrp &&
+        currentStat.pgrp === selfIdentity.selfPgid
+    ) {
+        return true;
+    }
+    return false;
+}
 
 export function resolveKillExecutable() {
     if (GLib.file_test('/bin/kill', GLib.FileTest.IS_EXECUTABLE)) return '/bin/kill';
@@ -36,8 +78,12 @@ export function resolveSetsidExecutable(pathDirs = []) {
     return findExecutableInDirs('setsid', pathDirs) || '';
 }
 
-export function signalIsolatedProcessGroup(pgid, signalName, killBin) {
-    if (!killBin || !isSafeProcessGroupId(pgid)) return false;
+export function signalIsolatedProcessGroup(pgid, signalName, killBin, onComplete = null) {
+    const selfIdentity = getSelfProcessIdentity();
+    if (!killBin || !isSafeProcessGroupId(pgid, selfIdentity)) {
+        onComplete?.({started: false, ok: false, exitStatus: -1});
+        return false;
+    }
     try {
         const argv = buildProcessGroupKillArgv(pgid, signalName, killBin);
         const killer = Gio.Subprocess.new(
@@ -45,58 +91,129 @@ export function signalIsolatedProcessGroup(pgid, signalName, killBin) {
             Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE
         );
         killer.wait_async(null, (p, res) => {
-            try { p.wait_finish(res); } catch (_) {}
+            let ok = false;
+            let exitStatus = -1;
+            try {
+                p.wait_finish(res);
+                if (p.get_if_exited?.()) {
+                    exitStatus = p.get_exit_status();
+                    ok = exitStatus === 0;
+                } else if (p.get_successful?.()) {
+                    exitStatus = 0;
+                    ok = true;
+                }
+            } catch (_) {}
+            onComplete?.({started: true, ok, exitStatus});
         });
         return true;
     } catch (_) {
+        onComplete?.({started: false, ok: false, exitStatus: -1});
         return false;
     }
 }
 
+export function signalIsolatedProcessGroupAsync(pgid, signalName, killBin) {
+    return new Promise(resolve => {
+        signalIsolatedProcessGroup(pgid, signalName, killBin, result => resolve(result));
+    });
+}
+
 /**
  * Terminates a CLI subprocess and its isolated `setsid` process group cleanly:
- * sends SIGTERM first, gives DEFAULT_KILL_GRACE_MS (800ms) for clean exit,
- * and escalates to SIGKILL ONLY within the child's own isolated process group.
+ * sends SIGTERM first, gives `graceMs` (default 800ms) for clean exit,
+ * and escalates to SIGKILL within the child's isolated process group even if
+ * the leader process exited early on SIGTERM while a child process ignored SIGTERM.
  */
-export function terminateProcessTreeGracefully(proc, {pgid = 0, isolatedProcessGroup = false} = {}) {
-    if (!proc) return;
+export function terminateProcessTreeGracefully(
+    proc,
+    {
+        pgid = 0,
+        isolatedProcessGroup = false,
+        leaderStartTime = '',
+        graceMs = DEFAULT_KILL_GRACE_MS,
+        onComplete = null,
+    } = {}
+) {
+    if (!proc && !pgid) {
+        onComplete?.({termSent: false, killSent: false});
+        return;
+    }
+    const selfIdentity = getSelfProcessIdentity();
     const killBin = isolatedProcessGroup ? resolveKillExecutable() : '';
-    const canKillGroup = Boolean(isolatedProcessGroup && killBin && isSafeProcessGroupId(pgid));
+    const canKillGroup = Boolean(
+        isolatedProcessGroup &&
+        killBin &&
+        isSafeProcessGroupId(pgid, selfIdentity) &&
+        !isProcessGroupReused(pgid, leaderStartTime)
+    );
 
-    let exited = false;
-    try {
-        proc.wait_async(null, (p, res) => {
-            exited = true;
-            try { p.wait_finish(res); } catch (_) {}
-        });
-    } catch (_) {}
+    let leaderExited = Boolean(proc?.get_if_exited?.() || proc?.get_if_signaled?.());
+    if (proc && !leaderExited) {
+        try {
+            proc.wait_async(null, (p, res) => {
+                leaderExited = true;
+                try { p.wait_finish(res); } catch (_) {}
+            });
+        } catch (_) {}
+    }
 
     if (canKillGroup) {
         signalIsolatedProcessGroup(pgid, 'TERM', killBin);
     }
-    try {
-        proc.send_signal(15); // SIGTERM
-    } catch (_) {
-        if (canKillGroup) signalIsolatedProcessGroup(pgid, 'KILL', killBin);
-        try { proc.force_exit(); } catch (__) {}
-        return;
+    if (proc && !leaderExited) {
+        try {
+            proc.send_signal(15); // SIGTERM
+        } catch (_) {
+            if (canKillGroup && !isProcessGroupReused(pgid, leaderStartTime)) {
+                signalIsolatedProcessGroup(pgid, 'KILL', killBin, r => {
+                    onComplete?.({termSent: true, killSent: true, killResult: r});
+                });
+            } else {
+                onComplete?.({termSent: false, killSent: false});
+            }
+            try { proc.force_exit(); } catch (__) {}
+            return;
+        }
     }
 
-    GLib.timeout_add(GLib.PRIORITY_DEFAULT, DEFAULT_KILL_GRACE_MS, () => {
-        if (!exited) {
-            if (canKillGroup) {
-                signalIsolatedProcessGroup(pgid, 'KILL', killBin);
-            }
+    const effectiveGraceMs = Math.max(20, Number(graceMs) || DEFAULT_KILL_GRACE_MS);
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, effectiveGraceMs, () => {
+        // R2: Do NOT rely solely on `!leaderExited` to decide whether to send group SIGKILL!
+        // A leader may exit immediately on SIGTERM while its child traps/ignores SIGTERM.
+        // `/bin/kill -s KILL -- -<pgid>` atomically kills any remaining members (exit 0)
+        // or returns non-zero (ESRCH) if the group is already empty.
+        if (canKillGroup && !isProcessGroupReused(pgid, leaderStartTime)) {
+            signalIsolatedProcessGroup(pgid, 'KILL', killBin, killRes => {
+                onComplete?.({
+                    termSent: true,
+                    killSent: true,
+                    hadRemainingMembers: killRes.ok,
+                    killResult: killRes,
+                });
+            });
+        } else {
+            onComplete?.({termSent: true, killSent: false, hadRemainingMembers: false});
+        }
+        if (proc && !leaderExited) {
             try { proc.force_exit(); } catch (_) {}
         }
         return GLib.SOURCE_REMOVE;
     });
 }
 
-export function terminateTurnProcess(turn, proc) {
+export function terminateTurnProcess(turn, proc, opts = {}) {
+    if (turn?.terminationInitiated && !opts.force) {
+        return;
+    }
+    if (turn) {
+        turn.terminationInitiated = true;
+    }
     terminateProcessTreeGracefully(proc || turn?.process, {
         pgid: turn?.processGroupId || 0,
         isolatedProcessGroup: Boolean(turn?.isolatedProcessGroup),
+        leaderStartTime: turn?.leaderStartTime || '',
+        graceMs: opts.graceMs ?? turn?.killGraceMs ?? DEFAULT_KILL_GRACE_MS,
+        onComplete: opts.onComplete || null,
     });
 }
 
@@ -272,7 +389,7 @@ export function spawnManagedCliTurn({
             Gio.SubprocessFlags.STDERR_PIPE,
     });
     launcher.set_cwd(workspace);
-    launcher.setenv('PATH', runtime.pathEnv || '', true);
+    launcher.setenv('PATH', runtime.pathEnv ?? (GLib.getenv('PATH') || ''), true);
     launcher.setenv('NO_COLOR', '1', true);
 
     const envMap = {
@@ -282,6 +399,11 @@ export function spawnManagedCliTurn({
         QUICK_CHAT_SESSION_ID: String(sessionId || ''),
         QUICK_CHAT_TURN_ID: String(turn.id || ''),
         QUICK_CHAT_WORKSPACE: String(workspace || ''),
+        ...(backend === 'zcode' && (requireBridgeHandshake || runtime?.bridgePath)
+            ? {
+                QUICK_CHAT_FORCE_BRIDGE: '1',
+            }
+            : {}),
         ...(requireBridgeHandshake
             ? {
                 QUICK_CHAT_REQUIRE_BRIDGE: '1',
@@ -289,19 +411,40 @@ export function spawnManagedCliTurn({
             }
             : {}),
     };
+    if (
+        backend === 'zcode' &&
+        runtime?.bridgePath &&
+        !String(runtime.bridgePath).includes('"') &&
+        !rawArgv.includes(runtime.bridgePath) &&
+        !String(envMap.NODE_OPTIONS || '').includes(runtime.bridgePath)
+    ) {
+        const existingNodeOpts = String(envMap.NODE_OPTIONS || GLib.getenv('NODE_OPTIONS') || '').trim();
+        envMap.NODE_OPTIONS = `${existingNodeOpts} --require "${runtime.bridgePath}"`.trim();
+    }
     for (const [k, v] of Object.entries(envMap)) {
         launcher.setenv(k, String(v), true);
     }
 
-    const wrappedSpawn = wrapArgvWithSetsid(rawArgv, runtime.setsidPath);
+    const effectiveSetsidPath = runtime.setsidPath !== undefined
+        ? runtime.setsidPath
+        : resolveSetsidExecutable();
+    const wrappedSpawn = wrapArgvWithSetsid(rawArgv, effectiveSetsidPath);
     const turnTempFiles = [...turn.tempFiles];
 
     let proc;
     try {
         proc = launcher.spawnv(wrappedSpawn.argv);
         turn.process = proc;
-        turn.isolatedProcessGroup = wrappedSpawn.isolatedProcessGroup;
-        turn.processGroupId = Number.parseInt(proc.get_identifier?.() || '', 10) || 0;
+        const rawPid = Number.parseInt(proc.get_identifier?.() || '', 10) || 0;
+        const selfIdentity = getSelfProcessIdentity();
+        const statAfterSpawn = rawPid > 1 ? readProcStatSync(rawPid) : null;
+        const verifiedIsolatedGroup = Boolean(
+            wrappedSpawn.isolatedProcessGroup &&
+            isSafeProcessGroupId(rawPid, selfIdentity)
+        );
+        turn.isolatedProcessGroup = verifiedIsolatedGroup;
+        turn.processGroupId = verifiedIsolatedGroup ? rawPid : 0;
+        turn.leaderStartTime = statAfterSpawn?.startTime || '';
     } catch (spawnErr) {
         turns.finalizeTurn(turn, {
             status: 'failed',
@@ -350,9 +493,18 @@ export function spawnManagedCliTurn({
         }
     };
 
+    let postExitDrainTimerId = 0;
+    const clearPostExitDrainTimer = () => {
+        if (postExitDrainTimerId) {
+            try { GLib.source_remove(postExitDrainTimerId); } catch (_) {}
+            postExitDrainTimerId = 0;
+        }
+    };
+
     let stdoutDone = false;
     let stderrDone = false;
     let processExited = false;
+    let leakedChildPipeDetected = false;
     let exitCode = null;
     let termSignal = null;
     let streamsClosed = false;
@@ -370,12 +522,17 @@ export function spawnManagedCliTurn({
         }
     };
 
-    const abortTurnForFatalMonitorError = () => {
+    const cleanupAllTurnAsyncResources = () => {
         clearHandshakeTimer();
+        clearPostExitDrainTimer();
+        closeIoPipes();
+    };
+
+    const abortTurnForFatalMonitorError = () => {
+        cleanupAllTurnAsyncResources();
         if (!turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
             return;
         }
-        closeIoPipes();
         const persistCfg = getSessionContextConfig();
         turns.finalizeTurn(turn, {
             status: 'failed',
@@ -388,8 +545,7 @@ export function spawnManagedCliTurn({
 
     const trySettleWhenComplete = () => {
         if (!stdoutDone || !stderrDone || !processExited) return;
-        clearHandshakeTimer();
-        closeIoPipes();
+        cleanupAllTurnAsyncResources();
 
         if (!turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
             return;
@@ -418,6 +574,15 @@ export function spawnManagedCliTurn({
                 : '远端会话恢复失败，已自动切换为本地历史上下文，请重新发送当前问题';
         }
 
+        // R2: Separate normal clean exit from forced termination so normal completion
+        // does not send SIGTERM/SIGKILL to an already-exited or reused PGID.
+        const isCleanNormalCompletion =
+            outcome.status === 'completed' &&
+            !leakedChildPipeDetected &&
+            !turn.aborted &&
+            !turn.timedOut &&
+            !monitor.fatalError;
+
         const persistCfg = getSessionContextConfig();
         turns.finalizeTurn(turn, {
             status: outcome.status,
@@ -426,15 +591,18 @@ export function spawnManagedCliTurn({
             interrupted: outcome.interrupted,
             errorText: finalErrorMessage,
             onPersistAssistant: m => store?.appendMessage(m, backend, persistCfg),
-            onTerminateProcess: p => terminateTurnProcess(turn, p),
+            onTerminateProcess: isCleanNormalCompletion ? null : (p => terminateTurnProcess(turn, p)),
             onCleanupTempFiles: files => files.forEach(removeFileQuietly),
         });
     };
 
+    const handshakeTimeoutMs = Number(timeouts?.bridgeHandshakeTimeoutMs) > 0
+        ? Number(timeouts.bridgeHandshakeTimeoutMs)
+        : DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS;
     if (requireBridgeHandshake) {
         handshakeTimerId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
-            DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS,
+            handshakeTimeoutMs,
             () => {
                 handshakeTimerId = 0;
                 if (monitor.markHandshakeTimedOut()) {
@@ -444,6 +612,10 @@ export function spawnManagedCliTurn({
             }
         );
     }
+
+    const postExitDrainMs = Number(timeouts?.postExitDrainMs) > 0
+        ? Number(timeouts.postExitDrainMs)
+        : DEFAULT_POST_EXIT_PIPE_DRAIN_MS;
 
     proc.wait_async(null, (p, res) => {
         try {
@@ -458,6 +630,21 @@ export function spawnManagedCliTurn({
         turn.tempFiles = [];
 
         processExited = true;
+        if (!stdoutDone || !stderrDone) {
+            clearPostExitDrainTimer();
+            postExitDrainTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, postExitDrainMs, () => {
+                postExitDrainTimerId = 0;
+                if (!stdoutDone || !stderrDone) {
+                    leakedChildPipeDetected = true;
+                    stdoutDone = true;
+                    stderrDone = true;
+                    closeIoPipes();
+                    terminateTurnProcess(turn, proc);
+                    trySettleWhenComplete();
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+        }
         trySettleWhenComplete();
     });
 
@@ -468,25 +655,23 @@ export function spawnManagedCliTurn({
             return;
         }
         stderr.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (src, res) => {
-            if (isDisposedFn()) {
-                stderrDone = true;
-                return;
-            }
+            let line = null;
             try {
-                const [line] = src.read_line_finish_utf8(res);
-                if (line === null) {
-                    stderrDone = true;
-                    trySettleWhenComplete();
-                    return;
-                }
-                if (turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
-                    monitor.pushStderrLine(turn.id, line);
-                }
-                readStderrLoop();
+                [line] = src.read_line_finish_utf8(res);
             } catch (_) {
                 stderrDone = true;
                 trySettleWhenComplete();
+                return;
             }
+            if (isDisposedFn() || turn.aborted || turn.timedOut || line === null) {
+                stderrDone = true;
+                trySettleWhenComplete();
+                return;
+            }
+            if (turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                monitor.pushStderrLine(turn.id, line);
+            }
+            readStderrLoop();
         });
     };
 
@@ -537,19 +722,33 @@ export function spawnManagedCliTurn({
     };
 
     const readStdoutLoop = () => {
-        if (!turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+        if (isDisposedFn() || !turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
             stdoutDone = true;
             trySettleWhenComplete();
             return;
         }
         stdout.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (stream, res) => {
-            if (!turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+            let line = null;
+            let readErr = null;
+            try {
+                [line] = stream.read_line_finish_utf8(res);
+            } catch (err) {
+                readErr = err;
+            }
+            if (isDisposedFn() || !turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
                 stdoutDone = true;
                 trySettleWhenComplete();
                 return;
             }
+            if (readErr) {
+                stdoutDone = true;
+                if (!turn.aborted && !turn.timedOut && !turn.error && !leakedChildPipeDetected) {
+                    turn.error = readErr.message;
+                }
+                trySettleWhenComplete();
+                return;
+            }
             try {
-                const [line] = stream.read_line_finish_utf8(res);
                 if (line === null) {
                     stdoutDone = true;
                     trySettleWhenComplete();
