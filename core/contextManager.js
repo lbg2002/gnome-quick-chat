@@ -117,21 +117,169 @@ export function buildRuntimeContextSignature(backend, config = {}) {
     return `${cleanBackend}|prov=${provider}|model=${model}|ws=${workspace}|mode=${mode}`;
 }
 
+const EMBEDDED_ATTACHMENT_MARKER_RE = /(?:<<<BEGIN_QC_UNTRUSTED_ATTACHMENT_|\[不可信引用数据边界说明\s*\/\s*UNTRUSTED_ATTACHMENT_BOUNDARY\]|\[随问引用上下文（共\s*\d+\s*个本地片段）\])/;
+const STRUCTURED_ATTACHMENT_BLOCK_RE = /<<<BEGIN_QC_UNTRUSTED_ATTACHMENT_[^>]*>>>[\s\S]*?<<<END_QC_UNTRUSTED_ATTACHMENT_[^>]*>>>/g;
+const UNTRUSTED_BOUNDARY_SECTION_RE = /\n*---\n\[不可信引用数据边界说明\s*\/\s*UNTRUSTED_ATTACHMENT_BOUNDARY\][\s\S]*$/g;
+const LEGACY_ATTACHMENT_SECTION_RE = /\[随问引用上下文（共\s*\d+\s*个本地片段）\][\s\S]*?(?=\n\n\[用户问题\]\n|$)/g;
+
+/**
+ * R6: Detects whether a persisted user message string contains embedded local attachment content.
+ */
+export function containsEmbeddedAttachmentContent(text) {
+    if (typeof text !== 'string' || !text) return false;
+    return EMBEDDED_ATTACHMENT_MARKER_RE.test(text);
+}
+
+/**
+ * R6: Strips embedded local attachment bodies from a persisted user message,
+ * preserving the user's question and summary (`displayText`) so sensitive file contents
+ * are not silently forwarded when switching across backends or remote API endpoints.
+ */
+export function stripEmbeddedAttachmentContent(text, displayText = '') {
+    const raw = stripInternalPromptHeaders(String(text || '')).trim();
+    if (!raw) return '';
+    if (!containsEmbeddedAttachmentContent(raw)) {
+        return raw;
+    }
+
+    const cleanDisplay = stripInternalPromptHeaders(String(displayText || '')).trim();
+    if (cleanDisplay && !containsEmbeddedAttachmentContent(cleanDisplay)) {
+        return `${cleanDisplay}\n[注：前序对话中的本地附件正文已按跨端点/跨后端隐私策略省略，仅保留问题摘要]`;
+    }
+
+    let stripped = raw
+        .replace(UNTRUSTED_BOUNDARY_SECTION_RE, '\n[已省略前序内联附件正文]')
+        .replace(STRUCTURED_ATTACHMENT_BLOCK_RE, '[已省略前序内联附件正文]')
+        .replace(LEGACY_ATTACHMENT_SECTION_RE, '[已省略前序引用上下文正文]')
+        .replace(/^\[用户提问\s*\/\s*USER_INSTRUCTION\]\n/, '');
+
+    const questionIdx = stripped.indexOf('[用户问题]\n');
+    if (questionIdx >= 0) {
+        const questionBody = stripped.slice(questionIdx + '[用户问题]\n'.length).trim();
+        return questionBody
+            ? `[已省略前序内联附件正文]\n${questionBody}`
+            : '[已省略前序内联附件正文]';
+    }
+    return stripped.trim() || '[已省略前序内联附件正文]';
+}
+
+/**
+ * R6: Inspects stored session messages before sending to `targetBackend` / `targetEndpoint`
+ * to identify prior user messages containing embedded attachment content from a different
+ * backend or remote endpoint.
+ */
+export function inspectCrossContextAttachmentPrivacy(messages, {
+    targetBackend = '',
+    targetEndpoint = '',
+    excludeMessageId = '',
+} = {}) {
+    const list = Array.isArray(messages) ? messages : [];
+    const cleanTargetBackend = String(targetBackend || '').trim().toLowerCase();
+    const normTargetEndpoint = normalizeEndpointForSignature(targetEndpoint || '');
+    const affectedMessageIds = [];
+    const sourceBackends = new Set();
+    const sourceEndpoints = new Set();
+
+    for (let i = 0; i < list.length; i++) {
+        const msg = list[i];
+        if (!msg || msg.role !== 'user') continue;
+        if (excludeMessageId && msg.id === excludeMessageId) continue;
+
+        const rawText = extractCleanMessageText(msg);
+        if (!containsEmbeddedAttachmentContent(rawText)) continue;
+
+        const msgBackend = String(msg.backend || '').trim().toLowerCase();
+        const msgEndpoint = normalizeEndpointForSignature(msg.endpoint || '');
+
+        const backendMismatch = Boolean(
+            cleanTargetBackend &&
+            (!msgBackend || msgBackend !== cleanTargetBackend)
+        );
+        const endpointMismatch = Boolean(
+            cleanTargetBackend === 'openai' &&
+            normTargetEndpoint &&
+            (!msgEndpoint || msgEndpoint !== normTargetEndpoint)
+        );
+        const isCrossContext = backendMismatch || endpointMismatch || (!cleanTargetBackend && !normTargetEndpoint);
+
+        if (isCrossContext) {
+            if (msg.id) affectedMessageIds.push(msg.id);
+            if (msgBackend) sourceBackends.add(msgBackend);
+            if (msgEndpoint) sourceEndpoints.add(msgEndpoint);
+        }
+    }
+
+    const count = affectedMessageIds.length;
+    return {
+        hasCrossContextAttachments: count > 0,
+        affectedMessageCount: count,
+        affectedMessageIds,
+        sourceBackends: [...sourceBackends],
+        sourceEndpoints: [...sourceEndpoints],
+        targetBackend: cleanTargetBackend,
+        targetEndpoint: normTargetEndpoint,
+        privacyNotice: count > 0
+            ? `隐私保护：检测到前序历史中有 ${count} 条消息含内联本地附件（来自其他引擎或 API 端点），已默认剥离附件正文、仅发送问题摘要`
+            : '',
+    };
+}
+
 /**
  * Sanitizes stored history into clean `{role: 'user'|'assistant', content, id, status}` entries,
  * excluding tool outputs, hidden thinking, empty messages, and pure error banners.
+ * R6: By default, when `targetBackend` / `targetEndpoint` or `stripCrossContextAttachments` is specified
+ * and `allowCrossContextAttachments` is false, embedded attachment bodies from other backends/endpoints
+ * are replaced with their attachment-free summary.
  */
-export function sanitizeMessagesForModelContext(messages) {
+export function sanitizeMessagesForModelContext(messages, options = {}) {
     if (!Array.isArray(messages)) return [];
+    const cleanTargetBackend = String(options?.targetBackend || '').trim().toLowerCase();
+    const normTargetEndpoint = normalizeEndpointForSignature(options?.targetEndpoint || '');
+    const allowCrossContextAttachments = Boolean(options?.allowCrossContextAttachments);
+    const forceStripAttachments = Boolean(options?.stripAllPriorAttachments);
+    const preserveMessageId = String(options?.preserveAttachmentMessageId || '').trim();
+
+    let newestUserIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]?.role === 'user') {
+            newestUserIndex = i;
+            break;
+        }
+    }
+
     const clean = [];
-    for (const msg of messages) {
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
         if (!msg || (msg.role !== 'user' && msg.role !== 'assistant')) continue;
         // Skip empty failed turns or cancelled turns with zero text
         if (msg.role === 'assistant' && msg.status === 'failed' && !extractCleanMessageText(msg)) {
             continue;
         }
-        const content = extractCleanMessageText(msg);
+        let content = extractCleanMessageText(msg);
         if (!content) continue;
+
+        if (
+            msg.role === 'user' &&
+            !allowCrossContextAttachments &&
+            containsEmbeddedAttachmentContent(content)
+        ) {
+            const isProtectedCurrentTurn = (preserveMessageId && msg.id === preserveMessageId) ||
+                (!forceStripAttachments && i === newestUserIndex && !options?.isPriorHistoryOnly);
+            if (!isProtectedCurrentTurn) {
+                const msgBackend = String(msg.backend || '').trim().toLowerCase();
+                const msgEndpoint = normalizeEndpointForSignature(msg.endpoint || '');
+                const backendMismatch = Boolean(cleanTargetBackend && (!msgBackend || msgBackend !== cleanTargetBackend));
+                const endpointMismatch = Boolean(
+                    cleanTargetBackend === 'openai' &&
+                    normTargetEndpoint &&
+                    (!msgEndpoint || msgEndpoint !== normTargetEndpoint)
+                );
+                if (forceStripAttachments || backendMismatch || endpointMismatch) {
+                    content = stripEmbeddedAttachmentContent(content, msg.displayText || '');
+                }
+            }
+        }
+
         clean.push({
             role: msg.role,
             content,
@@ -267,7 +415,14 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
     const maxHistoryTokens = Math.max(256, contextWindowTokens - reserveOutputTokens - systemTokens - separateCurrentTokens);
     const maxHistoryChars = Math.max(128, maxChars - separateCurrentChars);
 
-    const sanitized = sanitizeMessagesForModelContext(messages);
+    const sanitized = sanitizeMessagesForModelContext(messages, {
+        targetBackend: opts.targetBackend || '',
+        targetEndpoint: opts.targetEndpoint || '',
+        allowCrossContextAttachments: Boolean(opts.allowCrossContextAttachments),
+        stripAllPriorAttachments: Boolean(opts.stripAllPriorAttachments),
+        preserveAttachmentMessageId: opts.preserveAttachmentMessageId || '',
+        isPriorHistoryOnly: Boolean(opts.currentPrompt && String(opts.currentPrompt).trim()),
+    });
     if (!sanitized.length) return [];
 
     const turnGroups = groupContextTurns(sanitized);
@@ -342,13 +497,20 @@ export function buildBudgetedContextMessages(messages, optionsOrMaxMessages = DE
 }
 
 export function buildCrossBackendPromptWithContext(historyBeforePrompt, newPromptText, maxCharsOrOpts = 6000) {
-    const opts = typeof maxCharsOrOpts === 'object' && maxCharsOrOpts !== null
-        ? {...maxCharsOrOpts, currentPrompt: newPromptText}
+    const baseOpts = typeof maxCharsOrOpts === 'object' && maxCharsOrOpts !== null
+        ? maxCharsOrOpts
         : {
             maxMessages: 10,
             maxChars: Number(maxCharsOrOpts) + String(newPromptText || '').length,
-            currentPrompt: newPromptText,
         };
+    const opts = {
+        ...baseOpts,
+        currentPrompt: newPromptText,
+        // R6: Cross-backend / unresumed handoffs strip prior embedded local attachment bodies by default
+        // unless caller explicitly sets `allowCrossContextAttachments: true`.
+        stripAllPriorAttachments: !baseOpts.allowCrossContextAttachments &&
+            (baseOpts.stripAllPriorAttachments !== undefined ? Boolean(baseOpts.stripAllPriorAttachments) : !baseOpts.targetBackend),
+    };
 
     const prior = buildBudgetedContextMessages(historyBeforePrompt, opts);
     if (!prior.length) return newPromptText;

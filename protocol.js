@@ -11,9 +11,12 @@ import {
     buildBudgetedContextMessages,
     buildCrossBackendPromptWithContext,
     buildRuntimeContextSignature,
+    containsEmbeddedAttachmentContent,
     estimateTextTokens,
+    inspectCrossContextAttachmentPrivacy,
     preparePromptWithinBudget,
     sanitizeMessagesForModelContext,
+    stripEmbeddedAttachmentContent,
 } from './core/contextManager.js';
 
 export {
@@ -21,10 +24,13 @@ export {
     buildCrossBackendPromptWithContext,
     buildRuntimeContextSignature,
     computePermissionScope,
+    containsEmbeddedAttachmentContent,
     estimateTextTokens,
     evaluatePermissionPolicy,
+    inspectCrossContextAttachmentPrivacy,
     preparePromptWithinBudget,
     sanitizeMessagesForModelContext,
+    stripEmbeddedAttachmentContent,
     validatePermissionResponsePayload,
 };
 

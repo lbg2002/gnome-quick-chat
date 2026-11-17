@@ -498,9 +498,14 @@ export default class QuickChat extends Extension {
         if (!this._panel || !this._attachments) return;
         const eff = this._getEffectiveBackend();
         const endpointUrl = this._getSettingString('openai-base-url', '').trim();
-        const notice = this._attachments.buildOutboundScopeNotice(eff, {endpointUrl});
+        const draftText = this._panel.entry?.get_text() || '';
+        const notice = this._attachments.buildOutboundScopeNotice(eff, {
+            endpointUrl,
+            modelLabel: this._modelLabel || '',
+            draftText,
+        });
         this._panel.renderAttachments(this._attachments.items, notice);
-        this._updateLocalRouteSuggestion(this._panel.entry?.get_text() || '');
+        this._updateLocalRouteSuggestion(draftText);
     }
 
     _removeAttachment(id) {
@@ -517,9 +522,13 @@ export default class QuickChat extends Extension {
 
     _toggleAttachmentFileMode(id) {
         if (!this._attachments) return;
-        const res = this._attachments.toggleFileMode(id);
+        const res = this._attachments.toggleFileMode(id, {
+            effectiveBackend: this._getEffectiveBackend(),
+        });
         if (!res.ok && res.error) {
             this._panel?.setStatusIndicator('error', `⚠️ ${res.error}`);
+        } else if (res.warning && !this._chatController?.busy) {
+            this._panel?.setStatusIndicator('ready', `ℹ️ ${res.warning}`);
         }
         this._refreshAttachmentBarUi();
     }
@@ -527,6 +536,7 @@ export default class QuickChat extends Extension {
     async _attachLocalFilePath(rawPath, {preferPathOnly = false, sourceOrigin = '手动附加文件'} = {}) {
         if (!this._isSessionUnlockedAndAlive() || !this._attachments) return false;
         const lifeGen = this._lifecycleGeneration;
+        const initialSessionId = this._chatController?.currentSessionId || this._getSettingString('session-id', '');
         const home = GLib.get_home_dir() || '';
         const expanded = expandHomePath(String(rawPath || '').trim(), home);
         if (!expanded || !expanded.startsWith('/')) {
@@ -538,12 +548,15 @@ export default class QuickChat extends Extension {
             return false;
         }
 
+        const effectiveBackend = this._getEffectiveBackend();
+
         if (GLib.file_test(expanded, GLib.FileTest.IS_DIR)) {
             const dirRes = this._attachments.addFileCandidate({
                 filePath: expanded,
                 exists: true,
                 isDirectory: true,
                 sourceOrigin,
+                effectiveBackend,
             });
             if (!dirRes.ok) {
                 this._panel?.setStatusIndicator('error', `⚠️ ${dirRes.error}`);
@@ -551,60 +564,90 @@ export default class QuickChat extends Extension {
             }
             this._panel?.toggleFileAttachBar(false);
             this._refreshAttachmentBarUi();
+            if (dirRes.item?.warning && !this._chatController?.busy) {
+                this._panel?.setStatusIndicator('ready', `ℹ️ ${dirRes.item.warning}`);
+            }
             return true;
         }
 
-        let fileSize = 0;
-        try {
-            const info = await new Promise(resolve => {
-                Gio.File.new_for_path(expanded).query_info_async(
-                    'standard::size',
-                    Gio.FileQueryInfoFlags.NONE,
-                    GLib.PRIORITY_DEFAULT,
-                    null,
-                    (f, r) => {
-                        try { resolve(f.query_info_finish(r)); } catch (_) { resolve(null); }
-                    }
-                );
-            });
-            fileSize = Number(info?.get_size?.() || 0);
-        } catch (_) {}
-
-        if (!this._isSessionUnlockedAndAlive(lifeGen)) return false;
-
-        let readRes = {exists: true, tooLarge: fileSize > MAX_ATTACHMENT_FILE_BYTES, bytes: null};
-        if (!preferPathOnly && !readRes.tooLarge) {
-            readRes = await readFileBytesBoundedAsync(expanded, MAX_ATTACHMENT_FILE_BYTES);
-            if (!this._isSessionUnlockedAndAlive(lifeGen)) return false;
-        }
-
-        const added = this._attachments.addFileCandidate({
-            filePath: expanded,
-            fileSize,
-            exists: readRes.exists,
-            isDirectory: false,
-            tooLarge: readRes.tooLarge,
-            bytes: readRes.bytes,
-            preferPathOnly,
-            sourceOrigin,
+        const cancellable = new Gio.Cancellable();
+        const readGuard = this._attachments.beginReadGuard({
+            sessionId: initialSessionId,
+            cancellable,
         });
+        const isReadStillValid = () => {
+            const nowSessionId = this._chatController?.currentSessionId || this._getSettingString('session-id', '');
+            return Boolean(
+                this._isSessionUnlockedAndAlive(lifeGen) &&
+                this._attachments &&
+                readGuard.isValid({currentSessionId: nowSessionId})
+            );
+        };
 
-        if (!added.ok) {
-            this._panel?.setStatusIndicator('error', `⚠️ ${added.error}`);
-            return false;
-        }
+        try {
+            let fileSize = 0;
+            try {
+                const info = await new Promise(resolve => {
+                    Gio.File.new_for_path(expanded).query_info_async(
+                        'standard::size,standard::type',
+                        Gio.FileQueryInfoFlags.NONE,
+                        GLib.PRIORITY_DEFAULT,
+                        cancellable,
+                        (f, r) => {
+                            try { resolve(f.query_info_finish(r)); } catch (_) { resolve(null); }
+                        }
+                    );
+                });
+                fileSize = Number(info?.get_size?.() || 0);
+            } catch (_) {}
 
-        this._panel?.toggleFileAttachBar(false);
-        this._refreshAttachmentBarUi();
-        if (added.item?.warning && !this._chatController?.busy) {
-            this._panel?.setStatusIndicator('ready', `ℹ️ ${added.item.warning}`);
+            if (!isReadStillValid()) return false;
+
+            let readRes = {exists: true, tooLarge: fileSize > MAX_ATTACHMENT_FILE_BYTES, bytes: null};
+            if (!preferPathOnly && !readRes.tooLarge) {
+                readRes = await readFileBytesBoundedAsync(expanded, MAX_ATTACHMENT_FILE_BYTES, cancellable);
+                if (!isReadStillValid() || readRes.cancelled) return false;
+            }
+
+            if (readRes.nonRegular) {
+                this._panel?.setStatusIndicator('error', `⚠️ ${readRes.error || '不支持附加特殊文件（FIFO/设备/Socket）'}`);
+                return false;
+            }
+
+            const added = this._attachments.addFileCandidate({
+                filePath: expanded,
+                fileSize: readRes.byteLength || fileSize,
+                exists: readRes.exists,
+                isDirectory: false,
+                nonRegular: Boolean(readRes.nonRegular),
+                tooLarge: readRes.tooLarge,
+                bytes: readRes.bytes,
+                preferPathOnly,
+                sourceOrigin,
+                effectiveBackend: this._getEffectiveBackend(),
+            });
+
+            if (!added.ok) {
+                this._panel?.setStatusIndicator('error', `⚠️ ${added.error}`);
+                return false;
+            }
+
+            this._panel?.toggleFileAttachBar(false);
+            this._refreshAttachmentBarUi();
+            if (added.item?.warning && !this._chatController?.busy) {
+                this._panel?.setStatusIndicator('ready', `ℹ️ ${added.item.warning}`);
+            }
+            return true;
+        } finally {
+            readGuard.finish();
         }
-        return true;
     }
 
     _triggerClipboardAsk(openPanelFirst = true) {
-        if (!this._isSessionUnlockedAndAlive()) return;
+        if (!this._isSessionUnlockedAndAlive() || !this._attachments) return;
         const lifeGen = this._lifecycleGeneration;
+        const initialSessionId = this._chatController?.currentSessionId || this._getSettingString('session-id', '');
+        const clipGuard = this._attachments.beginReadGuard({sessionId: initialSessionId});
         const menu = this._dateIntegration?.menu;
         if (openPanelFirst && menu && !menu.isOpen) {
             menu.open(true);
@@ -614,47 +657,66 @@ export default class QuickChat extends Extension {
         }
 
         const clip = St.Clipboard.get_default();
-        const isAlive = () => Boolean(this._isSessionUnlockedAndAlive(lifeGen) && this._panel?.entry);
+        const isAlive = () => {
+            const nowSessionId = this._chatController?.currentSessionId || this._getSettingString('session-id', '');
+            return Boolean(
+                this._isSessionUnlockedAndAlive(lifeGen) &&
+                this._panel?.entry &&
+                this._attachments &&
+                clipGuard.isValid({currentSessionId: nowSessionId})
+            );
+        };
 
         const attachClipboardContent = async (raw, {fromPrimarySelection = false} = {}) => {
-            const trimmed = String(raw || '').trim();
-            if (!trimmed || !isAlive()) return;
+            try {
+                const trimmed = String(raw || '').trim();
+                if (!trimmed || !isAlive()) return;
 
-            // Check if user copied files in Nautilus (`file://` URIs or explicit path lines)
-            const copiedPaths = extractCopiedFilePaths(trimmed).filter(p => GLib.file_test(p, GLib.FileTest.EXISTS));
-            if (copiedPaths.length > 0) {
-                for (const fp of copiedPaths) {
-                    if (!isAlive()) return;
-                    await this._attachLocalFilePath(fp, {
-                        preferPathOnly: false,
-                        sourceOrigin: 'Nautilus 选中文件',
-                    });
+                // Check if user copied files in Nautilus (`file://` URIs or explicit path lines)
+                const copiedPaths = extractCopiedFilePaths(trimmed).filter(p => GLib.file_test(p, GLib.FileTest.EXISTS));
+                if (copiedPaths.length > 0) {
+                    for (const fp of copiedPaths) {
+                        if (!isAlive()) return;
+                        await this._attachLocalFilePath(fp, {
+                            preferPathOnly: false,
+                            sourceOrigin: 'Nautilus 选中文件',
+                        });
+                    }
+                    this._panel?.entry?.grab_key_focus();
+                    return;
+                }
+
+                // Attach text / terminal log snippet independently WITHOUT overwriting entry draft or truncating at 4000 chars!
+                const res = this._attachments.addTextSnippet(trimmed, {fromPrimarySelection});
+                if (!res.ok) {
+                    this._panel?.setStatusIndicator('error', `⚠️ ${res.error}`);
+                } else {
+                    this._refreshAttachmentBarUi();
                 }
                 this._panel?.entry?.grab_key_focus();
-                return;
+            } finally {
+                clipGuard.finish();
             }
-
-            // Attach text / terminal log snippet independently WITHOUT overwriting entry draft or truncating at 4000 chars!
-            const res = this._attachments.addTextSnippet(trimmed, {fromPrimarySelection});
-            if (!res.ok) {
-                this._panel?.setStatusIndicator('error', `⚠️ ${res.error}`);
-            } else {
-                this._refreshAttachmentBarUi();
-            }
-            this._panel?.entry?.grab_key_focus();
         };
 
         clip.get_text(St.ClipboardType.CLIPBOARD, (_, text) => {
-            if (!isAlive()) return;
+            if (!isAlive()) {
+                clipGuard.finish();
+                return;
+            }
             if (text && text.trim()) {
                 attachClipboardContent(text, {fromPrimarySelection: false});
                 return;
             }
             clip.get_text(St.ClipboardType.PRIMARY, (__, primaryText) => {
-                if (!isAlive()) return;
+                if (!isAlive()) {
+                    clipGuard.finish();
+                    return;
+                }
                 if (primaryText && primaryText.trim()) {
                     attachClipboardContent(primaryText, {fromPrimarySelection: true});
                 } else {
+                    clipGuard.finish();
                     this._panel?.entry?.grab_key_focus();
                 }
             });
@@ -1228,9 +1290,22 @@ export default class QuickChat extends Extension {
         const hasAttachments = Boolean(this._attachments?.count > 0);
         if (!rawDraft && !hasAttachments) return;
 
+        const effectiveBackend = this._getEffectiveBackend();
+        const attachmentSnapshot = this._attachments
+            ? this._attachments.createSnapshot(rawDraft)
+            : null;
         const payload = this._attachments
-            ? this._attachments.composeTurnPayload(rawDraft)
-            : {hasAttachments: false, promptForModel: rawDraft, displayUserText: rawDraft};
+            ? this._attachments.composeTurnPayload(rawDraft, {backend: effectiveBackend})
+            : {hasAttachments: false, promptForModel: rawDraft, displayUserText: rawDraft, overBudget: false};
+
+        if (payload.overBudget) {
+            this._panel?.setStatusIndicator(
+                'error',
+                `⚠️ ${payload.budgetWarning || '当前提问与引用附件超出上下文预算，请精简后重试'}`
+            );
+            return;
+        }
+
         const editTarget = this._editingTurnInfo;
 
         await this._executePromptTurn({
@@ -1240,6 +1315,7 @@ export default class QuickChat extends Extension {
             reuseExistingUserCard: false,
             clearEntry: true,
             clearAttachments: hasAttachments,
+            attachmentSnapshot,
             clearEditState: Boolean(editTarget),
             recordHistoryText: rawDraft,
             restoreDraftOnEarlyError: rawDraft,
@@ -1256,6 +1332,7 @@ export default class QuickChat extends Extension {
         userTs = 0,
         clearEntry = true,
         clearAttachments = false,
+        attachmentSnapshot = null,
         clearEditState = false,
         recordHistoryText = '',
         restoreDraftOnEarlyError = '',
@@ -1413,6 +1490,10 @@ export default class QuickChat extends Extension {
             this._setBusy(false);
             if (restoreDraftOnEarlyError && this._panel?.entry && !this._panel.entry.get_text()) {
                 this._panel.setEntryTextProgrammatically(restoreDraftOnEarlyError, {focus: true, cursorAtEnd: true});
+            }
+            if (clearAttachments && attachmentSnapshot && this._attachments && this._attachments.count === 0) {
+                this._attachments.restoreFromSnapshot(attachmentSnapshot);
+                this._refreshAttachmentBarUi();
             }
             if (String(error.message || '').includes('超时')) {
                 this._chatController.stopClient();
@@ -2406,6 +2487,7 @@ export default class QuickChat extends Extension {
         if (validTarget === currentId) return;
 
         this._sessionMutationLock = true;
+        this._attachments?.invalidatePendingReads({nextSessionId: validTarget});
         const lifeGen = this._lifecycleGeneration;
         try {
             const prevClient = this._chatController.client;
@@ -2422,7 +2504,7 @@ export default class QuickChat extends Extension {
             }
 
             this._rememberPreviousNonEmptySessionId(currentId);
-            this._resetTransientComposerState();
+            this._resetTransientComposerState(validTarget);
             this._chatController.stopClient();
             this._settings.set_string('session-id', validTarget);
             this._ensureClient();
@@ -2459,6 +2541,7 @@ export default class QuickChat extends Extension {
     async _deleteCurrentSession() {
         if (!this._chatController || this._isBusyOrMutating()) return;
         this._sessionMutationLock = true;
+        this._attachments?.invalidatePendingReads();
         const lifeGen = this._lifecycleGeneration;
         const victimId = this._getSettingString('session-id', '');
 
@@ -2480,8 +2563,9 @@ export default class QuickChat extends Extension {
                 return;
             }
 
-            this._resetTransientComposerState();
-            this._settings.set_string('session-id', GLib.uuid_string_random());
+            const nextSessionId = GLib.uuid_string_random();
+            this._resetTransientComposerState(nextSessionId);
+            this._settings.set_string('session-id', nextSessionId);
             this._panel?.clearMessages();
             this._ensureClient();
             this._panel?.entry?.grab_key_focus();
@@ -2513,14 +2597,14 @@ export default class QuickChat extends Extension {
         }
     }
 
-    _resetTransientComposerState() {
+    _resetTransientComposerState(nextSessionId = undefined) {
         this._live = null;
         this._draftInput = '';
         this._promptHistory = [];
         this._historyIndex = -1;
         this._editingTurnInfo = null;
         this._dismissedRouteKeys?.clear();
-        this._attachments?.clear();
+        this._attachments?.clear({nextSessionId});
         this._modelPicker?.resetSessionState();
         if (this._panel) {
             this._panel.setEditQuestionBanner(false);
@@ -2538,6 +2622,7 @@ export default class QuickChat extends Extension {
     async _newSession() {
         if (!this._chatController || this._isBusyOrMutating()) return;
         this._sessionMutationLock = true;
+        this._attachments?.invalidatePendingReads();
         const lifeGen = this._lifecycleGeneration;
         const currentId = this._getSettingString('session-id', '');
 
@@ -2558,10 +2643,11 @@ export default class QuickChat extends Extension {
                 return;
             }
 
+            const nextSessionId = GLib.uuid_string_random();
             this._rememberPreviousNonEmptySessionId(currentId);
             this._chatController.stopClient();
-            this._resetTransientComposerState();
-            this._settings.set_string('session-id', GLib.uuid_string_random());
+            this._resetTransientComposerState(nextSessionId);
+            this._settings.set_string('session-id', nextSessionId);
             this._panel?.clearMessages();
             this._ensureClient();
             this._panel?.entry?.grab_key_focus();

@@ -8,6 +8,7 @@ import Soup from 'gi://Soup?version=3.0';
 import {BaseBackendAdapter} from './baseAdapter.js';
 import {
     buildBudgetedContextMessages,
+    inspectCrossContextAttachmentPrivacy,
     preparePromptWithinBudget,
 } from '../protocol.js';
 import {
@@ -363,12 +364,30 @@ export class OpenAIAdapter extends BaseBackendAdapter {
             this._runtime?.modelMetadata?.[modelId]?.contextWindowTokens || knownCtxWindow || 0
         ) || undefined;
 
+        const targetEndpoint = this._runtime?.baseUrl || '';
+        const allowCrossAttachments = Boolean(this._config?.allowCrossContextAttachments);
+        const privacyInspection = inspectCrossContextAttachmentPrivacy(this._store?.messages || [], {
+            targetBackend: 'openai',
+            targetEndpoint,
+            excludeMessageId: turnMeta.userMessageId || '',
+        });
+        if (!allowCrossAttachments && privacyInspection.hasCrossContextAttachments && privacyInspection.privacyNotice) {
+            this._turns.emitForTurn(turn, {
+                type: 'mode_notice',
+                message: privacyInspection.privacyNotice,
+            });
+        }
+
         const apiMessages = [
             {role: 'system', content: systemPrompt},
             ...buildBudgetedContextMessages(this._store?.messages || [], {
                 maxMessages: 24,
                 maxChars: 28000,
                 systemPrompt,
+                targetBackend: 'openai',
+                targetEndpoint,
+                allowCrossContextAttachments: allowCrossAttachments,
+                preserveAttachmentMessageId: turnMeta.userMessageId || '',
                 ...(effectiveCtxWindow ? {contextWindowTokens: effectiveCtxWindow} : {}),
             }),
         ];

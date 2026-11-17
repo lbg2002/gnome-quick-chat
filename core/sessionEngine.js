@@ -152,6 +152,7 @@ export function normalizeStoredMessage(raw, {
     nextRevision = 1,
     defaultBackend = '',
     defaultModelId = '',
+    defaultEndpoint = '',
     previousUserMessageId = '',
     maxRecordBytes = MAX_SINGLE_JSONL_RECORD_BYTES,
 } = {}) {
@@ -195,6 +196,10 @@ export function normalizeStoredMessage(raw, {
         ? raw.modelId.trim()
         : String(defaultModelId || '').trim();
 
+    const endpoint = typeof raw.endpoint === 'string' && raw.endpoint.trim()
+        ? raw.endpoint.trim().slice(0, 512)
+        : String(defaultEndpoint || '').trim().slice(0, 512);
+
     const bounded = truncateContentToByteBudget(cloneDeepJson(raw.content ?? ''), Math.max(4096, maxRecordBytes - 1024));
 
     const finishReason = typeof raw.finishReason === 'string' && raw.finishReason.trim()
@@ -216,6 +221,7 @@ export function normalizeStoredMessage(raw, {
         ts,
         backend,
         modelId,
+        ...(endpoint ? {endpoint} : {}),
         replyTo,
         status,
         ...(raw.partial || bounded.truncated ? {partial: true} : {}),
@@ -902,6 +908,10 @@ export class SessionStoreEngine {
             message?.modelId ||
             (backend === 'openai' ? (config?.openaiModel || config?.model || '') : (config?.model || ''))
         ).trim();
+        const effectiveEndpoint = String(
+            message?.endpoint ||
+            (backend === 'openai' ? (config?.openaiBaseUrl || '') : '')
+        ).trim();
 
         const record = normalizeStoredMessage(
             {...message, revision: rev},
@@ -910,6 +920,7 @@ export class SessionStoreEngine {
                 nextRevision: rev,
                 defaultBackend: backend || this.meta.backend || '',
                 defaultModelId: effectiveModelId,
+                defaultEndpoint: effectiveEndpoint,
                 previousUserMessageId: lastUserId,
             }
         );
