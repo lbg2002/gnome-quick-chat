@@ -45,6 +45,7 @@ import {CodexAdapter} from './backends/codexAdapter.js';
 import {
     OpenAIAdapter,
     attachCrossOriginRedirectGuard,
+    readSoupResponseBytesBoundedAsync,
 } from './backends/openaiAdapter.js';
 
 export {
@@ -54,6 +55,7 @@ export {
     createIsolatedZCodeConfigOverride,
     createIsolatedZCodeConfigOverrideAsync,
     findExecutableInDirs,
+    readSoupResponseBytesBoundedAsync,
 };
 
 export function resolveBackendRuntime(config = {}) {

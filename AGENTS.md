@@ -66,11 +66,11 @@
 
 ### R5. 资源上限需在读取过程中执行（P1，防止 OOM）
 
-- [ ] runtime/processManager.js:335–336、469、544 使用 Gio.DataInputStream.read_line_async，CliTurnMonitor 在完整行读取后才检查 maxLineBytes（runtime/cliProcessRunner.js:199–210）。一条无换行巨型 JSON 仍会被完整缓冲进内存。改为固定 8–32KiB read_bytes_async + UTF-8 增量 decoder + 有界行组装，超限立即终止受控子进程；stderr 与 stdout 都限制。避免每 chunk 重新拼接全部历史。
-- [ ] backends/openaiAdapter.js:103–111 /models 使用 send_and_read_async 在响应整体进入内存后才 parse/cap；改有界流读取，检查 Content-Length 仅作提前拒绝而非唯一限制。prefs.js 的在线模型刷新同样检查。
-- [ ] core/paths.js:312–350 readFileBytesBoundedAsync 先 stat 再 load_contents_async，文件变化、特殊文件可绕过预先大小判断。拒绝非普通文件（FIFO、设备、socket），固定大小分块读取，最多 maxBytes+1；权限错误、取消、文件变化给明确结果。SessionStore.load 同样限制单行/总大小并分页读取，不无界读取已损坏文件。
-- [ ] 确认 TurnController 的 text/thinking segments、工具明细、historyWindow 数据层设置累计字节预算（不能只限制 Actor 或单条事件）；达到上限应明确截断/落盘，不能丢失最终状态。按需读取工具日志，不默认存储敏感完整输出。
-- [ ] 测试：假 CLI 输出 10MiB 无换行、巨大 stderr；mock HTTP chunked /models 超限；文件在 stat 后增长/特殊文件；验证内存峰值、提前取消与错误状态。
+- [x] runtime/processManager.js:335–336、469、544 使用 Gio.DataInputStream.read_line_async，CliTurnMonitor 在完整行读取后才检查 maxLineBytes（runtime/cliProcessRunner.js:199–210）。一条无换行巨型 JSON 仍会被完整缓冲进内存。改为固定 8–32KiB read_bytes_async + UTF-8 增量 decoder + 有界行组装，超限立即终止受控子进程；stderr 与 stdout 都限制。避免每 chunk 重新拼接全部历史。
+- [x] backends/openaiAdapter.js:103–111 /models 使用 send_and_read_async 在响应整体进入内存后才 parse/cap；改有界流读取，检查 Content-Length 仅作提前拒绝而非唯一限制。prefs.js 的在线模型刷新同样检查。
+- [x] core/paths.js:312–350 readFileBytesBoundedAsync 先 stat 再 load_contents_async，文件变化、特殊文件可绕过预先大小判断。拒绝非普通文件（FIFO、设备、socket），固定大小分块读取，最多 maxBytes+1；权限错误、取消、文件变化给明确结果。SessionStore.load 同样限制单行/总大小并分页读取，不无界读取已损坏文件。
+- [x] 确认 TurnController 的 text/thinking segments、工具明细、historyWindow 数据层设置累计字节预算（不能只限制 Actor 或单条事件）；达到上限应明确截断/落盘，不能丢失最终状态。按需读取工具日志，不默认存储敏感完整输出。
+- [x] 测试：假 CLI 输出 10MiB 无换行、巨大 stderr；mock HTTP chunked /models 超限；文件在 stat 后增长/特殊文件；验证内存峰值、提前取消与错误状态。
 
 ### R6. 附件与上下文安全/生命周期（P1）
 

@@ -1,5 +1,6 @@
 import {registerHooks} from 'node:module';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -982,24 +983,227 @@ export function registerGiMocks() {
     };
     globalThis.__qcMockSoup = {
         Session: class {
-            abort() {}
+            constructor() {
+                this._activeReqs = new Set();
+            }
+            abort() {
+                for (const req of this._activeReqs) {
+                    try { req.destroy(new Error('Soup session aborted')); } catch (_) {}
+                }
+                this._activeReqs.clear();
+            }
+            send_async(msg, _prio, cancellable, callback) {
+                let cancelled = false;
+                let cancelId = 0;
+                const activeSession = this;
+
+                const finishWithError = err => {
+                    if (cancelId && cancellable?.disconnect) {
+                        try { cancellable.disconnect(cancelId); } catch (_) {}
+                        cancelId = 0;
+                    }
+                    queueMicrotask(() => callback?.(activeSession, {_err: err}));
+                };
+
+                if (cancellable?.is_cancelled?.()) {
+                    finishWithError(new Error('Operation was cancelled'));
+                    return;
+                }
+
+                let currentReq = null;
+                if (cancellable?.connect) {
+                    cancelId = cancellable.connect(() => {
+                        cancelled = true;
+                        try { currentReq?.destroy(new Error('Operation was cancelled')); } catch (_) {}
+                    });
+                }
+
+                const performRequest = (hopCount = 0) => {
+                    if (cancelled || msg._aborted) {
+                        finishWithError(new Error(msg._abortReason || 'Operation was cancelled'));
+                        return;
+                    }
+                    if (hopCount > 5) {
+                        finishWithError(new Error('Too many redirects'));
+                        return;
+                    }
+                    let parsedUrl;
+                    try {
+                        parsedUrl = new URL(msg._url);
+                    } catch (err) {
+                        finishWithError(err);
+                        return;
+                    }
+
+                    const headersObj = {};
+                    for (const [k, v] of msg._reqHeaders.entries()) {
+                        headersObj[k] = v;
+                    }
+                    if (msg._bodyBuffer && msg._method !== 'GET' && msg._method !== 'HEAD') {
+                        headersObj['Content-Length'] = String(msg._bodyBuffer.length);
+                        if (msg._contentType && !headersObj['Content-Type'] && !headersObj['content-type']) {
+                            headersObj['Content-Type'] = msg._contentType;
+                        }
+                    }
+
+                    const req = http.request({
+                        protocol: parsedUrl.protocol,
+                        hostname: parsedUrl.hostname,
+                        port: parsedUrl.port,
+                        path: `${parsedUrl.pathname}${parsedUrl.search}`,
+                        method: msg._method,
+                        headers: headersObj,
+                        agent: false,
+                    }, res => {
+                        activeSession._activeReqs.delete(req);
+                        msg._status = res.statusCode || 200;
+                        msg._reasonPhrase = res.statusMessage || 'OK';
+                        msg._resHeaders = res.headers || {};
+
+                        const status = msg._status;
+                        const location = res.headers?.location;
+                        if ([301, 302, 303, 307, 308].includes(status) && location) {
+                            res.resume();
+                            let nextUrl;
+                            try {
+                                nextUrl = new URL(location, msg._url).toString();
+                            } catch (err) {
+                                finishWithError(err);
+                                return;
+                            }
+                            msg._url = nextUrl;
+                            if (status === 303 || ((status === 301 || status === 302) && msg._method === 'POST')) {
+                                msg._method = 'GET';
+                                msg._bodyBuffer = null;
+                            }
+                            msg._emit('restarted');
+                            if (cancelled || msg._aborted || cancellable?.is_cancelled?.()) {
+                                finishWithError(new Error(msg._abortReason || 'Operation was cancelled'));
+                                return;
+                            }
+                            performRequest(hopCount + 1);
+                            return;
+                        }
+
+                        if (cancelId && cancellable?.disconnect) {
+                            try { cancellable.disconnect(cancelId); } catch (_) {}
+                            cancelId = 0;
+                        }
+                        const stream = new MockInputStream(res);
+                        queueMicrotask(() => callback?.(activeSession, {_stream: stream}));
+                    });
+
+                    currentReq = req;
+                    activeSession._activeReqs.add(req);
+                    req.on('error', err => {
+                        activeSession._activeReqs.delete(req);
+                        finishWithError(err);
+                    });
+
+                    if (msg._bodyBuffer && msg._method !== 'GET' && msg._method !== 'HEAD') {
+                        req.write(msg._bodyBuffer);
+                    }
+                    req.end();
+                };
+
+                performRequest(0);
+            }
+            send_finish(res) {
+                if (res?._err) throw res._err;
+                return res?._stream;
+            }
         },
         Message: {
-            new: (_method, _url) => ({
-                connect: () => 1,
-                get_uri: () => ({to_string: () => _url}),
-                get_request_headers: () => ({
-                    append: () => {},
-                    remove: () => {},
-                }),
-                get_response_headers: () => ({
-                    get_content_length: () => 0,
-                    get_one: () => null,
-                }),
-                get_status: () => 200,
-                get_reason_phrase: () => 'OK',
-                set_request_body_from_bytes: () => {},
-            }),
+            new: (method, url) => {
+                const listeners = new Map();
+                let nextListenerId = 1;
+                const reqHeaders = new Map();
+                const msgObj = {
+                    _method: String(method || 'GET').toUpperCase(),
+                    _url: String(url || ''),
+                    _reqHeaders: reqHeaders,
+                    _resHeaders: {},
+                    _status: 200,
+                    _reasonPhrase: 'OK',
+                    _bodyBuffer: null,
+                    _contentType: '',
+                    _aborted: false,
+                    _abortReason: '',
+                    connect(sig, fn) {
+                        const id = nextListenerId++;
+                        if (!listeners.has(sig)) listeners.set(sig, new Map());
+                        listeners.get(sig).set(id, fn);
+                        return id;
+                    },
+                    disconnect(id) {
+                        for (const map of listeners.values()) {
+                            map.delete(id);
+                        }
+                    },
+                    _emit(sig) {
+                        const map = listeners.get(sig);
+                        if (!map) return;
+                        for (const fn of map.values()) {
+                            try { fn(msgObj); } catch (_) {}
+                        }
+                    },
+                    get_method: () => msgObj._method,
+                    get_uri: () => ({to_string: () => msgObj._url}),
+                    get_request_headers: () => ({
+                        append: (k, v) => {
+                            reqHeaders.set(String(k), String(v));
+                        },
+                        replace: (k, v) => {
+                            reqHeaders.set(String(k), String(v));
+                        },
+                        remove: k => {
+                            for (const existingKey of Array.from(reqHeaders.keys())) {
+                                if (existingKey.toLowerCase() === String(k).toLowerCase()) {
+                                    reqHeaders.delete(existingKey);
+                                }
+                            }
+                        },
+                        get_one: k => {
+                            for (const [existingKey, val] of reqHeaders.entries()) {
+                                if (existingKey.toLowerCase() === String(k).toLowerCase()) {
+                                    return val;
+                                }
+                            }
+                            return null;
+                        },
+                    }),
+                    get_response_headers: () => ({
+                        get_content_length: () => {
+                            const raw = msgObj._resHeaders['content-length'];
+                            const n = Number(raw);
+                            return Number.isFinite(n) && n > 0 ? n : 0;
+                        },
+                        get_one: name => {
+                            const key = String(name || '').toLowerCase();
+                            const val = msgObj._resHeaders[key];
+                            if (Array.isArray(val)) return val[0] ?? null;
+                            return val ?? null;
+                        },
+                    }),
+                    get_status: () => msgObj._status,
+                    get_reason_phrase: () => msgObj._reasonPhrase,
+                    set_request_body_from_bytes: (contentType, gbytes) => {
+                        msgObj._contentType = String(contentType || 'application/json');
+                        if (!gbytes) {
+                            msgObj._bodyBuffer = null;
+                        } else if (gbytes._buf) {
+                            msgObj._bodyBuffer = Buffer.from(gbytes._buf);
+                        } else if (typeof gbytes.get_data === 'function') {
+                            msgObj._bodyBuffer = Buffer.from(gbytes.get_data());
+                        } else if (gbytes instanceof Uint8Array) {
+                            msgObj._bodyBuffer = Buffer.from(gbytes);
+                        } else {
+                            msgObj._bodyBuffer = Buffer.from(String(gbytes));
+                        }
+                    },
+                };
+                return msgObj;
+            },
         },
     };
     const MockConstructible = new Proxy(function MockGiClass() {}, {

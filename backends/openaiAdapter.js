@@ -46,6 +46,129 @@ export function attachCrossOriginRedirectGuard(msg, initialUrl) {
     });
 }
 
+/**
+ * Reads an HTTP response body via `Soup.Session.send_async` + bounded `read_bytes_async` chunks.
+ *
+ * - Uses `Content-Length` only as an early rejection hint.
+ * - Reads at most `maxBytes + 1` bytes in fixed chunks (`16 KiB`) and aborts/closes the stream
+ *   immediately if the body exceeds `maxBytes`, preventing chunked or dishonest servers from
+ *   exhausting GNOME Shell memory (Stage R5).
+ */
+export function readSoupResponseBytesBoundedAsync(session, msg, {
+    maxBytes = DEFAULT_SSE_LIMITS.maxModelsResponseBytes,
+    chunkBytes = 16 * 1024,
+    cancellable = null,
+} = {}) {
+    if (!session || !msg) {
+        return Promise.reject(new Error('无效的 HTTP 会话或请求对象'));
+    }
+    const effectiveMaxBytes = Math.max(1024, Number(maxBytes) || DEFAULT_SSE_LIMITS.maxModelsResponseBytes);
+    const effectiveChunkBytes = Math.max(512, Math.min(Number(chunkBytes) || (16 * 1024), effectiveMaxBytes + 1));
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let bodyStream = null;
+
+        const closeBodyStream = () => {
+            if (!bodyStream) return;
+            const s = bodyStream;
+            bodyStream = null;
+            try {
+                s.close_async(GLib.PRIORITY_DEFAULT, null, (st, r) => {
+                    try { st.close_finish(r); } catch (_) {}
+                });
+            } catch (_) {}
+        };
+
+        const failWith = err => {
+            if (settled) return;
+            settled = true;
+            closeBodyStream();
+            reject(err instanceof Error ? err : new Error(String(err)));
+        };
+
+        session.send_async(msg, GLib.PRIORITY_DEFAULT, cancellable, (sess, sendRes) => {
+            try {
+                bodyStream = sess.send_finish(sendRes);
+            } catch (err) {
+                failWith(err);
+                return;
+            }
+            if (!bodyStream) {
+                failWith(new Error('HTTP 响应流为空'));
+                return;
+            }
+
+            // Early rejection check on Content-Length header (never the sole guard!)
+            try {
+                const respHeaders = msg.get_response_headers?.();
+                let declaredLen = 0;
+                const clHeader = respHeaders?.get_one?.('Content-Length') || respHeaders?.get_one?.('content-length');
+                if (clHeader !== null && clHeader !== undefined && String(clHeader).trim() !== '') {
+                    declaredLen = Number.parseInt(String(clHeader).trim(), 10) || 0;
+                } else if (typeof respHeaders?.get_content_length === 'function') {
+                    declaredLen = Number(respHeaders.get_content_length() || 0);
+                }
+                if (declaredLen > effectiveMaxBytes) {
+                    failWith(new Error(`/models 响应体积超过上限（Content-Length ${Math.ceil(declaredLen / 1024)} KB > ${Math.ceil(effectiveMaxBytes / 1024)} KB）`));
+                    return;
+                }
+            } catch (_) {}
+
+            const chunks = [];
+            let totalBytes = 0;
+
+            const readNextChunk = () => {
+                if (settled || !bodyStream) return;
+                if (cancellable?.is_cancelled?.()) {
+                    failWith(new Error('Operation was cancelled'));
+                    return;
+                }
+                const remainingPlusOne = (effectiveMaxBytes - totalBytes) + 1;
+                const toRead = Math.max(1, Math.min(effectiveChunkBytes, remainingPlusOne));
+                bodyStream.read_bytes_async(toRead, GLib.PRIORITY_DEFAULT, cancellable, (stream, readRes) => {
+                    let gbytes = null;
+                    try {
+                        gbytes = stream.read_bytes_finish(readRes);
+                    } catch (err) {
+                        failWith(err);
+                        return;
+                    }
+                    if (settled) return;
+                    const data = gbytes ? gbytes.get_data() : null;
+                    if (!data || data.byteLength === 0) {
+                        settled = true;
+                        closeBodyStream();
+                        const merged = new Uint8Array(totalBytes);
+                        let offset = 0;
+                        for (const c of chunks) {
+                            merged.set(c, offset);
+                            offset += c.byteLength;
+                        }
+                        resolve({
+                            status: msg.get_status(),
+                            reasonPhrase: msg.get_reason_phrase?.() || '',
+                            bytes: merged,
+                        });
+                        return;
+                    }
+
+                    const copy = data instanceof Uint8Array ? data : new Uint8Array(data);
+                    totalBytes += copy.byteLength;
+                    if (totalBytes > effectiveMaxBytes) {
+                        failWith(new Error(`/models 响应体积超过上限（>${Math.ceil(effectiveMaxBytes / 1024)} KB）`));
+                        return;
+                    }
+                    chunks.push(copy);
+                    readNextChunk();
+                });
+            };
+
+            readNextChunk();
+        });
+    });
+}
+
 export class OpenAIAdapter extends BaseBackendAdapter {
     constructor({
         turns,
@@ -80,60 +203,62 @@ export class OpenAIAdapter extends BaseBackendAdapter {
         if (this._runtime) this._runtime.apiKey = clean;
     }
 
-    getModels({cancellable = null} = {}) {
+    async getModels({
+        cancellable = null,
+        maxBytes = DEFAULT_SSE_LIMITS.maxModelsResponseBytes,
+    } = {}) {
         if (!this._httpSession || this._disposed) {
-            return Promise.reject(new Error('OpenAI HTTP 会话已关闭'));
+            throw new Error('OpenAI HTTP 会话已关闭');
         }
         const userPreferredModel = String(this._runtime?.modelId || '').trim();
         const modelsUrl = this._runtime?.modelsUrl || '';
         const apiKey = this._runtime?.apiKey || '';
 
-        return new Promise((resolve, reject) => {
-            const msg = Soup.Message.new('GET', modelsUrl);
-            if (!msg) {
-                reject(new Error(`无效的接口地址：${modelsUrl}`));
-                return;
-            }
-            attachCrossOriginRedirectGuard(msg, modelsUrl);
-            const headers = msg.get_request_headers();
-            headers.append('Accept', 'application/json');
-            if (apiKey) {
-                headers.append('Authorization', `Bearer ${apiKey}`);
-            }
-            this._httpSession.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, cancellable, (sess, res) => {
-                try {
-                    const bytes = sess.send_and_read_finish(res);
-                    const rawData = bytes?.get_data?.() || new Uint8Array(0);
-                    const status = msg.get_status();
-                    const parsed = parseModelsResponse(status, rawData, {
-                        preferredModel: userPreferredModel,
-                        apiKey,
-                    });
-                    if (this._runtime) {
-                        this._runtime.modelMetadata = {
-                            ...(this._runtime.modelMetadata || {}),
-                            ...(parsed.metadataById || {}),
-                        };
-                    }
-                    if (!this._disposed && Array.isArray(parsed.models) && parsed.models.length > 0) {
-                        this._emitEvent?.({
-                            type: 'models_discovered',
-                            backend: 'openai',
-                            models: parsed.models.slice(0, 200),
-                            clientGeneration: this._clientGeneration,
-                        });
-                    }
-                    resolve({
-                        backend: 'openai',
-                        models: parsed.models || [],
-                        selectedModel: parsed.selectedModel || '',
-                    });
-                } catch (e) {
-                    const cleanMsg = redactSensitiveText(e?.message || String(e), {apiKey, maxChars: 240});
-                    reject(new Error(cleanMsg));
-                }
+        const msg = Soup.Message.new('GET', modelsUrl);
+        if (!msg) {
+            throw new Error(`无效的接口地址：${modelsUrl}`);
+        }
+        attachCrossOriginRedirectGuard(msg, modelsUrl);
+        const headers = msg.get_request_headers();
+        headers.append('Accept', 'application/json');
+        if (apiKey) {
+            headers.append('Authorization', `Bearer ${apiKey}`);
+        }
+
+        try {
+            const {status, bytes: rawData} = await readSoupResponseBytesBoundedAsync(
+                this._httpSession,
+                msg,
+                {maxBytes, cancellable}
+            );
+            const parsed = parseModelsResponse(status, rawData, {
+                preferredModel: userPreferredModel,
+                apiKey,
+                maxResponseBytes: maxBytes,
             });
-        });
+            if (this._runtime) {
+                this._runtime.modelMetadata = {
+                    ...(this._runtime.modelMetadata || {}),
+                    ...(parsed.metadataById || {}),
+                };
+            }
+            if (!this._disposed && Array.isArray(parsed.models) && parsed.models.length > 0) {
+                this._emitEvent?.({
+                    type: 'models_discovered',
+                    backend: 'openai',
+                    models: parsed.models.slice(0, 200),
+                    clientGeneration: this._clientGeneration,
+                });
+            }
+            return {
+                backend: 'openai',
+                models: parsed.models || [],
+                selectedModel: parsed.selectedModel || '',
+            };
+        } catch (e) {
+            const cleanMsg = redactSensitiveText(e?.message || String(e), {apiKey, maxChars: 240});
+            throw new Error(cleanMsg);
+        }
     }
 
     async _discoverModelIfNeeded(cancellable) {

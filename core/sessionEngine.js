@@ -21,6 +21,9 @@ import {
 export const DEFAULT_HOT_MESSAGE_LIMIT = 200;
 export const DEFAULT_COMPACT_TARGET_RATIO = 0.8;
 export const MAX_SINGLE_JSONL_RECORD_BYTES = 2 * 1024 * 1024; // 2 MiB safety cap per record
+export const MAX_SESSION_META_BYTES = 256 * 1024; // 256 KiB cap for meta.json
+export const MAX_SESSION_LINE_BYTES = 512 * 1024; // 512 KiB cap per line on load
+export const MAX_SESSION_HOT_FILE_BYTES = 8 * 1024 * 1024; // 8 MiB cap for hot messages.jsonl
 export const VALID_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 const UTF8_ENCODER = new TextEncoder();
@@ -356,6 +359,9 @@ export class SessionStoreEngine {
         sessionsRootDir,
         io,
         maxHotMessages = DEFAULT_HOT_MESSAGE_LIMIT,
+        maxLineBytes = MAX_SESSION_LINE_BYTES,
+        maxHotFileBytes = MAX_SESSION_HOT_FILE_BYTES,
+        maxRetainedLines = 600,
         keepArchive = true,
         maxWriteRetries = 2,
         retryDelayMs = 20,
@@ -377,6 +383,9 @@ export class SessionStoreEngine {
 
         this._io = io;
         this._maxHotMessages = Math.max(4, Number(maxHotMessages) || DEFAULT_HOT_MESSAGE_LIMIT);
+        this._maxLineBytes = Math.max(4096, Number(maxLineBytes) || MAX_SESSION_LINE_BYTES);
+        this._maxHotFileBytes = Math.max(32768, Number(maxHotFileBytes) || MAX_SESSION_HOT_FILE_BYTES);
+        this._maxRetainedLines = Math.max(this._maxHotMessages, Number(maxRetainedLines) || 600);
         this._keepArchive = Boolean(keepArchive);
         this._maxWriteRetries = Math.max(0, Number(maxWriteRetries ?? 2));
         this._retryDelayMs = Math.max(0, Number(retryDelayMs ?? 20));
@@ -405,6 +414,7 @@ export class SessionStoreEngine {
         this._failedWrites = new Map();
         this._nextWriteSeq = 0;
         this.corruptLineCount = 0;
+        this.truncatedHotFileOnLoad = false;
         this._initialCorruptSnapshot = null;
         this._needsLeadingNewlineOnAppend = false;
     }
@@ -583,23 +593,80 @@ export class SessionStoreEngine {
             }
 
             if (jsonlExists) {
-                const linesRaw = await this._io.readText(this.jsonlPath);
                 const rawParsed = [];
                 const corruptLines = [];
-                const rawLines = String(linesRaw || '').split(/\r?\n/);
+                let linesRawSnapshot = '';
 
-                for (let idx = 0; idx < rawLines.length; idx++) {
-                    const trimmed = rawLines[idx].trim();
-                    if (!trimmed) continue;
-                    try {
-                        const obj = JSON.parse(trimmed);
-                        if (obj && typeof obj === 'object') {
-                            rawParsed.push(obj);
-                        } else {
+                if (typeof this._io.readJsonlBounded === 'function') {
+                    const bounded = await this._io.readJsonlBounded(this.jsonlPath, {
+                        maxLineBytes: this._maxLineBytes,
+                        maxTotalBytes: this._maxHotFileBytes,
+                        maxRetainedLines: this._maxRetainedLines,
+                    });
+                    if (bounded.truncatedFile) {
+                        this.truncatedHotFileOnLoad = true;
+                    }
+                    if (Array.isArray(bounded.corruptLines) && bounded.corruptLines.length > 0) {
+                        corruptLines.push(...bounded.corruptLines);
+                    }
+                    for (const entry of (bounded.lines || [])) {
+                        const trimmed = String(entry.raw || '').trim();
+                        if (!trimmed) continue;
+                        try {
+                            const obj = JSON.parse(trimmed);
+                            if (obj && typeof obj === 'object') {
+                                rawParsed.push(obj);
+                            } else {
+                                corruptLines.push({lineNumber: entry.lineNumber, raw: trimmed.slice(0, 65536)});
+                            }
+                        } catch (_) {
+                            corruptLines.push({lineNumber: entry.lineNumber, raw: trimmed.slice(0, 65536)});
+                        }
+                    }
+                    if (bounded.totalBytesRead > 0 && !bounded.endsWithNewline) {
+                        this._needsLeadingNewlineOnAppend = true;
+                    }
+                } else {
+                    const linesRaw = String((await this._io.readText(this.jsonlPath)) || '');
+                    linesRawSnapshot = linesRaw;
+                    const encodedTotal = UTF8_ENCODER.encode(linesRaw);
+                    let boundedRaw = linesRaw;
+                    if (encodedTotal.byteLength > this._maxHotFileBytes) {
+                        this.truncatedHotFileOnLoad = true;
+                        boundedRaw = new TextDecoder('utf-8', {fatal: false}).decode(
+                            encodedTotal.subarray(0, this._maxHotFileBytes)
+                        );
+                    }
+                    const rawLines = boundedRaw.split(/\r?\n/);
+
+                    for (let idx = 0; idx < rawLines.length; idx++) {
+                        const trimmed = rawLines[idx].trim();
+                        if (!trimmed) continue;
+                        const lineByteLen = UTF8_ENCODER.encode(trimmed).byteLength;
+                        if (lineByteLen > this._maxLineBytes) {
+                            corruptLines.push({
+                                lineNumber: idx + 1,
+                                raw: trimmed.slice(0, 4096),
+                                reason: 'line_too_large',
+                            });
+                            continue;
+                        }
+                        try {
+                            const obj = JSON.parse(trimmed);
+                            if (obj && typeof obj === 'object') {
+                                rawParsed.push(obj);
+                                if (rawParsed.length > this._maxRetainedLines) {
+                                    rawParsed.shift();
+                                }
+                            } else {
+                                corruptLines.push({lineNumber: idx + 1, raw: trimmed});
+                            }
+                        } catch (_) {
                             corruptLines.push({lineNumber: idx + 1, raw: trimmed});
                         }
-                    } catch (_) {
-                        corruptLines.push({lineNumber: idx + 1, raw: trimmed});
+                    }
+                    if (linesRaw && !linesRaw.endsWith('\n')) {
+                        this._needsLeadingNewlineOnAppend = true;
                     }
                 }
 
@@ -612,21 +679,18 @@ export class SessionStoreEngine {
                 this._durableRevision = this._revision;
                 this.meta.committedRevision = this._revision;
 
-                if (linesRaw && !linesRaw.endsWith('\n')) {
-                    this._needsLeadingNewlineOnAppend = true;
-                }
-
                 if (corruptLines.length > 0) {
                     this.corruptLineCount += corruptLines.length;
                     if (this._initialCorruptSnapshot === null) {
-                        this._initialCorruptSnapshot = String(linesRaw || '');
+                        this._initialCorruptSnapshot = linesRawSnapshot;
                     }
                     // Isolate corrupt lines to corrupt.jsonl WITHOUT overwriting the sole messages.jsonl copy!
                     const isolationPayload = corruptLines
                         .map(item => JSON.stringify({
                             isolatedAt: new Date().toISOString(),
                             lineNumber: item.lineNumber,
-                            raw: item.raw.slice(0, 65536),
+                            ...(item.reason ? {reason: item.reason} : {}),
+                            raw: String(item.raw || '').slice(0, 65536),
                         }))
                         .join('\n') + '\n';
                     this._enqueueWrite('isolate_corrupt_lines', async () => {

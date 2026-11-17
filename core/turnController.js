@@ -42,9 +42,43 @@ export const STREAM_EVENT_TYPES = Object.freeze({
     TURN_SETTLED: 'agent_settled',
 });
 
+const UTF8_ENCODER = new TextEncoder();
+const UTF8_DECODER = new TextDecoder('utf-8', {fatal: false});
+
+export const DEFAULT_TURN_BUDGETS = Object.freeze({
+    maxTurnTextBytes: 512 * 1024, // 512 KiB cumulative assistant text per turn
+    maxTurnThinkingBytes: 256 * 1024, // 256 KiB cumulative thinking text per turn
+    maxToolDetailBytesPerEvent: 4 * 1024, // 4 KiB per tool event detail
+    maxTurnToolEventsBytes: 128 * 1024, // 128 KiB cumulative tool event details per turn
+});
+
+function truncateUtf8ToBytes(str, maxBytes, suffix = '') {
+    const raw = String(str ?? '');
+    const encoded = UTF8_ENCODER.encode(raw);
+    if (encoded.byteLength <= maxBytes) {
+        return {text: raw, truncated: false, byteLength: encoded.byteLength};
+    }
+    const suffixBytes = suffix ? UTF8_ENCODER.encode(suffix) : new Uint8Array(0);
+    let endIdx = Math.max(0, Math.min(encoded.byteLength, maxBytes - suffixBytes.byteLength));
+    while (endIdx > 0 && (encoded[endIdx] & 0xc0) === 0x80) {
+        endIdx--;
+    }
+    const prefix = UTF8_DECODER.decode(encoded.subarray(0, endIdx));
+    const combined = `${prefix}${suffix}`;
+    return {
+        text: combined,
+        truncated: true,
+        byteLength: UTF8_ENCODER.encode(combined).byteLength,
+    };
+}
+
 export class TurnController {
-    constructor(onEvent) {
+    constructor(onEvent, budgets = {}) {
         this._onEvent = onEvent;
+        this._budgets = {
+            ...DEFAULT_TURN_BUDGETS,
+            ...(budgets || {}),
+        };
         this._seq = 0;
         this._activeTurn = null;
         this._disposed = false;
@@ -72,6 +106,10 @@ export class TurnController {
         const seq = ++this._seq;
         const turnId = String(meta.turnId || '').trim() || `turn_${seq}`;
         const messageId = String(meta.messageId || '').trim() || `msg_${seq}`;
+        const budgets = {
+            ...this._budgets,
+            ...(meta.budgets || {}),
+        };
         const turn = {
             id: turnId,
             messageId,
@@ -89,10 +127,17 @@ export class TurnController {
             stdin: null,
             tempFiles: [],
             deferTempCleanupUntilProcessExit: Boolean(meta.deferTempCleanupUntilProcessExit),
+            budgets,
             text: '',
             thinking: '',
             textSegments: new Map(),
             thinkingSegments: new Map(),
+            textBytesUsed: 0,
+            thinkingBytesUsed: 0,
+            toolEventsBytesUsed: 0,
+            textBudgetTruncated: false,
+            thinkingBudgetTruncated: false,
+            toolEventsBudgetTruncated: false,
             error: '',
             aborted: false,
             timedOut: false,
@@ -385,11 +430,27 @@ export class TurnController {
         if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
             turn.state = 'streaming';
         }
+        if (turn.textBudgetTruncated) {
+            return true;
+        }
         const segKey = String(segmentId || '__primary__');
         turn.textSegments.set(segKey, (turn.textSegments.get(segKey) || '') + delta);
-        const aggregated = turn.textSegments.size <= 1
+        let aggregated = turn.textSegments.size <= 1
             ? (turn.textSegments.get(segKey) || '')
             : Array.from(turn.textSegments.values()).filter(Boolean).join('\n\n');
+        const maxBytes = Math.max(1024, Number(turn.budgets?.maxTurnTextBytes) || DEFAULT_TURN_BUDGETS.maxTurnTextBytes);
+        const capped = truncateUtf8ToBytes(
+            aggregated,
+            maxBytes,
+            '\n\n… [输出已达单轮内存上限，已截断]'
+        );
+        if (capped.truncated) {
+            turn.textBudgetTruncated = true;
+            aggregated = capped.text;
+            turn.textSegments.clear();
+            turn.textSegments.set('__primary__', aggregated);
+        }
+        turn.textBytesUsed = capped.byteLength;
         return this._applyAggregatedText(turn, aggregated);
     }
 
@@ -400,9 +461,24 @@ export class TurnController {
         }
         const segKey = String(segmentId || '__primary__');
         turn.textSegments.set(segKey, nextText);
-        const aggregated = turn.textSegments.size <= 1
+        let aggregated = turn.textSegments.size <= 1
             ? nextText
             : Array.from(turn.textSegments.values()).filter(Boolean).join('\n\n');
+        const maxBytes = Math.max(1024, Number(turn.budgets?.maxTurnTextBytes) || DEFAULT_TURN_BUDGETS.maxTurnTextBytes);
+        const capped = truncateUtf8ToBytes(
+            aggregated,
+            maxBytes,
+            '\n\n… [输出已达单轮内存上限，已截断]'
+        );
+        if (capped.truncated) {
+            turn.textBudgetTruncated = true;
+            aggregated = capped.text;
+            turn.textSegments.clear();
+            turn.textSegments.set('__primary__', aggregated);
+        } else {
+            turn.textBudgetTruncated = false;
+        }
+        turn.textBytesUsed = capped.byteLength;
         return this._applyAggregatedText(turn, aggregated);
     }
 
@@ -411,11 +487,27 @@ export class TurnController {
         if (turn.pendingApprovals.size === 0 && turn.state !== 'cancelling') {
             turn.state = 'streaming';
         }
+        if (turn.thinkingBudgetTruncated) {
+            return true;
+        }
         const segKey = String(segmentId || '__primary__');
         turn.thinkingSegments.set(segKey, (turn.thinkingSegments.get(segKey) || '') + delta);
-        const aggregated = turn.thinkingSegments.size <= 1
+        let aggregated = turn.thinkingSegments.size <= 1
             ? (turn.thinkingSegments.get(segKey) || '')
             : Array.from(turn.thinkingSegments.values()).filter(Boolean).join('\n\n');
+        const maxBytes = Math.max(1024, Number(turn.budgets?.maxTurnThinkingBytes) || DEFAULT_TURN_BUDGETS.maxTurnThinkingBytes);
+        const capped = truncateUtf8ToBytes(
+            aggregated,
+            maxBytes,
+            '\n\n… [思考过程已达单轮内存上限，已截断]'
+        );
+        if (capped.truncated) {
+            turn.thinkingBudgetTruncated = true;
+            aggregated = capped.text;
+            turn.thinkingSegments.clear();
+            turn.thinkingSegments.set('__primary__', aggregated);
+        }
+        turn.thinkingBytesUsed = capped.byteLength;
         return this._applyAggregatedThinking(turn, aggregated);
     }
 
@@ -426,19 +518,75 @@ export class TurnController {
         }
         const segKey = String(segmentId || '__primary__');
         turn.thinkingSegments.set(segKey, nextThinking);
-        const aggregated = turn.thinkingSegments.size <= 1
+        let aggregated = turn.thinkingSegments.size <= 1
             ? nextThinking
             : Array.from(turn.thinkingSegments.values()).filter(Boolean).join('\n\n');
+        const maxBytes = Math.max(1024, Number(turn.budgets?.maxTurnThinkingBytes) || DEFAULT_TURN_BUDGETS.maxTurnThinkingBytes);
+        const capped = truncateUtf8ToBytes(
+            aggregated,
+            maxBytes,
+            '\n\n… [思考过程已达单轮内存上限，已截断]'
+        );
+        if (capped.truncated) {
+            turn.thinkingBudgetTruncated = true;
+            aggregated = capped.text;
+            turn.thinkingSegments.clear();
+            turn.thinkingSegments.set('__primary__', aggregated);
+        } else {
+            turn.thinkingBudgetTruncated = false;
+        }
+        turn.thinkingBytesUsed = capped.byteLength;
         return this._applyAggregatedThinking(turn, aggregated);
     }
 
     emitForTurn(turn, event) {
         if (!this.isCurrent(turn) || !event) return false;
+        let normalizedEvent = event;
+        if (
+            event.type === 'tool_execution_start' ||
+            event.type === 'tool_execution_update' ||
+            event.type === 'tool_execution_end'
+        ) {
+            const perEventCap = Math.max(
+                256,
+                Number(turn.budgets?.maxToolDetailBytesPerEvent) || DEFAULT_TURN_BUDGETS.maxToolDetailBytesPerEvent
+            );
+            const totalToolCap = Math.max(
+                1024,
+                Number(turn.budgets?.maxTurnToolEventsBytes) || DEFAULT_TURN_BUDGETS.maxTurnToolEventsBytes
+            );
+            normalizedEvent = {...event};
+            for (const field of ['detail', 'output', 'result']) {
+                if (typeof normalizedEvent[field] === 'string' && normalizedEvent[field].length > 0) {
+                    const remainingBudget = Math.max(0, totalToolCap - turn.toolEventsBytesUsed);
+                    if (remainingBudget <= 128) {
+                        turn.toolEventsBudgetTruncated = true;
+                        normalizedEvent[field] = '… [工具日志累计已达单轮上限，已省略详细输出]';
+                        normalizedEvent.detailTruncated = true;
+                    } else {
+                        const effectiveCap = Math.min(perEventCap, remainingBudget);
+                        const capped = truncateUtf8ToBytes(
+                            normalizedEvent[field],
+                            effectiveCap,
+                            ' … [工具明细已按上限截断]'
+                        );
+                        normalizedEvent[field] = capped.text;
+                        turn.toolEventsBytesUsed += capped.byteLength;
+                        if (capped.truncated) {
+                            normalizedEvent.detailTruncated = true;
+                            if (effectiveCap < perEventCap) {
+                                turn.toolEventsBudgetTruncated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         this._onEvent?.({
-            ...event,
+            ...normalizedEvent,
             turnId: turn.id,
-            messageId: event.messageId || turn.messageId,
-            sessionId: event.sessionId || turn.sessionId,
+            messageId: normalizedEvent.messageId || turn.messageId,
+            sessionId: normalizedEvent.sessionId || turn.sessionId,
             clientGeneration: turn.clientGeneration,
         });
         return true;

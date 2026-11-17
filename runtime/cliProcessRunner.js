@@ -13,6 +13,7 @@ export const BRIDGE_EXPECTED_PROTOCOL_VERSION = 1;
 export const DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS = 5000;
 export const DEFAULT_KILL_GRACE_MS = 800;
 export const DEFAULT_POST_EXIT_PIPE_DRAIN_MS = 250;
+export const DEFAULT_PIPE_CHUNK_BYTES = 16 * 1024;
 
 export const DEFAULT_STREAM_LIMITS = Object.freeze({
     maxLineBytes: 512 * 1024,
@@ -20,6 +21,133 @@ export const DEFAULT_STREAM_LIMITS = Object.freeze({
     maxStderrLines: 20,
     maxJsonParseErrors: 32,
 });
+
+/**
+ * Incremental UTF-8 line assembler with strict in-stream byte ceiling (`maxLineBytes`).
+ *
+ * - Reads fixed `Uint8Array` chunks (`8–32 KiB`) from `read_bytes_async`.
+ * - Decodes UTF-8 incrementally with `{stream: true}` so multi-byte sequences split across
+ *   chunk boundaries are preserved without corruption.
+ * - Accumulates decoded fragments in an array (`_pendingParts`) and joins ONLY once per `\n`
+ *   line completion, avoiding O(N^2) string re-concatenation across chunks.
+ * - Enforces `maxLineBytes` BEFORE buffering an unbounded newline-less payload into RAM!
+ */
+export class IncrementalBoundedLineReader {
+    constructor({maxLineBytes = DEFAULT_STREAM_LIMITS.maxLineBytes} = {}) {
+        this.maxLineBytes = Math.max(256, Number(maxLineBytes) || DEFAULT_STREAM_LIMITS.maxLineBytes);
+        this._decoder = new TextDecoder('utf-8', {fatal: false});
+        this._pendingParts = [];
+        this._pendingBytes = 0;
+        this.overflowed = false;
+        this.overflowBytes = 0;
+    }
+
+    get pendingBytes() {
+        return this._pendingBytes;
+    }
+
+    pushChunk(rawChunk) {
+        if (this.overflowed || !rawChunk) {
+            return {lines: [], overflowed: this.overflowed, overflowBytes: this.overflowBytes};
+        }
+        const chunk = rawChunk instanceof Uint8Array
+            ? rawChunk
+            : new Uint8Array(rawChunk);
+        if (chunk.byteLength === 0) {
+            return {lines: [], overflowed: false, overflowBytes: 0};
+        }
+
+        const lines = [];
+        let cursor = 0;
+        const len = chunk.byteLength;
+
+        while (cursor < len) {
+            let nlIdx = -1;
+            for (let i = cursor; i < len; i++) {
+                if (chunk[i] === 0x0a) {
+                    nlIdx = i;
+                    break;
+                }
+            }
+
+            if (nlIdx === -1) {
+                const segLen = len - cursor;
+                const nextBytes = this._pendingBytes + segLen;
+                if (nextBytes > this.maxLineBytes) {
+                    this.overflowed = true;
+                    this.overflowBytes = nextBytes;
+                    this._pendingParts = [];
+                    this._pendingBytes = 0;
+                    return {lines, overflowed: true, overflowBytes: this.overflowBytes};
+                }
+                const slice = chunk.subarray(cursor, len);
+                const decoded = this._decoder.decode(slice, {stream: true});
+                if (decoded) {
+                    this._pendingParts.push(decoded);
+                }
+                this._pendingBytes = nextBytes;
+                break;
+            }
+
+            const segLen = nlIdx - cursor;
+            const nextBytes = this._pendingBytes + segLen;
+            if (nextBytes > this.maxLineBytes) {
+                this.overflowed = true;
+                this.overflowBytes = nextBytes;
+                this._pendingParts = [];
+                this._pendingBytes = 0;
+                return {lines, overflowed: true, overflowBytes: this.overflowBytes};
+            }
+
+            const slice = chunk.subarray(cursor, nlIdx);
+            const tailDecoded = this._decoder.decode(slice, {stream: false});
+            if (tailDecoded) {
+                this._pendingParts.push(tailDecoded);
+            }
+            let fullLine = this._pendingParts.length === 1
+                ? this._pendingParts[0]
+                : this._pendingParts.join('');
+            if (fullLine.endsWith('\r')) {
+                fullLine = fullLine.slice(0, -1);
+            }
+            lines.push(fullLine);
+            this._pendingParts = [];
+            this._pendingBytes = 0;
+            cursor = nlIdx + 1;
+        }
+
+        return {lines, overflowed: false, overflowBytes: 0};
+    }
+
+    flush() {
+        if (this.overflowed) {
+            return {lines: [], overflowed: true, overflowBytes: this.overflowBytes};
+        }
+        const tail = this._decoder.decode();
+        if (tail) {
+            this._pendingParts.push(tail);
+        }
+        if (this._pendingParts.length === 0 && this._pendingBytes === 0) {
+            return {lines: [], overflowed: false, overflowBytes: 0};
+        }
+        let fullLine = this._pendingParts.length === 1
+            ? this._pendingParts[0]
+            : this._pendingParts.join('');
+        if (fullLine.endsWith('\r')) {
+            fullLine = fullLine.slice(0, -1);
+        }
+        this._pendingParts = [];
+        this._pendingBytes = 0;
+        return {lines: fullLine ? [fullLine] : [], overflowed: false, overflowBytes: 0};
+    }
+
+    takePendingPrefix(maxChars = 256) {
+        const prefix = this._pendingParts.join('').slice(0, maxChars);
+        this._pendingParts = [];
+        this._pendingBytes = 0;
+        return prefix;
+    }
+}
 
 export const MANAGED_TEMP_RUNTIME_FILE_RE = /^zcode-(?:provider|prompt)-[0-9a-fA-F-]{8,64}\.(?:json|txt)$/;
 
@@ -183,6 +311,12 @@ export class CliTurnMonitor {
         this.jsonParseErrors = 0;
         this.stdoutLineOverflow = false;
         this.fatalError = '';
+        this._stdoutLineReader = new IncrementalBoundedLineReader({
+            maxLineBytes: this.limits.maxLineBytes,
+        });
+        this._stderrLineReader = new IncrementalBoundedLineReader({
+            maxLineBytes: Math.max(4096, Math.min(this.limits.maxLineBytes, this.limits.maxStderrBytes * 2)),
+        });
     }
 
     get isHandshakePending() {
@@ -203,6 +337,7 @@ export class CliTurnMonitor {
 
     pushStderrLine(forTurnId, rawLine) {
         if (forTurnId !== this.turnId || rawLine === null || rawLine === undefined) return false;
+        if (this.stderrTruncated) return true;
         const clean = stripAnsi(String(rawLine)).trim();
         if (!clean) return true;
 
@@ -225,9 +360,99 @@ export class CliTurnMonitor {
         return true;
     }
 
+    pushStderrChunk(forTurnId, uint8Chunk) {
+        if (forTurnId !== this.turnId || !uint8Chunk) return false;
+        if (this.stderrTruncated) {
+            return true;
+        }
+        const remainingBudget = Math.max(0, this.limits.maxStderrBytes - this.stderrBytes);
+        const chunk = uint8Chunk instanceof Uint8Array ? uint8Chunk : new Uint8Array(uint8Chunk);
+        const allowedSlice = chunk.byteLength > remainingBudget + 256
+            ? chunk.subarray(0, remainingBudget + 256)
+            : chunk;
+
+        const res = this._stderrLineReader.pushChunk(allowedSlice);
+        for (const line of res.lines) {
+            this.pushStderrLine(forTurnId, line);
+            if (this.stderrTruncated) break;
+        }
+        if (res.overflowed || chunk.byteLength > allowedSlice.byteLength) {
+            if (!this.stderrTruncated) {
+                const partial = stripAnsi(this._stderrLineReader.takePendingPrefix(256)).trim();
+                if (partial) {
+                    this.stderrLines.push(`${partial}… [stderr 已截断]`);
+                } else if (this.stderrLines.length === 0) {
+                    const fallbackText = stripAnsi(new TextDecoder('utf-8', {fatal: false}).decode(allowedSlice.subarray(0, Math.min(256, allowedSlice.byteLength)))).trim();
+                    if (fallbackText) {
+                        this.stderrLines.push(`${fallbackText}… [stderr 已截断]`);
+                    }
+                }
+                this.stderrBytes = this.limits.maxStderrBytes;
+                this.stderrTruncated = true;
+            }
+        }
+        return true;
+    }
+
+    flushStderr(forTurnId) {
+        if (forTurnId !== this.turnId || this.stderrTruncated) return false;
+        const res = this._stderrLineReader.flush();
+        for (const line of res.lines) {
+            this.pushStderrLine(forTurnId, line);
+        }
+        return true;
+    }
+
     getStderrSummary(maxLines = 3) {
         if (!this.stderrLines.length) return '';
         return this.stderrLines.slice(-maxLines).join(' ').slice(0, 480);
+    }
+
+    /**
+     * Feeds a raw `Uint8Array` chunk from `stdout.read_bytes_async` into the bounded line reader
+     * and processes any completed lines. Immediately sets `fatalError` if an unterminated line
+     * exceeds `maxLineBytes` mid-stream!
+     */
+    pushStdoutChunk(forTurnId, uint8Chunk) {
+        if (forTurnId !== this.turnId || !uint8Chunk) {
+            return {ignore: true, results: [], fatalError: ''};
+        }
+        const res = this._stdoutLineReader.pushChunk(uint8Chunk);
+        const results = [];
+        for (const line of res.lines) {
+            const checked = this.processStdoutLine(forTurnId, line);
+            results.push(checked);
+            if (checked.fatalError) {
+                return {ignore: false, results, fatalError: checked.fatalError};
+            }
+        }
+        if (res.overflowed) {
+            this.stdoutLineOverflow = true;
+            this.fatalError = `CLI 单行输出超过安全上限（${Math.ceil(res.overflowBytes / 1024)} KB > ${Math.ceil(this.limits.maxLineBytes / 1024)} KB）`;
+            return {ignore: false, results, fatalError: this.fatalError};
+        }
+        return {ignore: false, results, fatalError: ''};
+    }
+
+    flushStdout(forTurnId) {
+        if (forTurnId !== this.turnId) {
+            return {ignore: true, results: [], fatalError: ''};
+        }
+        const res = this._stdoutLineReader.flush();
+        if (res.overflowed) {
+            this.stdoutLineOverflow = true;
+            this.fatalError = `CLI 单行输出超过安全上限（${Math.ceil(res.overflowBytes / 1024)} KB > ${Math.ceil(this.limits.maxLineBytes / 1024)} KB）`;
+            return {ignore: false, results: [], fatalError: this.fatalError};
+        }
+        const results = [];
+        for (const line of res.lines) {
+            const checked = this.processStdoutLine(forTurnId, line);
+            results.push(checked);
+            if (checked.fatalError) {
+                return {ignore: false, results, fatalError: checked.fatalError};
+            }
+        }
+        return {ignore: false, results, fatalError: ''};
     }
 
     /**

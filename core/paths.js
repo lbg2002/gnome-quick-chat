@@ -305,18 +305,78 @@ export function writePrivateFileAsync(filePath, bytes, cancellable = null) {
 }
 
 /**
- * Reads a regular file asynchronously with a strict byte ceiling (`maxBytes`) before loading contents,
- * preventing abnormally large files from blocking the GJS main thread.
- * Returns `{exists: boolean, tooLarge: boolean, bytes: Uint8Array | null}`.
+ * Reads a regular file asynchronously in fixed-size chunks (`16 KiB`) up to `maxBytes + 1`,
+ * preventing non-regular files (FIFOs, character/block devices, sockets, directories) or files
+ * that grow after `stat()` from exhausting GNOME Shell memory or blocking on an endless stream (Stage R5).
+ *
+ * Returns `{exists, tooLarge, nonRegular, cancelled, permissionDenied, grewDuringRead, bytes, error}`.
  */
 export function readFileBytesBoundedAsync(filePath, maxBytes = 4 * 1024 * 1024, cancellable = null) {
     if (!filePath) {
-        return Promise.resolve({exists: false, tooLarge: false, bytes: null});
+        return Promise.resolve({
+            exists: false,
+            tooLarge: false,
+            nonRegular: false,
+            cancelled: false,
+            permissionDenied: false,
+            bytes: null,
+            error: '文件路径为空',
+        });
     }
+    if (cancellable?.is_cancelled?.()) {
+        return Promise.resolve({
+            exists: false,
+            tooLarge: false,
+            nonRegular: false,
+            cancelled: true,
+            permissionDenied: false,
+            bytes: null,
+            error: '读取已取消',
+        });
+    }
+
+    const classifyGioError = err => {
+        if (cancellable?.is_cancelled?.() || /cancelled|canceled/i.test(String(err?.message || ''))) {
+            return {
+                exists: false,
+                tooLarge: false,
+                nonRegular: false,
+                cancelled: true,
+                permissionDenied: false,
+                bytes: null,
+                error: '读取已取消',
+            };
+        }
+        const msg = String(err?.message || err || '');
+        if (/eacces|eperm|permission denied|权限/i.test(msg) || err?.code === 'EACCES' || err?.code === 'EPERM') {
+            return {
+                exists: true,
+                tooLarge: false,
+                nonRegular: false,
+                cancelled: false,
+                permissionDenied: true,
+                bytes: null,
+                error: '文件权限不足',
+            };
+        }
+        return {
+            exists: false,
+            tooLarge: false,
+            nonRegular: false,
+            cancelled: false,
+            permissionDenied: false,
+            bytes: null,
+            error: msg || '读取文件失败',
+        };
+    };
+
+    const effectiveMaxBytes = maxBytes > 0 ? Number(maxBytes) : 4 * 1024 * 1024;
+    const chunkSize = Math.max(512, Math.min(16 * 1024, effectiveMaxBytes + 1));
     const gfile = Gio.File.new_for_path(filePath);
+
     return new Promise(resolve => {
         gfile.query_info_async(
-            'standard::type,standard::size',
+            'standard::type,standard::size,unix::mode',
             Gio.FileQueryInfoFlags.NONE,
             GLib.PRIORITY_DEFAULT,
             cancellable,
@@ -324,35 +384,161 @@ export function readFileBytesBoundedAsync(filePath, maxBytes = 4 * 1024 * 1024, 
                 let info = null;
                 try {
                     info = f.query_info_finish(infoRes);
-                } catch (_) {
-                    resolve({exists: false, tooLarge: false, bytes: null});
+                } catch (err) {
+                    resolve(classifyGioError(err));
                     return;
                 }
-                if (!info || info.get_file_type() === Gio.FileType.DIRECTORY) {
-                    resolve({exists: false, tooLarge: false, bytes: null});
+                if (!info) {
+                    resolve({
+                        exists: false,
+                        tooLarge: false,
+                        nonRegular: false,
+                        cancelled: false,
+                        permissionDenied: false,
+                        bytes: null,
+                        error: '文件不存在',
+                    });
                     return;
                 }
-                const size = Number(info.get_size?.() || 0);
-                if (maxBytes > 0 && size > maxBytes) {
-                    resolve({exists: true, tooLarge: true, bytes: null});
+
+                const fileType = info.get_file_type?.();
+                let unixMode = 0;
+                try {
+                    unixMode = Number(info.get_attribute_uint32?.('unix::mode') || 0);
+                } catch (_) {}
+                const modeTypeBits = unixMode & 0o170000;
+                const isNonRegularByMode = modeTypeBits !== 0 && modeTypeBits !== 0o100000;
+                if (fileType !== Gio.FileType.REGULAR || isNonRegularByMode) {
+                    resolve({
+                        exists: true,
+                        tooLarge: false,
+                        nonRegular: true,
+                        cancelled: false,
+                        permissionDenied: false,
+                        fileType,
+                        bytes: null,
+                        error: '拒绝读取非普通文件（FIFO、设备、套接字或目录）',
+                    });
                     return;
                 }
-                f.load_contents_async(cancellable, (lf, loadRes) => {
+
+                const initialSize = Number(info.get_size?.() || 0);
+                if (effectiveMaxBytes > 0 && initialSize > effectiveMaxBytes) {
+                    resolve({
+                        exists: true,
+                        tooLarge: true,
+                        nonRegular: false,
+                        cancelled: false,
+                        permissionDenied: false,
+                        bytes: null,
+                        error: `文件超过大小上限（${Math.ceil(initialSize / 1024)} KB > ${Math.ceil(effectiveMaxBytes / 1024)} KB）`,
+                    });
+                    return;
+                }
+
+                f.read_async(GLib.PRIORITY_DEFAULT, cancellable, (rf, openRes) => {
+                    let stream = null;
                     try {
-                        const [ok, raw] = lf.load_contents_finish(loadRes);
-                        if (!ok || !raw) {
-                            resolve({exists: false, tooLarge: false, bytes: null});
-                            return;
-                        }
-                        const data = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-                        if (maxBytes > 0 && data.byteLength > maxBytes) {
-                            resolve({exists: true, tooLarge: true, bytes: null});
-                            return;
-                        }
-                        resolve({exists: true, tooLarge: false, bytes: data});
-                    } catch (_) {
-                        resolve({exists: false, tooLarge: false, bytes: null});
+                        stream = rf.read_finish(openRes);
+                    } catch (err) {
+                        resolve(classifyGioError(err));
+                        return;
                     }
+                    if (!stream) {
+                        resolve({
+                            exists: false,
+                            tooLarge: false,
+                            nonRegular: false,
+                            cancelled: false,
+                            permissionDenied: false,
+                            bytes: null,
+                            error: '打开文件读取流失败',
+                        });
+                        return;
+                    }
+
+                    const chunks = [];
+                    let totalBytes = 0;
+                    let settled = false;
+
+                    const closeAndResolve = payload => {
+                        if (settled) return;
+                        settled = true;
+                        try {
+                            stream.close_async(GLib.PRIORITY_DEFAULT, null, (st, cr) => {
+                                try { st.close_finish(cr); } catch (_) {}
+                            });
+                        } catch (_) {}
+                        resolve(payload);
+                    };
+
+                    const readNextChunk = () => {
+                        if (settled) return;
+                        if (cancellable?.is_cancelled?.()) {
+                            closeAndResolve({
+                                exists: true,
+                                tooLarge: false,
+                                nonRegular: false,
+                                cancelled: true,
+                                permissionDenied: false,
+                                bytes: null,
+                                error: '读取已取消',
+                            });
+                            return;
+                        }
+
+                        const remainingPlusOne = (effectiveMaxBytes - totalBytes) + 1;
+                        const toRead = Math.max(1, Math.min(chunkSize, remainingPlusOne));
+                        stream.read_bytes_async(toRead, GLib.PRIORITY_DEFAULT, cancellable, (s, bytesRes) => {
+                            let gbytes = null;
+                            try {
+                                gbytes = s.read_bytes_finish(bytesRes);
+                            } catch (err) {
+                                closeAndResolve(classifyGioError(err));
+                                return;
+                            }
+                            if (settled) return;
+
+                            const data = gbytes ? gbytes.get_data() : null;
+                            if (!data || data.byteLength === 0) {
+                                const merged = new Uint8Array(totalBytes);
+                                let offset = 0;
+                                for (const c of chunks) {
+                                    merged.set(c, offset);
+                                    offset += c.byteLength;
+                                }
+                                closeAndResolve({
+                                    exists: true,
+                                    tooLarge: false,
+                                    nonRegular: false,
+                                    cancelled: false,
+                                    permissionDenied: false,
+                                    bytes: merged,
+                                });
+                                return;
+                            }
+
+                            const copy = data instanceof Uint8Array ? data : new Uint8Array(data);
+                            totalBytes += copy.byteLength;
+                            if (totalBytes > effectiveMaxBytes) {
+                                closeAndResolve({
+                                    exists: true,
+                                    tooLarge: true,
+                                    grewDuringRead: initialSize <= effectiveMaxBytes,
+                                    nonRegular: false,
+                                    cancelled: false,
+                                    permissionDenied: false,
+                                    bytes: null,
+                                    error: `文件读取过程中超出大小上限（>${Math.ceil(effectiveMaxBytes / 1024)} KB）`,
+                                });
+                                return;
+                            }
+                            chunks.push(copy);
+                            readNextChunk();
+                        });
+                    };
+
+                    readNextChunk();
                 });
             }
         );

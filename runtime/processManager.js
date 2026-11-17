@@ -12,6 +12,7 @@ import {
     CliTurnMonitor,
     DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS,
     DEFAULT_KILL_GRACE_MS,
+    DEFAULT_PIPE_CHUNK_BYTES,
     DEFAULT_POST_EXIT_PIPE_DRAIN_MS,
     buildProcessGroupKillArgv,
     evaluateSubprocessOutcome,
@@ -363,16 +364,16 @@ export function attachApprovalWatchdog({
  */
 export function spawnManagedCliTurn({
     backend,
-    runtime,
-    config,
+    runtime = {},
+    config = {},
     workspace,
     sessionId,
-    specialDirs,
+    specialDirs = {},
     turns,
     turn,
-    store,
+    store = null,
     approvedScopes = null,
-    getSessionContextConfig,
+    getSessionContextConfig = () => ({}),
     isDisposedFn = () => false,
     rawArgv,
     turnExtraEnv = {},
@@ -383,6 +384,7 @@ export function spawnManagedCliTurn({
     modeNotice = '',
     effectiveMode = 'readonly',
     timeouts = null,
+    streamLimits = null,
 }) {
     const launcher = new Gio.SubprocessLauncher({
         flags:
@@ -479,14 +481,22 @@ export function spawnManagedCliTurn({
         try { stdinPipe.close(null); } catch (_) {}
     }
 
-    const stdout = new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()});
-    const stderr = new Gio.DataInputStream({base_stream: proc.get_stderr_pipe()});
+    const stdoutStream = proc.get_stdout_pipe();
+    const stderrStream = proc.get_stderr_pipe();
 
     const monitor = new CliTurnMonitor({
         turnId: turn.id,
         backend,
         requireBridgeHandshake,
+        limits: streamLimits || {},
     });
+    const pipeChunkBytes = Math.max(
+        1024,
+        Math.min(
+            DEFAULT_PIPE_CHUNK_BYTES,
+            Number(monitor.limits?.maxLineBytes || DEFAULT_PIPE_CHUNK_BYTES)
+        )
+    );
 
     let handshakeTimerId = 0;
     const clearHandshakeTimer = () => {
@@ -504,8 +514,8 @@ export function spawnManagedCliTurn({
         }
     };
 
-    let stdoutDone = false;
-    let stderrDone = false;
+    let stdoutDone = !stdoutStream;
+    let stderrDone = !stderrStream;
     let processExited = false;
     let leakedChildPipeDetected = false;
     let exitCode = null;
@@ -516,8 +526,12 @@ export function spawnManagedCliTurn({
     const closeIoPipes = () => {
         if (streamsClosed) return;
         streamsClosed = true;
-        try { stdout.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => { try { s.close_finish(r); } catch (_) {} }); } catch (_) {}
-        try { stderr.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => { try { s.close_finish(r); } catch (_) {} }); } catch (_) {}
+        if (stdoutStream) {
+            try { stdoutStream.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => { try { s.close_finish(r); } catch (_) {} }); } catch (_) {}
+        }
+        if (stderrStream) {
+            try { stderrStream.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => { try { s.close_finish(r); } catch (_) {} }); } catch (_) {}
+        }
         if (turn.stdin) {
             const st = turn.stdin;
             turn.stdin = null;
@@ -664,27 +678,36 @@ export function spawnManagedCliTurn({
     });
 
     const readStderrLoop = () => {
-        if (isDisposedFn() || turn.aborted || turn.timedOut) {
+        if (!stderrStream || isDisposedFn() || turn.aborted || turn.timedOut) {
             stderrDone = true;
             trySettleWhenComplete();
             return;
         }
-        stderr.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (src, res) => {
-            let line = null;
+        stderrStream.read_bytes_async(pipeChunkBytes, GLib.PRIORITY_DEFAULT, turn.cancellable, (src, res) => {
+            let gbytes = null;
             try {
-                [line] = src.read_line_finish_utf8(res);
+                gbytes = src.read_bytes_finish(res);
             } catch (_) {
                 stderrDone = true;
                 trySettleWhenComplete();
                 return;
             }
-            if (isDisposedFn() || turn.aborted || turn.timedOut || line === null) {
+            if (isDisposedFn() || turn.aborted || turn.timedOut) {
+                stderrDone = true;
+                trySettleWhenComplete();
+                return;
+            }
+            const chunk = gbytes ? gbytes.get_data() : null;
+            if (!chunk || chunk.byteLength === 0) {
+                if (turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+                    monitor.flushStderr(turn.id);
+                }
                 stderrDone = true;
                 trySettleWhenComplete();
                 return;
             }
             if (turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
-                monitor.pushStderrLine(turn.id, line);
+                monitor.pushStderrChunk(turn.id, chunk);
             }
             readStderrLoop();
         });
@@ -736,17 +759,125 @@ export function spawnManagedCliTurn({
         }
     };
 
+    const applyCheckedStdoutResults = results => {
+        for (const checked of results) {
+            if (checked.fatalError) {
+                abortTurnForFatalMonitorError();
+                return false;
+            }
+            if (monitor.isHandshakeVerified) {
+                clearHandshakeTimer();
+            }
+
+            const norm = checked.normalized;
+            if (!norm) continue;
+
+            const segCfg = getSessionContextConfig();
+            if (norm.type === 'bridge_ready') {
+                turns.emitForTurn(turn, norm);
+            } else if (norm.type === 'permission_request') {
+                if (norm.requestId && !seenPermissionIds.has(norm.requestId)) {
+                    seenPermissionIds.add(norm.requestId);
+                    turns.enterApproval(turn, norm.requestId, norm);
+                    turns.emitForTurn(turn, norm);
+                }
+            } else if (norm.type === 'permission_resolved') {
+                if (norm.requestId) {
+                    if (typeof turns.resolveApprovalFromBridge === 'function') {
+                        turns.resolveApprovalFromBridge(turn, norm, {approvedScopes});
+                    } else {
+                        turns.leaveApproval(turn, norm.requestId);
+                    }
+                }
+                turns.emitForTurn(turn, norm);
+            } else if (norm.type === 'permission_response_rejected') {
+                if (norm.requestId && typeof turns.rejectApprovalResponseFromBridge === 'function') {
+                    turns.rejectApprovalResponseFromBridge(turn, norm);
+                }
+                turns.emitForTurn(turn, norm);
+            } else if (norm.type === 'tool_execution_start') {
+                activeRunningTools++;
+                syncCliToolTimeoutPhase();
+                turns.emitForTurn(turn, norm);
+            } else if (norm.type === 'tool_execution_end') {
+                activeRunningTools = Math.max(0, activeRunningTools - 1);
+                syncCliToolTimeoutPhase();
+                turns.emitForTurn(turn, norm);
+            } else if (norm.type === 'tool_batch_end') {
+                activeRunningTools = 0;
+                syncCliToolTimeoutPhase();
+                turns.emitForTurn(turn, norm);
+            } else if (norm.type === 'session_bound' && norm.sessionId) {
+                turn.boundRemoteSessionId = norm.sessionId;
+                store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
+            } else if (norm.type === 'turn_completed') {
+                turn.sawDoneMarker = true;
+            } else if (norm.type === 'turn_result') {
+                if (norm.sessionId) {
+                    turn.boundRemoteSessionId = norm.sessionId;
+                    store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
+                }
+                if (norm.isError) {
+                    turn.error = norm.errorMessage || `${backend.toUpperCase()} 执行返回错误`;
+                } else {
+                    turn.sawDoneMarker = true;
+                    if (norm.text && !turn.text) {
+                        turns.replaceText(turn, norm.text, norm.segmentId || '');
+                    }
+                }
+            } else if (norm.type === 'text_snapshot') {
+                turns.replaceText(turn, norm.text, norm.segmentId || '');
+            } else if (norm.type === 'thinking_snapshot') {
+                turns.replaceThinking(turn, norm.text, norm.segmentId || '');
+            } else if (norm.type === 'message_update') {
+                if (norm.sessionId) {
+                    turn.boundRemoteSessionId = norm.sessionId;
+                    store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
+                }
+                const ev = norm.assistantMessageEvent;
+                if (ev?.type === 'text_delta') {
+                    turns.appendText(turn, ev.delta || '', norm.segmentId || '');
+                } else if (ev?.type === 'thinking_delta') {
+                    turns.appendThinking(turn, ev.delta || '', norm.segmentId || '');
+                } else {
+                    turns.emitForTurn(turn, norm);
+                }
+            } else if (norm.type === 'message_end' && norm.message) {
+                if (norm.sessionId) {
+                    turn.boundRemoteSessionId = norm.sessionId;
+                    store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
+                }
+                if (typeof norm.message.content === 'string' && norm.message.content) {
+                    turns.replaceText(turn, norm.message.content, norm.segmentId || norm.message.id || '');
+                }
+                if (norm.message.errorMessage) {
+                    turn.error = norm.message.errorMessage;
+                }
+            } else {
+                if (norm.sessionId) {
+                    turn.boundRemoteSessionId = norm.sessionId;
+                    store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
+                }
+                if (norm.type === 'message_start' && norm.modelId) {
+                    turn.modelId = norm.modelId;
+                }
+                turns.emitForTurn(turn, norm);
+            }
+        }
+        return true;
+    };
+
     const readStdoutLoop = () => {
-        if (isDisposedFn() || !turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
+        if (!stdoutStream || isDisposedFn() || !turns.matchesIdentity(turn, {turnId: turn.id, clientGeneration: turn.clientGeneration})) {
             stdoutDone = true;
             trySettleWhenComplete();
             return;
         }
-        stdout.read_line_async(GLib.PRIORITY_DEFAULT, turn.cancellable, (stream, res) => {
-            let line = null;
+        stdoutStream.read_bytes_async(pipeChunkBytes, GLib.PRIORITY_DEFAULT, turn.cancellable, (stream, res) => {
+            let gbytes = null;
             let readErr = null;
             try {
-                [line] = stream.read_line_finish_utf8(res);
+                gbytes = stream.read_bytes_finish(res);
             } catch (err) {
                 readErr = err;
             }
@@ -764,7 +895,18 @@ export function spawnManagedCliTurn({
                 return;
             }
             try {
-                if (line === null) {
+                const chunk = gbytes ? gbytes.get_data() : null;
+                if (!chunk || chunk.byteLength === 0) {
+                    const flushed = monitor.flushStdout(turn.id);
+                    if (flushed.results.length > 0) {
+                        if (!applyCheckedStdoutResults(flushed.results)) {
+                            return;
+                        }
+                    }
+                    if (flushed.fatalError) {
+                        abortTurnForFatalMonitorError();
+                        return;
+                    }
                     stdoutDone = true;
                     trySettleWhenComplete();
                     return;
@@ -773,108 +915,15 @@ export function spawnManagedCliTurn({
                     turn.resetWatchdog?.();
                 }
 
-                const checked = monitor.processStdoutLine(turn.id, line);
-                if (checked.fatalError) {
+                const chunkRes = monitor.pushStdoutChunk(turn.id, chunk);
+                if (chunkRes.results.length > 0) {
+                    if (!applyCheckedStdoutResults(chunkRes.results)) {
+                        return;
+                    }
+                }
+                if (chunkRes.fatalError) {
                     abortTurnForFatalMonitorError();
                     return;
-                }
-                if (monitor.isHandshakeVerified) {
-                    clearHandshakeTimer();
-                }
-
-                const norm = checked.normalized;
-                if (norm) {
-                    const segCfg = getSessionContextConfig();
-                    if (norm.type === 'bridge_ready') {
-                        turns.emitForTurn(turn, norm);
-                    } else if (norm.type === 'permission_request') {
-                        if (norm.requestId && !seenPermissionIds.has(norm.requestId)) {
-                            seenPermissionIds.add(norm.requestId);
-                            turns.enterApproval(turn, norm.requestId, norm);
-                            turns.emitForTurn(turn, norm);
-                        }
-                    } else if (norm.type === 'permission_resolved') {
-                        if (norm.requestId) {
-                            if (typeof turns.resolveApprovalFromBridge === 'function') {
-                                turns.resolveApprovalFromBridge(turn, norm, {approvedScopes});
-                            } else {
-                                turns.leaveApproval(turn, norm.requestId);
-                            }
-                        }
-                        turns.emitForTurn(turn, norm);
-                    } else if (norm.type === 'permission_response_rejected') {
-                        if (norm.requestId && typeof turns.rejectApprovalResponseFromBridge === 'function') {
-                            turns.rejectApprovalResponseFromBridge(turn, norm);
-                        }
-                        turns.emitForTurn(turn, norm);
-                    } else if (norm.type === 'tool_execution_start') {
-                        activeRunningTools++;
-                        syncCliToolTimeoutPhase();
-                        turns.emitForTurn(turn, norm);
-                    } else if (norm.type === 'tool_execution_end') {
-                        activeRunningTools = Math.max(0, activeRunningTools - 1);
-                        syncCliToolTimeoutPhase();
-                        turns.emitForTurn(turn, norm);
-                    } else if (norm.type === 'tool_batch_end') {
-                        activeRunningTools = 0;
-                        syncCliToolTimeoutPhase();
-                        turns.emitForTurn(turn, norm);
-                    } else if (norm.type === 'session_bound' && norm.sessionId) {
-                        turn.boundRemoteSessionId = norm.sessionId;
-                        store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
-                    } else if (norm.type === 'turn_completed') {
-                        turn.sawDoneMarker = true;
-                    } else if (norm.type === 'turn_result') {
-                        if (norm.sessionId) {
-                            turn.boundRemoteSessionId = norm.sessionId;
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
-                        }
-                        if (norm.isError) {
-                            turn.error = norm.errorMessage || `${backend.toUpperCase()} 执行返回错误`;
-                        } else {
-                            turn.sawDoneMarker = true;
-                            if (norm.text && !turn.text) {
-                                turns.replaceText(turn, norm.text, norm.segmentId || '');
-                            }
-                        }
-                    } else if (norm.type === 'text_snapshot') {
-                        turns.replaceText(turn, norm.text, norm.segmentId || '');
-                    } else if (norm.type === 'thinking_snapshot') {
-                        turns.replaceThinking(turn, norm.text, norm.segmentId || '');
-                    } else if (norm.type === 'message_update') {
-                        if (norm.sessionId) {
-                            turn.boundRemoteSessionId = norm.sessionId;
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
-                        }
-                        const ev = norm.assistantMessageEvent;
-                        if (ev?.type === 'text_delta') {
-                            turns.appendText(turn, ev.delta || '', norm.segmentId || '');
-                        } else if (ev?.type === 'thinking_delta') {
-                            turns.appendThinking(turn, ev.delta || '', norm.segmentId || '');
-                        } else {
-                            turns.emitForTurn(turn, norm);
-                        }
-                    } else if (norm.type === 'message_end' && norm.message) {
-                        if (norm.sessionId) {
-                            turn.boundRemoteSessionId = norm.sessionId;
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
-                        }
-                        if (typeof norm.message.content === 'string' && norm.message.content) {
-                            turns.replaceText(turn, norm.message.content, norm.segmentId || norm.message.id || '');
-                        }
-                        if (norm.message.errorMessage) {
-                            turn.error = norm.message.errorMessage;
-                        }
-                    } else {
-                        if (norm.sessionId) {
-                            turn.boundRemoteSessionId = norm.sessionId;
-                            store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
-                        }
-                        if (norm.type === 'message_start' && norm.modelId) {
-                            turn.modelId = norm.modelId;
-                        }
-                        turns.emitForTurn(turn, norm);
-                    }
                 }
                 readStdoutLoop();
             } catch (err) {

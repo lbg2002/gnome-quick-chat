@@ -15,7 +15,48 @@ export const UI_BUFFER_CAPS = Object.freeze({
     maxToolDetailDisplayBytes: 16 * 1024, // 16 KiB in tool drawer unless expanded
     maxCardStreamingBytes: 96 * 1024, // 96 KiB in live card body during streaming unless expanded
     maxInMemoryFieldChars: 512 * 1024, // 512K chars safety ceiling against runaway infinite output
+    maxSingleMessageDataBytes: 128 * 1024, // 128 KiB per message record in HistoryWindowController data layer
+    maxHistoryDataBytes: 2 * 1024 * 1024, // 2 MiB cumulative data-layer budget for HistoryWindowController.allMessages
 });
+
+const UTF8_DECODER = new TextDecoder('utf-8', {fatal: false});
+
+function estimateMessageDataBytes(msg) {
+    if (!msg || typeof msg !== 'object') return 0;
+    let total = 64;
+    if (typeof msg.text === 'string' && msg.text) {
+        total += UTF8_ENCODER.encode(msg.text).byteLength;
+    }
+    if (typeof msg.displayText === 'string' && msg.displayText && msg.displayText !== msg.text) {
+        total += UTF8_ENCODER.encode(msg.displayText).byteLength;
+    }
+    if (typeof msg.thinking === 'string' && msg.thinking) {
+        total += UTF8_ENCODER.encode(msg.thinking).byteLength;
+    }
+    return total;
+}
+
+function capMessageRecordBytes(msg, maxFieldBytes) {
+    if (!msg || typeof msg !== 'object') return msg;
+    let cloned = null;
+    for (const key of ['text', 'displayText', 'thinking']) {
+        if (typeof msg[key] === 'string' && msg[key].length > 0) {
+            const encoded = UTF8_ENCODER.encode(msg[key]);
+            if (encoded.byteLength > maxFieldBytes) {
+                if (!cloned) cloned = {...msg};
+                const suffix = '\n… [历史数据层已按内存上限截断]';
+                const suffixBytes = UTF8_ENCODER.encode(suffix);
+                let endIdx = Math.max(0, Math.min(encoded.byteLength, maxFieldBytes - suffixBytes.byteLength));
+                while (endIdx > 0 && (encoded[endIdx] & 0xc0) === 0x80) {
+                    endIdx--;
+                }
+                cloned[key] = `${UTF8_DECODER.decode(encoded.subarray(0, endIdx))}${suffix}`;
+                cloned.dataBudgetTruncated = true;
+            }
+        }
+    }
+    return cloned || msg;
+}
 
 const BACKEND_FALLBACK_LABELS = Object.freeze({
     zcode: 'ZCode',
@@ -233,15 +274,27 @@ export class HistoryWindowController {
         initialPageSize = DEFAULT_INITIAL_HISTORY_COUNT,
         pageSize = DEFAULT_HISTORY_PAGE_SIZE,
         maxMountedActors = DEFAULT_MAX_MOUNTED_ACTORS,
+        maxSingleMessageDataBytes = UI_BUFFER_CAPS.maxSingleMessageDataBytes,
+        maxHistoryDataBytes = UI_BUFFER_CAPS.maxHistoryDataBytes,
     } = {}) {
         this._initialPageSize = Math.max(2, Number(initialPageSize) || DEFAULT_INITIAL_HISTORY_COUNT);
         this._pageSize = Math.max(2, Number(pageSize) || DEFAULT_HISTORY_PAGE_SIZE);
         this._maxMounted = Math.max(this._initialPageSize, Number(maxMountedActors) || DEFAULT_MAX_MOUNTED_ACTORS);
+        this._maxSingleMessageDataBytes = Math.max(
+            1024,
+            Number(maxSingleMessageDataBytes) || UI_BUFFER_CAPS.maxSingleMessageDataBytes
+        );
+        this._maxHistoryDataBytes = Math.max(
+            4096,
+            Number(maxHistoryDataBytes) || UI_BUFFER_CAPS.maxHistoryDataBytes
+        );
 
         this.allMessages = [];
         this.mountedCards = [];
         this.windowStart = 0;
         this.windowEnd = 0;
+        this.totalDataBytes = 0;
+        this.compactedCount = 0;
     }
 
     get hasOlder() {
@@ -260,19 +313,75 @@ export class HistoryWindowController {
         return Math.max(0, this.allMessages.length - this.windowEnd);
     }
 
+    _enforceDataBudget() {
+        let total = 0;
+        for (let i = 0; i < this.allMessages.length; i++) {
+            this.allMessages[i] = capMessageRecordBytes(this.allMessages[i], this._maxSingleMessageDataBytes);
+            total += estimateMessageDataBytes(this.allMessages[i]);
+        }
+
+        if (total > this._maxHistoryDataBytes) {
+            const compactPreviewBytes = Math.min(2048, Math.max(256, Math.floor(this._maxSingleMessageDataBytes / 8)));
+            // Pass 1: compact off-window older messages first (indices < windowStart)
+            for (let i = 0; i < this.windowStart && total > this._maxHistoryDataBytes; i++) {
+                const msg = this.allMessages[i];
+                if (!msg || msg.compactedInDataLayer) continue;
+                const beforeBytes = estimateMessageDataBytes(msg);
+                const compacted = capMessageRecordBytes(msg, compactPreviewBytes);
+                if (compacted !== msg) {
+                    compacted.compactedInDataLayer = true;
+                    this.allMessages[i] = compacted;
+                    const afterBytes = estimateMessageDataBytes(compacted);
+                    total -= Math.max(0, beforeBytes - afterBytes);
+                    this.compactedCount++;
+                }
+            }
+            // Pass 2: if still exceeding budget, compact older messages from index 0 up to allMessages.length - 2
+            for (let i = 0; i < this.allMessages.length - 2 && total > this._maxHistoryDataBytes; i++) {
+                const msg = this.allMessages[i];
+                if (!msg || msg.compactedInDataLayer) continue;
+                const beforeBytes = estimateMessageDataBytes(msg);
+                const compacted = capMessageRecordBytes(msg, compactPreviewBytes);
+                if (compacted !== msg) {
+                    compacted.compactedInDataLayer = true;
+                    this.allMessages[i] = compacted;
+                    const afterBytes = estimateMessageDataBytes(compacted);
+                    total -= Math.max(0, beforeBytes - afterBytes);
+                    this.compactedCount++;
+                }
+            }
+            // Pass 3: if still exceeding budget and there are unmounted older entries before windowStart, drop oldest unmounted entries
+            while (this.windowStart > 0 && total > this._maxHistoryDataBytes && this.allMessages.length > this._maxMounted) {
+                const removed = this.allMessages.shift();
+                total -= estimateMessageDataBytes(removed);
+                this.windowStart = Math.max(0, this.windowStart - 1);
+                this.windowEnd = Math.max(this.windowStart, this.windowEnd - 1);
+                this.compactedCount++;
+            }
+        }
+
+        this.totalDataBytes = Math.max(0, total);
+    }
+
     clear() {
         this.allMessages = [];
         this.mountedCards = [];
         this.windowStart = 0;
         this.windowEnd = 0;
+        this.totalDataBytes = 0;
+        this.compactedCount = 0;
     }
 
     reset(allDetailedMessages = []) {
-        this.allMessages = Array.isArray(allDetailedMessages) ? [...allDetailedMessages] : [];
+        this.allMessages = Array.isArray(allDetailedMessages)
+            ? allDetailedMessages.map(m => capMessageRecordBytes(m, this._maxSingleMessageDataBytes))
+            : [];
         this.mountedCards = [];
         const total = this.allMessages.length;
         this.windowStart = Math.max(0, total - this._initialPageSize);
         this.windowEnd = total;
+        this.compactedCount = 0;
+        this._enforceDataBudget();
         return {
             initialSlice: this.allMessages.slice(this.windowStart, this.windowEnd),
             windowStart: this.windowStart,
@@ -337,9 +446,11 @@ export class HistoryWindowController {
     appendRuntimeCard(msgRecord, card, {allowRecycleTop = true, protectedCard = null} = {}) {
         // If user had paged way up (`hasNewer === true`), snap back to tail window first or append to data only
         const wasAtTail = !this.hasNewer;
-        this.allMessages.push(msgRecord);
+        const cappedRecord = capMessageRecordBytes(msgRecord, this._maxSingleMessageDataBytes);
+        this.allMessages.push(cappedRecord);
 
         if (!wasAtTail) {
+            this._enforceDataBudget();
             return {mountedAtTail: false, evictedTopCards: []};
         }
 
@@ -359,6 +470,8 @@ export class HistoryWindowController {
             }
         }
 
+        this._enforceDataBudget();
+
         return {
             mountedAtTail: true,
             evictedTopCards,
@@ -369,7 +482,11 @@ export class HistoryWindowController {
         if (!messageId || !patch) return false;
         for (let i = this.allMessages.length - 1; i >= 0; i--) {
             if (this.allMessages[i]?.id === messageId) {
-                this.allMessages[i] = {...this.allMessages[i], ...patch};
+                this.allMessages[i] = capMessageRecordBytes(
+                    {...this.allMessages[i], ...patch},
+                    this._maxSingleMessageDataBytes
+                );
+                this._enforceDataBudget();
                 return true;
             }
         }

@@ -18,7 +18,10 @@ import {
     peekCachedBackendCatalog,
 } from './core/backendDetect.js';
 import {BackendRegistry} from './core/backendRegistry.js';
-import {attachCrossOriginRedirectGuard} from './backendClient.js';
+import {
+    attachCrossOriginRedirectGuard,
+    readSoupResponseBytesBoundedAsync,
+} from './backendClient.js';
 import {
     SecretWriteQueue,
     clearOpenAIApiKey,
@@ -1619,21 +1622,18 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 msg.get_request_headers().append('Authorization', `Bearer ${targetApiKey}`);
             }
 
-            session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, reqCancellable, (sess, res) => {
-                if (
-                    reqGen !== modelsRefreshGeneration ||
-                    configGenSnapshot !== registry.generation ||
-                    ((eff === 'openai' || eff === 'unconfigured') &&
-                        normalizeEndpointKeyIdentity(getStr('openai-base-url', '').trim()) !== targetEndpointSlot)
-                ) {
-                    return;
-                }
-                refreshBtn.sensitive = true;
-                refreshBtnContent.label = '查询 / 刷新模型';
-                try {
-                    const bytes = sess.send_and_read_finish(res);
-                    const rawData = bytes?.get_data?.() || new Uint8Array(0);
-                    const status = msg.get_status();
+            readSoupResponseBytesBoundedAsync(session, msg, {cancellable: reqCancellable}).then(
+                ({status, bytes: rawData}) => {
+                    if (
+                        reqGen !== modelsRefreshGeneration ||
+                        configGenSnapshot !== registry.generation ||
+                        ((eff === 'openai' || eff === 'unconfigured') &&
+                            normalizeEndpointKeyIdentity(getStr('openai-base-url', '').trim()) !== targetEndpointSlot)
+                    ) {
+                        return;
+                    }
+                    refreshBtn.sensitive = true;
+                    refreshBtnContent.label = '查询 / 刷新模型';
                     const preferred = eff === 'openai' || eff === 'unconfigured'
                         ? getStr('openai-model', '').trim()
                         : getActiveModel(eff);
@@ -1663,15 +1663,26 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                         rebuildModelDropdown();
                         catalogGroup.description = `✓ 已合并本地配置与 ${targetProviderObj?.name || ''} 在线查询结果（共 ${ids.length} 个在线模型）`;
                     }
-                } catch (err) {
-                    if (reqCancellable.is_cancelled()) return;
+                },
+                err => {
+                    if (
+                        reqGen !== modelsRefreshGeneration ||
+                        configGenSnapshot !== registry.generation ||
+                        reqCancellable.is_cancelled() ||
+                        ((eff === 'openai' || eff === 'unconfigured') &&
+                            normalizeEndpointKeyIdentity(getStr('openai-base-url', '').trim()) !== targetEndpointSlot)
+                    ) {
+                        return;
+                    }
+                    refreshBtn.sensitive = true;
+                    refreshBtnContent.label = '查询 / 刷新模型';
                     const cleanErr = redactSensitiveText(err?.message || String(err), {
                         apiKey: targetApiKey,
                         maxChars: 200,
                     });
                     rebuildProviderAndModelUi(`⚠️ 在线查询未成功（${cleanErr}），已保留现有配置`, true);
                 }
-            });
+            );
         });
 
         rebuildProviderAndModelUi();
