@@ -569,6 +569,11 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
     // working CLI builds to be misdiagnosed as incompatible. Pass required
     // flags and let the real CLI parser give the authoritative error instead.
     // Never omit --mode: without it ZCode's --prompt defaults to YOLO.
+    // The legacy no-tool chat mode must fail closed unless disallowed-tools
+    // was actually confirmed; this is independent of plan/build compatibility.
+    if (mode === 'chat' && cliCaps?.probed && !cliCaps.supportsDisallowedTools) {
+        throw new Error('当前 ZCode CLI 帮助信息未确认 --disallowed-tools，无法强制纯问答无工具模式；请使用只读 Plan 或 OpenAI API');
+    }
 
     const effectiveCwd = String(workspace || config?.resolvedWorkspace || '').trim();
     const prefix = Array.isArray(config?.commandPrefix) && config.commandPrefix.length
