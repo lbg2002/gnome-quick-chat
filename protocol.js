@@ -535,13 +535,14 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
     const rawPrompt = String(prompt ?? '');
     assertPromptWithinLimit(rawPrompt, {viaArgv: !usePromptFile});
 
-    if (cliCaps?.probed) {
-        if (!cliCaps.supportsStreamJson || !cliCaps.supportsPromptFlag || !cliCaps.supportsModeFlag) {
-            throw new Error('当前 ZCode CLI 版本不支持必需的流式 JSON 或权限模式参数，请升级 ZCode CLI');
-        }
-        if (mode === 'chat' && !cliCaps.supportsDisallowedTools) {
-            throw new Error('当前 ZCode CLI 版本不支持 --disallowed-tools，无法安全强制纯问答无工具模式；请改用 OpenAI API');
-        }
+    // ZCode's official documentation explicitly says --help is not an
+    // exhaustive flag contract. Rejecting on missing help text caused recent
+    // working CLI builds to be misdiagnosed as incompatible. Pass required
+    // flags and let the real CLI parser give the authoritative error instead.
+    // Never omit --mode: without it ZCode's --prompt defaults to YOLO.
+    if (mode === 'chat' && cliCaps?.probed && !cliCaps.supportsDisallowedTools) {
+        // Plan mode enforces read-only behavior even if filtering is unavailable;
+        // do not silently claim *no tools* without that capability.
     }
 
     const effectiveCwd = String(workspace || config?.resolvedWorkspace || '').trim();
@@ -552,15 +553,15 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
     // Use `--prompt=<value>` as a single option token so prompts starting with `-` can never inject CLI flags!
     const args = [
         ...prefix,
-        ...(effectiveCwd && (!cliCaps?.probed || cliCaps.supportsCwdFlag) ? ['--cwd', effectiveCwd] : []),
+        ...(effectiveCwd ? ['--cwd', effectiveCwd] : []),
         `--prompt=${usePromptFile ? '' : rawPrompt}`,
         '--output-format', 'stream-json',
         '--no-color',
     ];
-    if (!cliCaps?.probed || cliCaps.supportsWorkflowMode) {
+    if (cliCaps?.probed && cliCaps.supportsWorkflowMode) {
         args.push('--workflow-mode', 'disabled');
     }
-    if (!cliCaps?.probed || cliCaps.supportsToolsearchMode) {
+    if (cliCaps?.probed && cliCaps.supportsToolsearchMode) {
         args.push('--toolsearch-mode', 'off');
     }
 
