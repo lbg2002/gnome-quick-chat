@@ -151,13 +151,13 @@ export function getBackendCapabilities(backend, cliCaps = null) {
                 supportsMcp: true,
                 supportedModes: supportsPureChat ? ['chat', 'readonly', 'smart', 'full'] : ['readonly', 'smart', 'full'],
                 pureChatRecommendation: 'Codex CLI 无真实禁用工具参数，已切换为只读沙箱 Agent；如需真正无工具纯问答请使用 OpenAI API。',
+                // The preferences ComboRow indexes ['readonly','smart','full'].
+                // Never inject an extra legacy 'chat' label here: doing so
+                // incorrectly presents a full-power selection as 'smart'.
                 modeLabels: [
-                    supportsPureChat
-                        ? '纯问答 (禁用 CLI 工具)'
-                        : '只读沙箱 Agent (Codex 无纯问答开关 · 纯问答推荐 OpenAI API)',
-                    '只读沙箱（禁止修改文件）',
-                    '智能（非交互 Codex 不支持审批回传，安全降级为只读）',
-                    '完全权限（不经随问审批，允许修改与删除）',
+                    '只读沙箱（只允许读取文件，禁止修改与删除）',
+                    '智能（Codex exec 无审批回传，安全降级为只读沙箱）',
+                    '完全权限（高风险：不经随问审批，允许写入与删除）',
                 ],
                 modeBadges: {
                     chat: supportsPureChat ? '纯问答' : '只读',
