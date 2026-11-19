@@ -1,6 +1,6 @@
 # AGENTS.md — Quick Chat（随问）开发与复审指南
 
-> **2026-11-19 最新优先事项（优先级高于下文历史 R1–R12 勾选）：** 阅读 [第三轮运行时审查清单](docs/reviews/2026-11-19-runtime-audit.md)，首先实施 QA-01/QA-02。当前代码存在 ChatController 自定义取消对象被传入原生 Gio.Cancellable 参数的生产调用链问题；历史 GJS 启动测试仅直接调用 BackendClient，没有覆盖真正的 ChatController 入口。不得仅凭 CI 通过或旧任务标记已完成而跳过该问题。本轮 QA 清单是**待实施审查报告**，不能把它当成已修复记录。保持 ZCode、Codex、OpenAI 三后端，保留现有用户数据，逐项测试并独立提交。参考基线 f14234fd1a0541eb273ce442880f5dd607ef0acf。
+> **2026-11-19 QA-01–QA-11 已进入实现与验收阶段。** 先读 [原始缺陷清单](docs/reviews/2026-11-19-runtime-audit.md)，再读 [最新实施与验收状态](docs/reviews/2026-11-19-implementation-status.md)。P0 原生 Gio.Cancellable / 控制器全链路连接修复、P1 会话保存/删除/上下文预算/按需探测/安装回滚等已提交并进入 CI 检查。**不要把历史任务的勾选、模拟 CLI 或无头 GJS 通过解释成 GNOME 50 / 真实 ZCode、Codex 已验收。** 尚未实机验证的 QA-05 UI、QA-07–11 保持 blocked/partial；以后每轮从最新 HEAD 校验源码与 CI，再确认实机环境。只保留 ZCode、Codex、OpenAI 三后端，不引入 Pi，也不擅自修改外部 CLI 配置或用户历史。
 
 
 > 当前执行基线：main @ e4e27f53b29803a1bbdfd9c95555c8323b33e1c9（2026-11-15 UTC）。2026-11-16 复审。优先执行本页新增的 R1–R12，不要重新执行下方已经完成的 A–F 大重构。发现最新源码已修复时，补回归验证并说明依据。只保留 ZCode、Codex、OpenAI 三后端；Pi 只允许历史迁移。保持原生 GJS/St/Clutter、中文紧凑界面和彩色轨迹，不新增数据库、Electron、WebView 或常驻服务。
