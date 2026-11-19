@@ -157,9 +157,22 @@ export class ChatController {
         }
         const prevClient = this._client;
         if (prevClient) {
-            try { await prevClient.request('flush_session'); } catch (_) {}
+            try {
+                const flushed = await prevClient.request('flush_session');
+                if (!flushed?.ok || flushed?.hasUnsavedChanges) {
+                    this._onConnectionError(new Error(
+                        `切换后端已暂停：当前会话历史尚未保存。请先重试保存或导出（${flushed?.error || '写入未完成'}）`
+                    ));
+                    return null;
+                }
+            } catch (err) {
+                this._onConnectionError(new Error(
+                    `切换后端已暂停：无法确认会话已保存（${err?.message || err}）`
+                ));
+                return null;
+            }
         }
-        if (this._disposed || this._busy) return null;
+        if (this._disposed || this._busy || this._client !== prevClient) return null;
         this.stopClient();
         if (!canConnect()) return null;
         return this.ensureConnected({canConnect});
