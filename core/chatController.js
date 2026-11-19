@@ -214,6 +214,7 @@ export class ChatController {
         );
 
         const task = (async () => {
+            let connectionPhase = '读取设置与密钥';
             try {
                 const env = await this._loadRuntimeEnvironment({cancellable: connectCancellable});
                 if (isStale()) {
@@ -242,6 +243,7 @@ export class ChatController {
                 );
 
                 this._client = client;
+                connectionPhase = '后端检测与初始化';
                 if (typeof client.startAsync === 'function') {
                     await client.startAsync(config, workspace, sessionsDir, sessionId, {
                         clientGeneration: generation,
@@ -256,12 +258,14 @@ export class ChatController {
                     return null;
                 }
 
+                connectionPhase = '读取后端状态';
                 const state = await client.request('get_state');
                 if (isStale()) {
                     try { client.close?.(); } catch (_) {}
                     if (this._client === client) this._client = null;
                     return null;
                 }
+                connectionPhase = '加载本地会话';
                 const data = await client.request('get_messages');
                 if (isStale()) {
                     try { client.close?.(); } catch (_) {}
@@ -289,7 +293,8 @@ export class ChatController {
             } catch (err) {
                 if (!this._disposed && this._lifecycleGeneration === lifeGen && generation === this._clientGeneration && !connectCancellable.is_cancelled()) {
                     this.stopClient();
-                    this._onConnectionError(err);
+                    const detail = err?.message || String(err || '未知错误');
+                    this._onConnectionError(new Error(`连接阶段「${connectionPhase}」失败：${detail}`));
                 }
                 return null;
             } finally {
