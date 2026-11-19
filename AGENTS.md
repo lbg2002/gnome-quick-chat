@@ -1,5 +1,8 @@
 # AGENTS.md — Quick Chat（随问）开发与复审指南
 
+> **2026-11-19 最新变更，版本 0.3.1：** 此前“只保留三后端”的指令已被用户新需求替代。**当前四后端为 ZCode、Codex、DeepSeek Harness (dsh) 和 OpenAI 兼容 API**；不得恢复 Pi。权限采用「只读 / 智能 / 完全权限」：ZCode 智能需真实 Bridge 审批；Codex exec 与 DSH headless 无可用的随问内审批回传时，智能必须安全降级为只读；绝不可将全文关键词判断当作系统权限边界。修复 ZCode --help 不完整引起的误判、GitHub Releases HTTP 415、用户级更新同目录写入；新增 DSH headless JSONL 适配。具体见 [README](README.md) 和 tests/dshAndPermissionModes.test.js。此处下面的早期三后端描述只保留作历史审计记录，**不再代表当前架构**。尚缺真实 ZCode/Codex/DSH 和 GNOME 50 Wayland 端到端人工验收，不能因自动化 CI 通过即声称实机通过。
+
+
 > **2026-11-19 QA-01–QA-11 已进入实现与验收阶段。** 先读 [原始缺陷清单](docs/reviews/2026-11-19-runtime-audit.md)，再读 [最新实施与验收状态](docs/reviews/2026-11-19-implementation-status.md)。P0 原生 Gio.Cancellable / 控制器全链路连接修复、P1 会话保存/删除/上下文预算/按需探测/安装回滚等已提交并进入 CI 检查。**不要把历史任务的勾选、模拟 CLI 或无头 GJS 通过解释成 GNOME 50 / 真实 ZCode、Codex 已验收。** 尚未实机验证的 QA-05 UI、QA-07–11 保持 blocked/partial；以后每轮从最新 HEAD 校验源码与 CI，再确认实机环境。只保留 ZCode、Codex、OpenAI 三后端，不引入 Pi，也不擅自修改外部 CLI 配置或用户历史。
 
 
