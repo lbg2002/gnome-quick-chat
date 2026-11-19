@@ -472,16 +472,16 @@ let mockHttpProc = null;
         // 5E. Full startup pipeline: detect CLI identity -> async capability probe ->
         // BackendClient.startAsync -> get_state/get_messages (not just direct adapters).
         // This previously had no coverage in the real GJS smoke suite.
-        for (const kind of ['zcode', 'codex']) {
+        for (const kind of ['zcode', 'codex', 'dsh']) {
             const cliFile = GLib.build_filenamev([tmpRoot, kind]);
             const cliStub = [
                 '#!/usr/bin/env node',
-                kind === 'zcode' ? '// @zcode/cli startup fixture' : '// codex-cli startup fixture',
+                kind === 'zcode' ? '// @zcode/cli startup fixture' : kind === 'dsh' ? '// DeepSeek Harness dsh startup fixture' : '// codex-cli startup fixture',
                 "const args = process.argv.slice(2);",
                 "if (args.includes('--version')) {",
-                `  console.log('${kind === 'zcode' ? 'zcode 1.1.0' : 'codex-cli 0.42.0'}');`,
+                `  console.log('${kind === 'zcode' ? 'zcode 1.1.0' : kind === 'dsh' ? 'dsh v0.1.0' : 'codex-cli 0.42.0'}');`,
                 '} else if (args.includes("--help")) {',
-                `  console.log('${kind === 'zcode' ? 'zcode --output-format --prompt --cwd --mode --resume' : 'codex exec --json --sandbox read-only --model'}');`,
+                `  console.log('${kind === 'zcode' ? 'zcode --output-format --prompt --cwd --mode --resume' : kind === 'dsh' ? 'dsh --profile headless --json --permission-mode --session-id' : 'codex exec --json --sandbox read-only --model'}');`,
                 '}',
             ].join('\n') + '\n';
             writeExecutableScriptSync(cliFile, cliStub);
@@ -490,6 +490,7 @@ let mockHttpProc = null;
                 configuredBackend: kind,
                 zcodePath: kind === 'zcode' ? cliFile : '',
                 codexPath: kind === 'codex' ? cliFile : '',
+                dshPath: kind === 'dsh' ? cliFile : '',
             }, {forceRefresh: true});
             assert(detected.available && detected.effectiveBackend === kind, `Real GJS ${kind} CLI identity detection`);
 
@@ -499,6 +500,7 @@ let mockHttpProc = null;
                     backend: kind,
                     zcodePath: kind === 'zcode' ? cliFile : '',
                     codexPath: kind === 'codex' ? cliFile : '',
+                dshPath: kind === 'dsh' ? cliFile : '',
                     mode: 'readonly',
                     workspace: tmpRoot,
                 }, tmpRoot, tmpRoot, `gjs_startup_${kind}`, {clientGeneration: 1});
@@ -530,6 +532,7 @@ let mockHttpProc = null;
                             backend: kind,
                             zcodePath: kind === 'zcode' ? cliFile : '',
                             codexPath: kind === 'codex' ? cliFile : '',
+                dshPath: kind === 'dsh' ? cliFile : '',
                             mode: 'readonly',
                             workspace: tmpRoot,
                         },
