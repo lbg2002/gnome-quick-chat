@@ -60,6 +60,14 @@ import {
     parseModelsResponse,
     redactSensitiveText,
 } from './runtime/sseParser.js';
+import {
+    RELEASE_PAGE,
+} from './core/updateManager.js';
+import {
+    checkGitHubRelease,
+    getInstalledExtensionMode,
+    installUserRelease,
+} from './runtime/releaseUpdater.js';
 
 function makeResetButton(tooltip, onClick) {
     const btn = new Gtk.Button({
@@ -1263,6 +1271,164 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 s.connect('changed::last-diagnostic-json', () => syncDiagnosticsUi())
             );
         }
+
+        // =====================================================================
+        // Page 4: 关于与更新（GitHub Releases，无需自己的服务器）
+        // =====================================================================
+        const aboutPage = new Adw.PreferencesPage({
+            title: '关于与更新',
+            icon_name: 'software-update-available-symbolic',
+        });
+        window.add(aboutPage);
+        const updateGroup = new Adw.PreferencesGroup({
+            title: 'Quick Chat · 随问',
+            description: '更新来自 lbg2002/gnome-quick-chat 的正式 GitHub Releases。仅在点击后检查或下载；不后台轮询。',
+        });
+        aboutPage.add(updateGroup);
+
+        const currentVersion = String(this.metadata?.['version-name'] || this.metadata?.version || '').trim();
+        const versionRow = new Adw.ActionRow({
+            title: '当前安装版本',
+            subtitle: `v${currentVersion} · GNOME Shell 50`,
+        });
+        updateGroup.add(versionRow);
+
+        const mode = getInstalledExtensionMode();
+        const modeLabels = {
+            user: '用户目录安装（可一键安装 ZIP）',
+            system: '系统 DEB 安装（使用软件包管理器升级）',
+            mixed: '检测到用户与系统版本共存（请先排除覆盖冲突）',
+            unknown: '安装路径未确认（只提供发布页面）',
+        };
+        const installRow = new Adw.ActionRow({
+            title: '安装方式',
+            subtitle: modeLabels[mode] || modeLabels.unknown,
+        });
+        updateGroup.add(installRow);
+
+        const updateStatus = new Adw.ActionRow({
+            title: '最新版本',
+            subtitle: '尚未检查（不会自动访问网络）',
+        });
+        updateGroup.add(updateStatus);
+        const checkBtn = new Gtk.Button({
+            label: '检查更新',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['suggested-action'],
+        });
+        updateStatus.add_suffix(checkBtn);
+
+        const installRow = new Adw.ActionRow({
+            title: '下载安装',
+            subtitle: '用户目录版本支持验证 SHA-256 后一键安装；系统 DEB 请从发布页面更新。',
+        });
+        updateGroup.add(installRow);
+        const installBtn = new Gtk.Button({
+            label: '下载并安装 ZIP',
+            valign: Gtk.Align.CENTER,
+            sensitive: false,
+        });
+        installRow.add_suffix(installBtn);
+        installBtn.visible = mode === 'user';
+
+        const releaseRow = new Adw.ActionRow({
+            title: 'GitHub 发布页面',
+            subtitle: '查看版本说明、.deb 与 ZIP 文件、SHA256SUMS',
+        });
+        updateGroup.add(releaseRow);
+        const releaseBtn = new Gtk.Button({
+            label: '查看 Releases',
+            valign: Gtk.Align.CENTER,
+        });
+        releaseRow.add_suffix(releaseBtn);
+        releaseBtn.connect('clicked', () => {
+            try {
+                const launcher = Gtk.UriLauncher.new(RELEASE_PAGE);
+                launcher.launch(window, null, (obj, result) => {
+                    try { obj.launch_finish(result); }
+                    catch (err) { updateStatus.subtitle = `打开浏览器失败：${err.message}`; }
+                });
+            } catch (err) {
+                updateStatus.subtitle = `打开发布页面失败：${err.message}`;
+            }
+        });
+
+        let latestRelease = null;
+        let updating = false;
+        let releaseCancellable = null;
+        window.connect('close-request', () => {
+            try { releaseCancellable?.cancel(); } catch (_) {}
+            return false;
+        });
+        const setUpdateBusy = value => {
+            updating = value;
+            checkBtn.sensitive = !value;
+            installBtn.sensitive = !value && mode === 'user' &&
+                Boolean(latestRelease?.hasUpdate && latestRelease?.zip && latestRelease?.checksum);
+        };
+
+        checkBtn.connect('clicked', async () => {
+            if (updating) return;
+            try { releaseCancellable?.cancel(); } catch (_) {}
+            releaseCancellable = new Gio.Cancellable();
+            setUpdateBusy(true);
+            latestRelease = null;
+            updateStatus.subtitle = '正在检查 GitHub 正式版本…';
+            try {
+                const info = await checkGitHubRelease(currentVersion, {
+                    cancellable: releaseCancellable,
+                });
+                if (releaseCancellable.is_cancelled()) return;
+                latestRelease = info;
+                const availability = info.hasUpdate ? '发现新版本' : '已经是最新正式版';
+                updateStatus.subtitle = `${availability}：v${info.version}`;
+                if (info.hasUpdate && (!info.zip || !info.checksum)) {
+                    updateStatus.subtitle += '（缺少经校验的 ZIP，请通过发布页安装）';
+                }
+            } catch (err) {
+                if (!releaseCancellable.is_cancelled()) {
+                    updateStatus.subtitle = `检查失败：${String(err?.message || err).slice(0, 180)}`;
+                }
+            } finally {
+                setUpdateBusy(false);
+            }
+        });
+
+        installBtn.connect('clicked', () => {
+            if (updating || !latestRelease?.hasUpdate || mode !== 'user') return;
+            const releaseToInstall = latestRelease;
+            const dlg = new Adw.AlertDialog({
+                heading: `安装 Quick Chat v${releaseToInstall.version}？`,
+                body: '从官方 GitHub Release 下载并校验 SHA-256，然后使用 GNOME 扩展管理器更新用户目录。不会清理历史或 API Key。GNOME Wayland 下完成后必须注销并重新登录，新版本才能真正生效。',
+            });
+            dlg.add_response('cancel', '取消');
+            dlg.add_response('install', '下载并安装');
+            dlg.set_default_response('cancel');
+            dlg.set_close_response('cancel');
+            dlg.connect('response', async (_dialog, response) => {
+                if (response !== 'install' || updating) return;
+                try { releaseCancellable?.cancel(); } catch (_) {}
+                releaseCancellable = new Gio.Cancellable();
+                setUpdateBusy(true);
+                updateStatus.subtitle = '正在下载、校验 ZIP 并安装…';
+                try {
+                    await installUserRelease(releaseToInstall, {
+                        currentVersion,
+                        cancellable: releaseCancellable,
+                    });
+                    if (!releaseCancellable.is_cancelled()) {
+                        updateStatus.subtitle = `✓ v${releaseToInstall.version} 已写入用户目录。请注销并重新登录后生效。`;
+                    }
+                } catch (err) {
+                    if (!releaseCancellable.is_cancelled()) {
+                        updateStatus.subtitle = `更新失败（原配置未删除）：${String(err?.message || err).slice(0, 200)}`;
+                    }
+                } finally {
+                    setUpdateBusy(false);
+                }
+            });
+            dlg.present(window);
+        });
 
         // =====================================================================
         // State & Synchronization for Provider / Model / Backend Capabilities
