@@ -400,6 +400,9 @@ test('E4 ChatController: coalesces concurrent ensureConnected, debounces reconne
                     if (method === 'get_messages') {
                         return {messages: []};
                     }
+                    if (method === 'flush_session') {
+                        return {ok: true, hasUnsavedChanges: false};
+                    }
                     return {};
                 },
                 close() {},
@@ -450,6 +453,49 @@ test('E4 ChatController: coalesces concurrent ensureConnected, debounces reconne
     const res2 = await controller.ensureConnected();
     assert.equal(res2.state.backend, 'zcode');
     controller.dispose();
+});
+
+test('QA-03: failed durable flush blocks reconnection and preserves the existing client', async () => {
+    let flushOk = false;
+    let closedCount = 0;
+    const errors = [];
+    const controller = new ChatController({
+        loadRuntimeEnvironment: async () => ({
+            config: {backend: 'openai'},
+            workspace: '/tmp',
+            sessionsDir: '/tmp',
+            sessionId: 'qa3_test',
+        }),
+        createClient: () => ({
+            start() {},
+            async request(type) {
+                if (type === 'get_state') return {backend: 'openai'};
+                if (type === 'get_messages') return {messages: []};
+                if (type === 'flush_session') return {
+                    ok: flushOk,
+                    hasUnsavedChanges: !flushOk,
+                    error: flushOk ? '' : 'simulated disk full',
+                };
+                return {};
+            },
+            close() { closedCount++; },
+        }),
+        onConnectionError: err => errors.push(String(err?.message || err)),
+    });
+    try {
+        await controller.ensureConnected();
+        const original = controller.client;
+        assert.equal(await controller.reconnectNow(), null);
+        assert.equal(controller.client, original, 'Unsaved state must keep the original session live');
+        assert.equal(closedCount, 0);
+        assert.match(errors.at(-1), /历史尚未保存/);
+        flushOk = true;
+        const restored = await controller.reconnectNow();
+        assert.equal(restored?.state?.backend, 'openai');
+        assert.equal(closedCount, 1, 'Client can be closed only after successful flush');
+    } finally {
+        controller.dispose();
+    }
 });
 
 test('E5 Shell Lifecycle: install.sh (install, upgrade, rollback) and uninstall.sh (preserve vs scoped --purge)', () => {
