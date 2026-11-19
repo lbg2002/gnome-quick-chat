@@ -400,7 +400,7 @@ export class BackendRegistry {
     }
 
     selectBackend(nextBackend, {clearMigrationNotice = true} = {}) {
-        const target = ['auto', 'zcode', 'codex', 'openai'].includes(nextBackend)
+        const target = ['auto', 'zcode', 'codex', 'dsh', 'openai'].includes(nextBackend)
             ? nextBackend
             : 'auto';
         runSettingsTransaction(this._settings, () => {
@@ -420,6 +420,7 @@ export class BackendRegistry {
             effectiveBackend,
             zcodePath: readString(this._settings, 'zcode-path', '').trim(),
             codexPath: readString(this._settings, 'codex-path', '').trim(),
+            dshPath: readString(this._settings, 'dsh-path', '').trim(),
             provider: profile.provider || '',
             model: profile.model || '',
             openaiBaseUrl: readString(this._settings, 'openai-base-url', '').trim(),
