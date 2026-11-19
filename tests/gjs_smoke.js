@@ -40,6 +40,8 @@ import {OpenAIAdapter, readSoupResponseBytesBoundedAsync} from '../backends/open
 import {ZCodeAdapter} from '../backends/zcodeAdapter.js';
 import {CodexAdapter} from '../backends/codexAdapter.js';
 import {spawnManagedCliTurn} from '../runtime/processManager.js';
+import {BackendClient} from '../backendClient.js';
+import {detectBackendSelectionAsync} from '../core/backendDetect.js';
 import {buildAskUserModifiedInput, getBackendCapabilities} from '../protocol.js';
 import {
     buildFakeCodexCliScriptSource,
@@ -454,6 +456,49 @@ let mockHttpProc = null;
         const codexSettled = await waitForEventGjs(codexEvents, e => e.type === 'agent_settled');
         assert(codexSettled.status === 'completed', `Codex turn failed in GJS: ${codexSettled.errorMessage}`);
         assert(codexStore.remoteSessionId === 'codex_thread_r10_prod', 'Codex remoteSessionId persisted in GJS');
+        
+        // 5E. Full startup pipeline: detect CLI identity -> async capability probe ->
+        // BackendClient.startAsync -> get_state/get_messages (not just direct adapters).
+        // This previously had no coverage in the real GJS smoke suite.
+        for (const kind of ['zcode', 'codex']) {
+            const cliFile = GLib.build_filenamev([tmpRoot, kind]);
+            const cliStub = [
+                '#!/usr/bin/env node',
+                '// @zcode/cli / codex-cli startup fixture',
+                "const args = process.argv.slice(2);",
+                "if (args.includes('--version')) {",
+                `  console.log('${kind === 'zcode' ? 'zcode 1.1.0' : 'codex-cli 0.42.0'}');`,
+                '} else if (args.includes("--help")) {',
+                `  console.log('${kind === 'zcode' ? 'zcode --output-format --prompt --cwd --mode --resume' : 'codex exec --json --sandbox read-only --model'}');`,
+                '}',
+            ].join('\\n') + '\\n';
+            writeExecutableScriptSync(cliFile, cliStub);
+
+            const detected = await detectBackendSelectionAsync({
+                configuredBackend: kind,
+                zcodePath: kind === 'zcode' ? cliFile : '',
+                codexPath: kind === 'codex' ? cliFile : '',
+            }, {forceRefresh: true});
+            assert(detected.available && detected.effectiveBackend === kind, `Real GJS ${kind} CLI identity detection`);
+
+            const startupClient = new BackendClient(() => {}, () => {});
+            try {
+                await startupClient.startAsync({
+                    backend: kind,
+                    zcodePath: kind === 'zcode' ? cliFile : '',
+                    codexPath: kind === 'codex' ? cliFile : '',
+                    mode: 'readonly',
+                    workspace: tmpRoot,
+                }, tmpRoot, tmpRoot, `gjs_startup_${kind}`, {clientGeneration: 1});
+                const state = await startupClient.request('get_state');
+                const history = await startupClient.request('get_messages');
+                assert(state.backend === kind && !state.unconfigured, `Real GJS ${kind} startup state`);
+                assert(Array.isArray(history.messages), `Real GJS ${kind} startup session read`);
+            } finally {
+                startupClient.close();
+            }
+        }
+
     } catch (err) {
         asyncError = err;
     } finally {
