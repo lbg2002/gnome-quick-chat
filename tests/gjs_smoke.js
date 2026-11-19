@@ -42,6 +42,7 @@ import {CodexAdapter} from '../backends/codexAdapter.js';
 import {spawnManagedCliTurn} from '../runtime/processManager.js';
 import {BackendClient} from '../backendClient.js';
 import {ChatController} from '../core/chatController.js';
+import {getInstalledExtensionMode} from '../runtime/releaseUpdater.js';
 import {detectBackendSelectionAsync} from '../core/backendDetect.js';
 import {buildAskUserModifiedInput, getBackendCapabilities} from '../protocol.js';
 import {
@@ -50,6 +51,16 @@ import {
     buildMockOpenAiDualOriginServerScriptSource,
 } from './fixtures/productionAdapterFixtures.js';
 
+// Verify the exact GJS checksum API used to validate downloaded release ZIPs.
+const updaterHash = GLib.compute_checksum_for_data(
+    GLib.ChecksumType.SHA256, new TextEncoder().encode('abc')
+);
+if (updaterHash !== 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') {
+    throw new Error('GJS release SHA-256 checksum function mismatch');
+}
+if (!['user', 'system', 'mixed', 'unknown'].includes(getInstalledExtensionMode())) {
+    throw new Error('Release installer mode detection returned an unexpected value');
+}
 const Encoder = new TextEncoder();
 const Decoder = new TextDecoder('utf-8');
 
