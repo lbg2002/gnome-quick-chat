@@ -39,6 +39,7 @@ import {BaseBackendAdapter} from '../backends/baseAdapter.js';
 import {OpenAIAdapter, readSoupResponseBytesBoundedAsync} from '../backends/openaiAdapter.js';
 import {ZCodeAdapter} from '../backends/zcodeAdapter.js';
 import {CodexAdapter} from '../backends/codexAdapter.js';
+import {DshAdapter} from '../backends/dshAdapter.js';
 import {spawnManagedCliTurn} from '../runtime/processManager.js';
 import {BackendClient} from '../backendClient.js';
 import {ChatController} from '../core/chatController.js';
@@ -469,6 +470,45 @@ let mockHttpProc = null;
         assert(codexSettled.status === 'completed', `Codex turn failed in GJS: ${codexSettled.errorMessage}`);
         assert(codexStore.remoteSessionId === 'codex_thread_r10_prod', 'Codex remoteSessionId persisted in GJS');
         
+        // 5D2. Real DSH Headless JSONL → Gio.Subprocess → shared TurnController.
+        const fakeDshScript = GLib.build_filenamev([tmpRoot, 'fake_dsh_cli.cjs']);
+        writeExecutableScriptSync(fakeDshScript, [
+            '#!/usr/bin/env node',
+            "let prompt = '';",
+            "process.stdin.setEncoding('utf8');",
+            "process.stdin.on('data', chunk => { prompt += chunk; });",
+            "process.stdin.on('end', () => {",
+            "  console.log(JSON.stringify({type:'session',sessionId:'session-gjs-dsh'}));",
+            "  console.log(JSON.stringify({type:'text',text:'DSH 接收:' + prompt.trim()}));",
+            "  console.log(JSON.stringify({type:'final',reason:'completed',sessionId:'session-gjs-dsh',text:'DSH 完成:' + prompt.trim()}));",
+            "});",
+        ].join('\n') + '\n');
+        const dshEvents = [];
+        const dshTurns = new TurnController(ev => dshEvents.push(ev));
+        const dshAdapter = new DshAdapter({
+            turns: dshTurns,
+            store: null,
+            getSessionContextConfig: () => ({}),
+            emitEvent: ev => dshEvents.push(ev),
+        });
+        dshAdapter.initialize({
+            executable: fakeDshScript,
+            pathEnv: GLib.getenv('PATH') || '/usr/local/bin:/usr/bin:/bin',
+            setsidPath: null,
+        }, {mode:'readonly'});
+        await dshAdapter.sendMessage({
+            promptText:'测试 DSH',
+            turnMeta:{turnId:'gjs_dsh_turn_1',messageId:'gjs_dsh_msg_1',userMessageId:'gjs_dsh_u_1'},
+            workspace:tmpRoot,
+            sessionId:'gjs_dsh_sess',
+            specialDirs:{home:tmpRoot},
+        });
+        const dshSettled = await waitForEventGjs(dshEvents,e => e.type === 'agent_settled');
+        assert(dshSettled.status === 'completed',
+            `DSH headless turn failed in real GJS: ${dshSettled.errorMessage}`);
+        assert(dshTurns.activeTurn?.text?.includes('DSH 完成:测试 DSH'),
+            'DSH official final event must replace interim text');
+
         // 5E. Full startup pipeline: detect CLI identity -> async capability probe ->
         // BackendClient.startAsync -> get_state/get_messages (not just direct adapters).
         // This previously had no coverage in the real GJS smoke suite.
