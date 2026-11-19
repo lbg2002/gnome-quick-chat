@@ -42,6 +42,7 @@ import {
     createIsolatedZCodeConfigOverrideAsync,
 } from './backends/zcodeAdapter.js';
 import {CodexAdapter} from './backends/codexAdapter.js';
+import {DshAdapter} from './backends/dshAdapter.js';
 import {
     OpenAIAdapter,
     attachCrossOriginRedirectGuard,
@@ -61,6 +62,7 @@ export {
 export function resolveBackendRuntime(config = {}) {
     const rawZCodePath = String(config.zcodePath || '').trim();
     const rawCodexPath = String(config.codexPath || '').trim();
+    const rawDshPath = String(config.dshPath || '').trim();
     const rawBaseUrl = String(config.openaiBaseUrl || '').trim();
     const requestedMode = String(config.mode || 'readonly').trim();
 
@@ -68,6 +70,7 @@ export function resolveBackendRuntime(config = {}) {
         configuredBackend: config.backend || 'auto',
         zcodePath: rawZCodePath,
         codexPath: rawCodexPath,
+        dshPath: rawDshPath,
         openaiBaseUrl: rawBaseUrl,
     });
 
@@ -217,6 +220,26 @@ export function resolveBackendRuntime(config = {}) {
         };
     }
 
+    if (effective === 'dsh') {
+        const pathDirs = buildSearchPath(rawDshPath);
+        const env = createGioCliEnv(rawDshPath, pathDirs);
+        const executable = (rawDshPath ? env.resolveCandidate(rawDshPath) : '')
+            || findExecutableInDirs('dsh', pathDirs);
+        if (!executable || !env.isExecutable(executable)) {
+            throw new Error('未检测到 DeepSeek Harness CLI（dsh）');
+        }
+        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode);
+        return {
+            backend: 'dsh', available: true, executable,
+            setsidPath: resolveSetsidExecutable(pathDirs),
+            pathEnv: pathDirs.join(':'),
+            resolvedProvider: 'deepseek-harness', resolvedModel: '',
+            label: 'DeepSeek Harness（由 dsh profile 选择模型）',
+            cliCapabilities: null, effectiveModeInfo,
+            capabilities: getBackendCapabilities('dsh'),
+        };
+    }
+
     if (effective === 'codex') {
         const cliEnv = createGioCliEnv(rawCodexPath);
         const codexExe = (rawCodexPath ? cliEnv.resolveCandidate(rawCodexPath) : '')
@@ -256,6 +279,7 @@ export async function resolveBackendRuntimeAsync(config = {}, {
     }
     const rawZCodePath = String(config.zcodePath || '').trim();
     const rawCodexPath = String(config.codexPath || '').trim();
+    const rawDshPath = String(config.dshPath || '').trim();
     const rawBaseUrl = String(config.openaiBaseUrl || '').trim();
     const requestedMode = String(config.mode || 'readonly').trim();
 
@@ -263,6 +287,7 @@ export async function resolveBackendRuntimeAsync(config = {}, {
         configuredBackend: config.backend || 'auto',
         zcodePath: rawZCodePath,
         codexPath: rawCodexPath,
+        dshPath: rawDshPath,
         openaiBaseUrl: rawBaseUrl,
     }, {
         forceRefresh,
@@ -429,6 +454,30 @@ export async function resolveBackendRuntimeAsync(config = {}, {
         };
     }
 
+    if (effective === 'dsh') {
+        const pathDirs = await buildSearchPathAsync(rawDshPath);
+        if (cancellable?.is_cancelled?.()) throw new Error('连接已取消');
+        const env = createGioCliEnv(rawDshPath, pathDirs);
+        const executable = (rawDshPath ? env.resolveCandidate(rawDshPath) : '')
+            || findExecutableInDirs('dsh', pathDirs);
+        if (!executable || !env.isExecutable(executable)) {
+            throw new Error('未检测到 DeepSeek Harness CLI（dsh），请检查 PATH 或指定 dsh 路径');
+        }
+        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode);
+        return {
+            backend: 'dsh', available: true,
+            executable,
+            setsidPath: resolveSetsidExecutable(pathDirs),
+            pathEnv: pathDirs.join(':'),
+            resolvedProvider: 'deepseek-harness',
+            resolvedModel: '',
+            label: 'DeepSeek Harness（由 dsh profile 选择模型）',
+            cliCapabilities: null,
+            effectiveModeInfo,
+            capabilities: getBackendCapabilities('dsh'),
+        };
+    }
+
     if (effective === 'codex') {
         const pathDirs = await buildSearchPathAsync(rawCodexPath);
         if (cancellable?.is_cancelled?.()) {
@@ -527,6 +576,8 @@ export class BackendClient {
             this._adapter = new ZCodeAdapter(sharedDeps).initialize(this._runtime, config);
         } else if (this._backend === 'codex') {
             this._adapter = new CodexAdapter(sharedDeps).initialize(this._runtime, config);
+        } else if (this._backend === 'dsh') {
+            this._adapter = new DshAdapter(sharedDeps).initialize(this._runtime, config);
         } else if (this._backend === 'openai') {
             this._adapter = new OpenAIAdapter(sharedDeps).initialize(this._runtime, config, {
                 timeouts: this._timeouts,
