@@ -6,7 +6,7 @@ import {
     normalizeEffectiveAgentMode, parseZCodeHelpCapabilities,
     getBackendCapabilities,
 } from '../protocol.js';
-import {resolveBackendSelection} from '../core/configMigration.js';
+import {resolveBackendSelection, matchesDshHeadlessHelp} from '../core/configMigration.js';
 import {BackendRegistry, MemorySettingsStore} from '../core/backendRegistry.js';
 
 test('ZCode: incomplete help text must not reject a newer CLI with valid --mode and stream-json', () => {
@@ -47,6 +47,18 @@ test('permissions: Codex smart must stay sandboxed read-only and never grant wri
     assert.ok(args.includes('approval_policy="never"'));
     assert.ok(!args.includes('sandbox_mode="danger-full-access"'));
 });
+test('DSH: only the documented headless JSONL and approval flags pass compatibility detection', () => {
+    const valid = `Usage: dsh --profile headless [options] [task...]
+      --json                  write newline-delimited events
+      --session-id <id>       resume a session
+      --permission-mode <preset>
+      --approval-policy <policy>`;
+    assert.equal(matchesDshHeadlessHelp(valid), true);
+    assert.equal(matchesDshHeadlessHelp(valid.replace('--json', '--text')), false);
+    assert.equal(matchesDshHeadlessHelp(valid.replace('--permission-mode', '--unsafe-mode')), false);
+    assert.equal(matchesDshHeadlessHelp(valid.replace('Usage: dsh --profile headless', 'Usage: fake-runner')), false);
+});
+
 test('DSH: headless CLI invocation passes prompt only on stdin and isolates permissions', () => {
     const readonly = buildDshArgs({executable:'/usr/bin/dsh',mode:'readonly'});
     assert.deepEqual(readonly, ['/usr/bin/dsh','--profile','headless','--json','--permission-mode','read-only','--approval-policy','never','-']);
