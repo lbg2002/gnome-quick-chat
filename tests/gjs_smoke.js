@@ -41,6 +41,7 @@ import {ZCodeAdapter} from '../backends/zcodeAdapter.js';
 import {CodexAdapter} from '../backends/codexAdapter.js';
 import {spawnManagedCliTurn} from '../runtime/processManager.js';
 import {BackendClient} from '../backendClient.js';
+import {ChatController} from '../core/chatController.js';
 import {detectBackendSelectionAsync} from '../core/backendDetect.js';
 import {buildAskUserModifiedInput, getBackendCapabilities} from '../protocol.js';
 import {
@@ -496,6 +497,46 @@ let mockHttpProc = null;
                 assert(Array.isArray(history.messages), `Real GJS ${kind} startup session read`);
             } finally {
                 startupClient.close();
+            }
+
+            // QA-01/02: unlike the legacy smoke check above, this runs through
+            // the actual ChatController.ensureConnected orchestration path.
+            // A plain JS cancellable triggers a GJS GI argument type error
+            // when backendDetect passes it to Gio.File.read_async().
+            const nativeCancellables = [];
+            const controller = new ChatController({
+                createCancellable: () => {
+                    const c = new Gio.Cancellable();
+                    nativeCancellables.push(c);
+                    return c;
+                },
+                createClient: (onEvent, onError) => new BackendClient(onEvent, onError),
+                loadRuntimeEnvironment: async ({cancellable}) => {
+                    assert(cancellable instanceof Gio.Cancellable,
+                        'ChatController must pass a native Gio.Cancellable into the real GJS connection');
+                    return {
+                        config: {
+                            backend: kind,
+                            zcodePath: kind === 'zcode' ? cliFile : '',
+                            codexPath: kind === 'codex' ? cliFile : '',
+                            mode: 'readonly',
+                            workspace: tmpRoot,
+                        },
+                        workspace: tmpRoot,
+                        sessionsDir: tmpRoot,
+                        sessionId: `gjs_controller_${kind}`,
+                    };
+                },
+            });
+            controller.beginLifecycle(300);
+            try {
+                const connected = await controller.ensureConnected({canConnect: () => true});
+                assert(connected?.state?.backend === kind,
+                    `Full ChatController → Gio → ${kind} runtime must connect successfully`);
+                assert(nativeCancellables.length === 1,
+                    `Each ${kind} connection must construct exactly one Gio.Cancellable`);
+            } finally {
+                controller.dispose();
             }
         }
 
