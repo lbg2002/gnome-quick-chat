@@ -506,7 +506,8 @@ let mockHttpProc = null;
         const dshSettled = await waitForEventGjs(dshEvents,e => e.type === 'agent_settled');
         assert(dshSettled.status === 'completed',
             `DSH headless turn failed in real GJS: ${dshSettled.errorMessage}`);
-        assert(dshTurns.activeTurn?.text?.includes('DSH 完成:测试 DSH'),
+        assert(dshEvents.some(e => e.type === 'message_end' &&
+            String(e.message?.content || '').includes('DSH 完成:测试 DSH')),
             'DSH official final event must replace interim text');
 
         // 5E. Full startup pipeline: detect CLI identity -> async capability probe ->
