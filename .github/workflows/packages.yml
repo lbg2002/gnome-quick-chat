@@ -24,11 +24,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install packaging and GJS dependencies
+      - name: Install minimal packaging and GJS dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gnome-shell gjs gir1.2-soup-3.0 libglib2.0-bin unzip dpkg-dev
+            gjs gir1.2-soup-3.0 libglib2.0-bin unzip dpkg-dev
       - name: Validate release version and tag
         shell: bash
         run: |
