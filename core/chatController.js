@@ -35,6 +35,7 @@ export class ChatController {
         registry,
         createClient,
         loadRuntimeEnvironment,
+        createCancellable = createConnectionCancellable,
         onEvent = () => {},
         onConnecting = () => {},
         onStateChanged = () => {},
@@ -47,6 +48,7 @@ export class ChatController {
         this._registry = registry;
         this._createClient = createClient;
         this._loadRuntimeEnvironment = loadRuntimeEnvironment;
+        this._createCancellable = createCancellable;
         this._onEvent = onEvent;
         this._onConnecting = onConnecting;
         this._onStateChanged = onStateChanged;
@@ -182,7 +184,9 @@ export class ChatController {
         const generation = ++this._clientGeneration;
         this._ready = false;
         try { this._connectCancellable?.cancel?.(); } catch (_) {}
-        const connectCancellable = createConnectionCancellable();
+        // Production injects a genuine Gio.Cancellable; pure-JS tests may use
+        // a lightweight implementation, but it must never reach native Gio APIs.
+        const connectCancellable = this._createCancellable();
         this._connectCancellable = connectCancellable;
         try {
             this._onConnecting({generation, lifecycleGeneration: lifeGen, reason: '正在检测…'});
