@@ -11,7 +11,7 @@ import {
     normalizeOpenAIEndpoint,
 } from './protocol.js';
 import {
-    detectBackendSelection,
+    peekBackendSelection,
     invalidateBackendDetectionCaches,
     loadLocalBackendCatalogAsync,
     migrateGSettingsIfNeeded,
@@ -406,7 +406,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         catalogGroup.add(modelComboRow);
 
-        const getSelection = () => detectBackendSelection({
+        const getSelection = () => peekBackendSelection({
             configuredBackend: getStr('backend', 'auto'),
             zcodePath: getStr('zcode-path', ''),
             codexPath: getStr('codex-path', ''),
