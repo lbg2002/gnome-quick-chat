@@ -21,6 +21,18 @@
       <default>''</default>
       <summary>Custom Codex CLI executable path</summary>
     </key>
+    <key name="dsh-path" type="s">
+      <default>''</default>
+      <summary>Custom DeepSeek Harness dsh executable path</summary>
+    </key>
+    <key name="dsh-workspace" type="s">
+      <default>''</default>
+      <summary>DeepSeek Harness working directory</summary>
+    </key>
+    <key name="dsh-agent-mode" type="s">
+      <default>'readonly'</default>
+      <summary>DeepSeek Harness permission mode (readonly, smart, full)</summary>
+    </key>
     <key name="provider" type="s">
       <default>''</default>
       <summary>Model provider override</summary>
