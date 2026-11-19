@@ -19,26 +19,51 @@ assert meta.get('uuid')=='quick-chat@lbg2002.github.io'
 print(v)
 PY
 )"
-command -v gnome-extensions >/dev/null
 command -v dpkg-deb >/dev/null
-command -v unzip >/dev/null
 command -v glib-compile-schemas >/dev/null
-
-# Reuse the existing upstream packaging manifest for both distribution formats.
-bash pack.sh "$out_dir"
-zip="$out_dir/quick-chat@lbg2002.github.io.shell-extension.zip"
-test -s "$zip"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
 root="$tmp/deb"
 target="$root/usr/share/gnome-shell/extensions/quick-chat@lbg2002.github.io"
 mkdir -p -- "$target" "$root/DEBIAN"
-unzip -q "$zip" -d "$target"
+
+# Keep the two installers byte-for-byte consistent. The ZIP contains exactly
+# the GNOME extension root (not the enclosing uuid directory); Debian installs
+# the same files to /usr/share. Avoid installing a complete desktop in CI.
+python3 - "$target" <<'PY'
+import pathlib,shutil,sys
+src=pathlib.Path.cwd()
+dst=pathlib.Path(sys.argv[1])
+for name in (
+    'metadata.json', 'extension.js', 'prefs.js', 'backendClient.js',
+    'protocol.js', 'zcodeBridge.cjs', 'stylesheet.css',
+):
+    shutil.copy2(src/name,dst/name)
+for directory in ('backends', 'core', 'runtime', 'ui'):
+    (dst/directory).mkdir()
+    for js in sorted((src/directory).glob('*.js')):
+        shutil.copy2(js,dst/directory/js.name)
+(dst/'schemas').mkdir()
+for schema in sorted((src/'schemas').glob('*.xml')):
+    shutil.copy2(schema,dst/'schemas'/schema.name)
+PY
+glib-compile-schemas --strict "$target/schemas"
 test -f "$target/metadata.json"
 test -f "$target/extension.js"
 test -f "$target/schemas/org.gnome.shell.extensions.quick-chat.gschema.xml"
-glib-compile-schemas --strict "$target/schemas"
+test -f "$target/schemas/gschemas.compiled"
+
+zip="$out_dir/quick-chat@lbg2002.github.io.shell-extension.zip"
+python3 - "$target" "$zip" <<'PY'
+import pathlib,sys,zipfile
+root=pathlib.Path(sys.argv[1])
+with zipfile.ZipFile(sys.argv[2], 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    for file in sorted(root.rglob('*')):
+        if file.is_file() and not file.is_symlink():
+            z.write(file, file.relative_to(root).as_posix())
+PY
+test -s "$zip"
 
 python3 - "$target/metadata.json" "$version" <<'PY'
 import json,sys
