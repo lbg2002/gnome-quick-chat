@@ -1318,17 +1318,17 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         updateStatus.add_suffix(checkBtn);
 
-        const installRow = new Adw.ActionRow({
+        const updateInstallRow = new Adw.ActionRow({
             title: '下载安装',
             subtitle: '用户目录版本支持验证 SHA-256 后一键安装；系统 DEB 请从发布页面更新。',
         });
-        updateGroup.add(installRow);
+        updateGroup.add(updateInstallRow);
         const installBtn = new Gtk.Button({
             label: '下载并安装 ZIP',
             valign: Gtk.Align.CENTER,
             sensitive: false,
         });
-        installRow.add_suffix(installBtn);
+        updateInstallRow.add_suffix(installBtn);
         installBtn.visible = mode === 'user';
 
         const releaseRow = new Adw.ActionRow({
