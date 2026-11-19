@@ -47,9 +47,10 @@ function createMemorySettings(initial = {}) {
 }
 
 test('Stage A1: supported backends strictly exclude pi', () => {
-    assert.deepEqual([...SUPPORTED_BACKENDS], ['auto', 'zcode', 'codex', 'openai']);
+    assert.deepEqual([...SUPPORTED_BACKENDS], ['auto', 'zcode', 'codex', 'dsh', 'openai']);
     assert.equal(getBackendCapabilities('zcode').supportsTools, true);
     assert.equal(getBackendCapabilities('codex').supportsTools, true);
+    assert.equal(getBackendCapabilities('dsh').supportsTools, true);
     assert.equal(getBackendCapabilities('openai').supportsTools, false);
     // Falling through with unknown/removed 'pi' never grants local tools
     assert.equal(getBackendCapabilities('pi').supportsTools, false);
