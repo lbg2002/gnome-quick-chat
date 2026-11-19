@@ -73,6 +73,15 @@ test('DSH: normalize official JSON line events with committed final answer', () 
     assert.equal(normalizeEvent('dsh',{type:'thinking',text:'思考'}).assistantMessageEvent.type,'thinking_delta');
     assert.equal(normalizeEvent('dsh',{type:'tool_call',callId:'call-1',tool:'read_file'}).type,'tool_execution_start');
     assert.equal(normalizeEvent('dsh',{type:'tool_result',callId:'call-1',status:'error'}).isError,true);
+    const raw = normalizeEvent('dsh',{type:'tool_call',callId:'raw-1',tool:'bash',input:'{"incomplete":'});
+    assert.deepEqual(raw.rawInput, {rawArguments:'{"incomplete":'});
+    const denied = normalizeEvent('dsh',{
+        type:'tool_result',callId:'raw-1',status:'error',result:'not run',
+        error:{code:'AUTO_REVIEW_DENIED',reason:'No explicit authorization for target'},
+    });
+    assert.equal(denied.isError, true);
+    assert.equal(denied.errorCode, 'AUTO_REVIEW_DENIED');
+    assert.match(denied.detail, /No explicit authorization/);
     const final = normalizeEvent('dsh',{type:'final',sessionId:'session-abcd',reason:{kind:'completed'},text:'最终结果'});
     assert.equal(final.type,'turn_result');
     assert.equal(final.text,'最终结果');
