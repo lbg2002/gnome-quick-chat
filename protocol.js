@@ -1201,7 +1201,14 @@ export function normalizeEvent(backend, record) {
                     toolCallId: String(record.callId || ''),
                     toolName: String(record.tool || '工具'),
                     summary: String(record.tool || '工具'),
-                    rawInput: record.input && typeof record.input === 'object' ? record.input : null,
+                    // DSH preserves malformed/non-round-trippable JSON tool
+                    // arguments as text. Keep a bounded, visible audit trail
+                    // instead of silently discarding them from the tool drawer.
+                    rawInput: record.input && typeof record.input === 'object'
+                        ? record.input
+                        : (typeof record.input === 'string'
+                            ? {rawArguments: record.input.slice(0, 4096)}
+                            : null),
                 };
             case 'tool_result':
                 return {
@@ -1209,7 +1216,11 @@ export function normalizeEvent(backend, record) {
                     toolCallId: String(record.callId || ''),
                     toolName: '工具',
                     isError: record.status === 'error',
-                    detail: String(record.error?.message || record.result || '').slice(0, 2048),
+                    detail: String(
+                        record.error?.reason || record.error?.message ||
+                        record.result || record.error?.code || ''
+                    ).slice(0, 2048),
+                    ...(record.error?.code ? {errorCode: String(record.error.code).slice(0, 96)} : {}),
                 };
             case 'final': {
                 // DSH's durable final.reason is a structured turn/end reason
