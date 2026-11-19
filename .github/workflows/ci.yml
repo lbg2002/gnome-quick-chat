@@ -31,7 +31,7 @@ jobs:
           done
 
       - name: Check shell script syntax
-        run: bash -n install.sh uninstall.sh pack.sh scripts/diagnose-local.sh
+        run: bash -n install.sh uninstall.sh pack.sh scripts/diagnose-local.sh scripts/measure-shell.sh
 
       - name: Validate GSettings XML schema strictly
         run: glib-compile-schemas --strict --dry-run schemas
