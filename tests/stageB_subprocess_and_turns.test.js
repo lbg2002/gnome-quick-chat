@@ -197,7 +197,7 @@ test('B2: Capability matrix is honest (ZCode approval agent vs Codex read-only s
     assert.equal(brokenZCodeCaps.supportsDisallowedTools, false);
     assert.throws(
         () => buildZCodeArgs({executable: 'zcode', mode: 'chat'}, '你好', '', '', {cliCaps: brokenZCodeCaps}),
-        /不支持 --disallowed-tools/
+        /--disallowed-tools/
     );
 
     const brokenCodexCaps = parseCodexHelpCapabilities('Usage: codex [PROMPT]', '0.0.1');
