@@ -921,6 +921,12 @@ export function createGioCliEnv(extraExecutable = '', precomputedPathDirs = null
             const pathCodex = findExecutableInDirs('codex', pathDirs);
             return Boolean(pathCodex && identifyCliCandidate(pathCodex, baseEnv) === 'codex');
         },
+        hasDsh(customDshPath = '') {
+            const name = String(customDshPath || '').trim() || 'dsh';
+            const candidate = resolveCandidate(name);
+            return Boolean(candidate && baseEnv.isExecutable(candidate) &&
+                /^(dsh|dsh-cli)$/.test(candidate.split('/').pop()));
+        },
     };
 }
 
@@ -940,18 +946,20 @@ function makeSelectionCacheKey({
     configuredBackend = 'auto',
     zcodePath = '',
     codexPath = '',
+    dshPath = '',
     openaiBaseUrl = '',
 } = {}) {
-    return `sel:${configuredBackend}\u0000${zcodePath}\u0000${codexPath}\u0000${openaiBaseUrl}`;
+    return `sel:${configuredBackend}\u0000${zcodePath}\u0000${codexPath}\u0000${dshPath}\u0000${openaiBaseUrl}`;
 }
 
 export function peekBackendSelection({
     configuredBackend = 'auto',
     zcodePath = '',
     codexPath = '',
+    dshPath = '',
     openaiBaseUrl = '',
 } = {}) {
-    const cacheKey = makeSelectionCacheKey({configuredBackend, zcodePath, codexPath, openaiBaseUrl});
+    const cacheKey = makeSelectionCacheKey({configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl});
     const cached = cliDetectionCache.peek(cacheKey);
     if (cached.hit && cached.value) {
         return {
@@ -961,7 +969,7 @@ export function peekBackendSelection({
             detecting: false,
         };
     }
-    const mode = ['auto', 'zcode', 'codex', 'openai'].includes(configuredBackend)
+    const mode = ['auto', 'zcode', 'codex', 'dsh', 'openai'].includes(configuredBackend)
         ? configuredBackend
         : 'auto';
     const hasOpenAI = Boolean(String(openaiBaseUrl || '').trim());
@@ -976,7 +984,7 @@ export function peekBackendSelection({
             detecting: !hasOpenAI,
         };
     }
-    if (mode === 'zcode' || mode === 'codex') {
+    if (mode === 'zcode' || mode === 'codex' || mode === 'dsh') {
         return {
             configuredBackend: mode,
             effectiveBackend: mode,
@@ -1005,6 +1013,7 @@ export function peekEffectiveBackend(configuredBackend = 'auto', options = {}) {
             configuredBackend,
             zcodePath: options?.zcodePath || '',
             codexPath: options?.codexPath || '',
+            dshPath: options?.dshPath || '',
             openaiBaseUrl: options?.openaiBaseUrl || '',
         };
     return peekBackendSelection(selectionOpts).effectiveBackend;
@@ -1014,17 +1023,18 @@ export function detectBackendSelection({
     configuredBackend = 'auto',
     zcodePath = '',
     codexPath = '',
+    dshPath = '',
     openaiBaseUrl = '',
 } = {}) {
-    const cacheKey = makeSelectionCacheKey({configuredBackend, zcodePath, codexPath, openaiBaseUrl});
+    const cacheKey = makeSelectionCacheKey({configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl});
     const cached = cliDetectionCache.peek(cacheKey);
     if (cached.hit && !cached.stale && cached.value) {
         return {...cached.value};
     }
-    const extra = zcodePath || codexPath || '';
+    const extra = zcodePath || codexPath || dshPath || '';
     const cliEnv = createGioCliEnv(extra);
     const resolved = resolveBackendSelection(
-        {configuredBackend, zcodePath, codexPath, openaiBaseUrl},
+        {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
         cliEnv
     );
     // Synchronous inspection must never seed the async detection cache: a transient
@@ -1037,6 +1047,7 @@ export async function detectBackendSelectionAsync({
     configuredBackend = 'auto',
     zcodePath = '',
     codexPath = '',
+    dshPath = '',
     openaiBaseUrl = '',
 } = {}, {
     forceRefresh = false,
@@ -1046,7 +1057,7 @@ export async function detectBackendSelectionAsync({
     if (cancellable?.is_cancelled?.()) {
         throw new Error('Backend detection cancelled');
     }
-    const cacheKey = makeSelectionCacheKey({configuredBackend, zcodePath, codexPath, openaiBaseUrl});
+    const cacheKey = makeSelectionCacheKey({configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl});
     const resolved = await cliDetectionCache.getOrLoadAsync(
         cacheKey,
         async () => {
@@ -1057,8 +1068,24 @@ export async function detectBackendSelectionAsync({
             // ZCode/Codex PATH scan, binary header reads, or CLI --version.
             if (configuredBackend === 'openai') {
                 return resolveBackendSelection(
-                    {configuredBackend, zcodePath, codexPath, openaiBaseUrl},
-                    {hasZCode: () => false, hasCodex: () => false}
+                    {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
+                    {hasZCode: () => false, hasCodex: () => false, hasDsh: () => false}
+                );
+            }
+            if (configuredBackend === 'dsh') {
+                const pathDirs = await buildSearchPathAsync(dshPath, {forceRefresh});
+                if (cancellable?.is_cancelled?.()) throw new Error('Backend detection cancelled');
+                const env = createGioCliEnv(dshPath, pathDirs);
+                const selected = dshPath ? env.resolveCandidate(dshPath)
+                    : findExecutableInDirs('dsh', pathDirs);
+                const hasDsh = Boolean(
+                    selected && env.isExecutable(selected) &&
+                    // Do not accept an arbitrary unrelated binary via custom path.
+                    /^(dsh|dsh-cli)$/.test(String(selected).split('/').pop())
+                );
+                return resolveBackendSelection(
+                    {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
+                    {hasDsh: () => hasDsh}
                 );
             }
             const extra = configuredBackend === 'zcode' ? zcodePath
@@ -1122,7 +1149,7 @@ export async function detectBackendSelectionAsync({
                 probeVersion: p => (verPreload.has(p) ? verPreload.get(p) : ''),
             };
             return resolveBackendSelection(
-                {configuredBackend, zcodePath, codexPath, openaiBaseUrl},
+                {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
                 {
                     ...asyncAwareEnv,
                     hasZCode(customZCodePath = '') {
@@ -1169,6 +1196,7 @@ export function detectEffectiveBackend(configuredBackend = 'auto', options = {})
             configuredBackend,
             zcodePath: options?.zcodePath || '',
             codexPath: options?.codexPath || '',
+            dshPath: options?.dshPath || '',
             openaiBaseUrl: options?.openaiBaseUrl || '',
         };
     return peekBackendSelection(selectionOpts).effectiveBackend;
