@@ -134,15 +134,16 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // --- Group 1: 后端引擎 ---
         const backendGroup = new Adw.PreferencesGroup({
             title: '后端引擎',
-            description: '支持 ZCode CLI、Codex CLI 与自定义 OpenAI 兼容 API（绝不篡改外部 CLI 全局配置文件）。',
+            description: '支持 ZCode、Codex、DeepSeek Harness (dsh) 和 OpenAI 兼容 API；不改动外部 CLI 全局配置。',
         });
         modelPage.add(backendGroup);
 
-        const backends = ['auto', 'zcode', 'codex', 'openai'];
+        const backends = ['auto', 'zcode', 'codex', 'dsh', 'openai'];
         const backendNames = [
-            '自动检测 (ZCode → Codex → OpenAI API)',
+            '自动检测 (ZCode → Codex → DSH → OpenAI API)',
             'ZCode CLI',
             'Codex CLI',
+            'DeepSeek Harness (dsh)',
             '自定义 OpenAI API',
         ];
         const backendRow = new Adw.ComboRow({
@@ -418,6 +419,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             configuredBackend: getStr('backend', 'auto'),
             zcodePath: getStr('zcode-path', ''),
             codexPath: getStr('codex-path', ''),
+            dshPath: getStr('dsh-path', ''),
             openaiBaseUrl: getStr('openai-base-url', ''),
         });
         const getEffectiveBackend = () => getSelection().effectiveBackend;
@@ -819,7 +821,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         };
 
         const applyBackendMode = (eff, chosenMode) => {
-            if (eff === 'zcode' || eff === 'codex') {
+            if (eff === 'zcode' || eff === 'codex' || eff === 'dsh') {
                 registry.updateBackendProfile(eff, {mode: chosenMode});
             } else {
                 setStr('agent-mode', chosenMode);
@@ -897,6 +899,21 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         agentGroup.add(codexPathRow);
 
+        const dshPathRow = new Adw.EntryRow({
+            title: 'DeepSeek Harness CLI 路径 (留空自动探测 dsh)',
+        });
+        if (hasKey('dsh-path')) {
+            s.bind('dsh-path', dshPathRow, 'text', Gio.SettingsBindFlags.DEFAULT);
+        }
+        dshPathRow.add_suffix(makeResetButton('清空自定义 dsh 路径', () => setStr('dsh-path', '')));
+        dshPathRow.connect('notify::text', () => {
+            invalidateBackendDetectionCaches();
+            registry.bumpGeneration();
+            rebuildProviderAndModelUi();
+        });
+        agentGroup.add(dshPathRow);
+
+
         let syncingWorkspace = false;
         const workspaceRow = new Adw.EntryRow({
             title: '当前后端工作目录 (留空默认使用主目录 ~)',
@@ -906,7 +923,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             if (syncingWorkspace) return;
             const eff = getEffectiveBackend();
             const val = workspaceRow.text.trim();
-            if (eff === 'zcode' || eff === 'codex') {
+            if (eff === 'zcode' || eff === 'codex' || eff === 'dsh') {
                 registry.updateBackendProfile(eff, {workspace: val});
             } else {
                 setStr('workspace', val);
@@ -1461,7 +1478,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 workspaceRow.text = desiredWorkspace;
                 syncingWorkspace = false;
             }
-            workspaceRow.sensitive = eff === 'zcode' || eff === 'codex';
+            workspaceRow.sensitive = eff === 'zcode' || eff === 'codex' || eff === 'dsh';
 
             modeRow.sensitive = caps.supportsTools;
             if (eff === 'unconfigured') {
@@ -1471,9 +1488,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             } else if (caps.supportsApproval) {
                 modeRow.subtitle = '需审批 Agent 按完整命令/规范真实路径/来源逐项请求您授权（非系统级强制只读沙箱；Shell 命令默认仅单次放行）';
             } else if (eff === 'codex') {
-                modeRow.subtitle = 'Codex CLI 无禁用全部工具的纯问答开关，已使用 CLI read-only 沙箱运行只读 Agent；如需严格无工具纯问答推荐使用 OpenAI API';
+                modeRow.subtitle = 'Codex 非交互执行模式无法把写入审批回传到随问；智能模式保持只读，只有显式开启完全权限才允许写入';
             } else {
-                modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 使用 CLI 沙箱策略控制权限，不支持会话内交互弹窗审批`;
+                modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 通过 CLI 权限预设控制操作；智能模式无真实审批回传时会保持只读`;
             }
             syncDiagnosticsUi();
         };
