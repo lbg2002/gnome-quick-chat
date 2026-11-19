@@ -410,6 +410,7 @@ export default class QuickChat extends Extension {
             configuredBackend: configured,
             zcodePath: this._getSettingString('zcode-path', ''),
             codexPath: this._getSettingString('codex-path', ''),
+            dshPath: this._getSettingString('dsh-path', ''),
             openaiBaseUrl: this._getSettingString('openai-base-url', ''),
         });
     }
@@ -821,16 +822,19 @@ export default class QuickChat extends Extension {
         if (!this._enabled) return;
         const zcodePath = this._getSettingString('zcode-path', '');
         const codexPath = this._getSettingString('codex-path', '');
+        const dshPath = this._getSettingString('dsh-path', '');
         const openaiBaseUrl = this._getSettingString('openai-base-url', '').trim();
         try {
-            const [zSel, cSel] = await Promise.all([
-                detectBackendSelectionAsync({configuredBackend: 'zcode', zcodePath, codexPath, openaiBaseUrl}),
-                detectBackendSelectionAsync({configuredBackend: 'codex', zcodePath, codexPath, openaiBaseUrl}),
+            const [zSel, cSel, dSel] = await Promise.all([
+                detectBackendSelectionAsync({configuredBackend: 'zcode', zcodePath, codexPath, dshPath, openaiBaseUrl}),
+                detectBackendSelectionAsync({configuredBackend: 'codex', zcodePath, codexPath, dshPath, openaiBaseUrl}),
+                detectBackendSelectionAsync({configuredBackend: 'dsh', zcodePath, codexPath, dshPath, openaiBaseUrl}),
             ]);
             if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
             const nextSet = new Set();
             if (zSel?.available) nextSet.add('zcode');
             if (cSel?.available) nextSet.add('codex');
+            if (dSel?.available) nextSet.add('dsh');
             if (openaiBaseUrl) nextSet.add('openai');
             this._cachedAvailableBackends = nextSet;
             this._updateLocalRouteSuggestion(this._panel?.entry?.get_text() || '');
@@ -866,6 +870,7 @@ export default class QuickChat extends Extension {
             profiles: {
                 zcode: this._registry.getBackendProfile('zcode'),
                 codex: this._registry.getBackendProfile('codex'),
+                dsh: this._registry.getBackendProfile('dsh'),
                 openai: this._registry.getBackendProfile('openai'),
             },
             dismissedKeys: this._dismissedRouteKeys,
@@ -876,7 +881,7 @@ export default class QuickChat extends Extension {
     _applyRouteSuggestion(suggestion) {
         if (!suggestion || !this._registry || this._chatController?.busy) return;
         const targetBackend = suggestion.targetBackend;
-        if (!['zcode', 'codex', 'openai'].includes(targetBackend)) return;
+        if (!['zcode', 'codex', 'dsh', 'openai'].includes(targetBackend)) return;
 
         // Hard security rule (Stage F6): NEVER auto-enable `full` or expand file/command scopes!
         const safeMode = clampSafeRecommendedMode(targetBackend, suggestion.targetMode);
@@ -1216,7 +1221,9 @@ export default class QuickChat extends Extension {
             ? 'OpenAI API'
             : state.backend === 'codex'
                 ? 'Codex'
-                : 'ZCode';
+                : state.backend === 'dsh'
+                    ? 'DeepSeek Harness'
+                    : 'ZCode';
         this._modelLabel = state.model?.id || config.model || backendTag;
 
         const effectiveMode = state.effectiveMode || config.mode;
