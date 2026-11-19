@@ -480,7 +480,7 @@ let mockHttpProc = null;
             "process.stdin.on('end', () => {",
             "  console.log(JSON.stringify({type:'session',sessionId:'session-gjs-dsh'}));",
             "  console.log(JSON.stringify({type:'text',text:'DSH 接收:' + prompt.trim()}));",
-            "  console.log(JSON.stringify({type:'final',reason:'completed',sessionId:'session-gjs-dsh',text:'DSH 完成:' + prompt.trim()}));",
+            "  console.log(JSON.stringify({type:'final',reason:{kind:'completed'},sessionId:'session-gjs-dsh',text:'DSH 完成:' + prompt.trim()}));",
             "});",
         ].join('\n') + '\n');
         const dshEvents = [];
