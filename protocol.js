@@ -125,13 +125,13 @@ export function getBackendCapabilities(backend, cliCaps = null) {
                 supportsThinking: true,
                 supportsSkills: true,
                 supportsMcp: true,
-                supportedModes: ['chat', 'readonly', 'full'],
+                supportedModes: ['chat', 'readonly', 'smart', 'full'],
                 modeLabels: [
-                    '纯问答 (禁用本地与联网工具)',
-                    '需审批 Agent (推荐 · 敏感操作需您授权，非系统级沙箱)',
-                    '高权限全自动 Agent (免审批执行读写与命令 · 谨慎开启)',
+                    '只读（ZCode Plan；可读文件，禁止修改）',
+                    '智能（ZCode Build；低风险读取自动执行，高风险操作请求审批）',
+                    '完全权限（ZCode YOLO；允许修改与删除）',
                 ],
-                modeBadges: {chat: '纯问答', readonly: '需审批 Agent', full: '高权限全自动'},
+                modeBadges: {chat: '纯问答', readonly: '只读', smart: '智能审批', full: '完全权限'},
             };
         case 'codex': {
             const supportsPureChat = Boolean(cliCaps?.supportsDisableTools);
@@ -149,19 +149,21 @@ export function getBackendCapabilities(backend, cliCaps = null) {
                 supportsThinking: true,
                 supportsSkills: false,
                 supportsMcp: true,
-                supportedModes: supportsPureChat ? ['chat', 'readonly', 'full'] : ['readonly', 'full'],
+                supportedModes: supportsPureChat ? ['chat', 'readonly', 'smart', 'full'] : ['readonly', 'smart', 'full'],
                 pureChatRecommendation: 'Codex CLI 无真实禁用工具参数，已切换为只读沙箱 Agent；如需真正无工具纯问答请使用 OpenAI API。',
                 modeLabels: [
                     supportsPureChat
                         ? '纯问答 (禁用 CLI 工具)'
                         : '只读沙箱 Agent (Codex 无纯问答开关 · 纯问答推荐 OpenAI API)',
-                    '只读沙箱 Agent (CLI 只读沙箱策略 · 无弹窗审批)',
-                    '高权限全自动 Agent (无沙箱读写与执行命令 · 谨慎开启)',
+                    '只读沙箱（禁止修改文件）',
+                    '智能（非交互 Codex 不支持审批回传，安全降级为只读）',
+                    '完全权限（不经随问审批，允许修改与删除）',
                 ],
                 modeBadges: {
-                    chat: supportsPureChat ? '纯问答' : '只读沙箱',
-                    readonly: '只读沙箱',
-                    full: '高权限全自动',
+                    chat: supportsPureChat ? '纯问答' : '只读',
+                    readonly: '只读',
+                    smart: '智能（只读限制）',
+                    full: '完全权限',
                 },
             };
         }
@@ -215,9 +217,16 @@ export function getBackendCapabilities(backend, cliCaps = null) {
 }
 
 export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly', cliCaps = null) {
-    const mode = ['chat', 'readonly', 'full'].includes(requestedMode) ? requestedMode : 'readonly';
+    const mode = ['chat', 'readonly', 'smart', 'full'].includes(requestedMode) ? requestedMode : 'readonly';
     if (backend === 'openai') {
         return {effectiveMode: 'chat', downgradedFromChat: false, notice: ''};
+    }
+    if (backend === 'codex' && mode === 'smart') {
+        return {
+            effectiveMode: 'readonly',
+            downgradedFromChat: false,
+            notice: 'Codex exec 没有可用的随问审批回传通道：智能模式安全降级为只读。写文件请勿改为无审批全权限，除非确认信任任务。',
+        };
     }
     if (backend === 'codex' && mode === 'chat' && !cliCaps?.supportsDisableTools) {
         return {
@@ -540,10 +549,6 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
     // working CLI builds to be misdiagnosed as incompatible. Pass required
     // flags and let the real CLI parser give the authoritative error instead.
     // Never omit --mode: without it ZCode's --prompt defaults to YOLO.
-    if (mode === 'chat' && cliCaps?.probed && !cliCaps.supportsDisallowedTools) {
-        // Plan mode enforces read-only behavior even if filtering is unavailable;
-        // do not silently claim *no tools* without that capability.
-    }
 
     const effectiveCwd = String(workspace || config?.resolvedWorkspace || '').trim();
     const prefix = Array.isArray(config?.commandPrefix) && config.commandPrefix.length
@@ -567,8 +572,10 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
 
     if (mode === 'full') {
         args.push('--mode', 'yolo');
+    } else if (mode === 'smart') {
+        args.push('--mode', 'build'); // ZCode's native risk-aware approval policy.
     } else if (mode === 'readonly') {
-        args.push('--mode', 'build');
+        args.push('--mode', 'plan'); // Genuine read-only tool execution.
     } else {
         args.push('--mode', 'plan', '--disallowed-tools', 'Bash Edit Write Read Grep Glob LS WebFetch WebSearch TodoWrite NotebookEdit');
     }
