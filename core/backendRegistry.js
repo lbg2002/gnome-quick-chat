@@ -4,7 +4,7 @@
 
 import {makeModelEntryKey, recordRecentModelKey} from './modelCatalogCache.js';
 
-export const REGISTERED_BACKENDS = Object.freeze(['zcode', 'codex', 'openai']);
+export const REGISTERED_BACKENDS = Object.freeze(['zcode', 'codex', 'dsh', 'openai']);
 
 const VALID_MODES = new Set(['chat', 'readonly', 'smart', 'full']);
 const VALID_EFFORTS = new Set(['default', 'fast', 'standard', 'deep']);
@@ -289,6 +289,20 @@ export class BackendRegistry {
             };
         }
 
+        if (clean === 'dsh') {
+            const modeRaw = readString(this._settings, 'dsh-agent-mode', '').trim();
+            return {
+                backend: 'dsh',
+                executablePath: readString(this._settings, 'dsh-path', '').trim(),
+                provider: 'deepseek-harness',
+                // dsh uses its own profile default, not an invented --model option.
+                model: '',
+                reasoningEffort: 'default',
+                workspace: readString(this._settings, 'dsh-workspace', '').trim() || sharedWorkspace,
+                mode: VALID_MODES.has(modeRaw) ? modeRaw : 'readonly',
+            };
+        }
+
         if (clean === 'openai') {
             const effortRaw = readString(this._settings, 'openai-reasoning-effort', 'default').trim();
             return {
@@ -352,6 +366,14 @@ export class BackendRegistry {
                 if ('mode' in patch && VALID_MODES.has(patch.mode)) {
                     const safeMode = patch.mode === 'chat' ? 'readonly' : patch.mode;
                     writeString(this._settings, 'codex-agent-mode', safeMode);
+                    writeString(this._settings, 'agent-mode', safeMode);
+                }
+            } else if (clean === 'dsh') {
+                if ('executablePath' in patch) writeString(this._settings, 'dsh-path', patch.executablePath);
+                if ('workspace' in patch) writeString(this._settings, 'dsh-workspace', patch.workspace);
+                if ('mode' in patch && VALID_MODES.has(patch.mode)) {
+                    const safeMode = patch.mode === 'chat' ? 'readonly' : patch.mode;
+                    writeString(this._settings, 'dsh-agent-mode', safeMode);
                     writeString(this._settings, 'agent-mode', safeMode);
                 }
             } else if (clean === 'openai') {
