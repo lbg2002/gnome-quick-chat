@@ -6,7 +6,7 @@ import {makeModelEntryKey, recordRecentModelKey} from './modelCatalogCache.js';
 
 export const REGISTERED_BACKENDS = Object.freeze(['zcode', 'codex', 'openai']);
 
-const VALID_MODES = new Set(['chat', 'readonly', 'full']);
+const VALID_MODES = new Set(['chat', 'readonly', 'smart', 'full']);
 const VALID_EFFORTS = new Set(['default', 'fast', 'standard', 'deep']);
 
 function hasSchemaKey(settings, key) {
