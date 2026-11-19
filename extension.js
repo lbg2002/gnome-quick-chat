@@ -1079,8 +1079,7 @@ export default class QuickChat extends Extension {
             zcodePath: this._getSettingString('zcode-path', ''),
             codexPath: this._getSettingString('codex-path', ''),
             openaiBaseUrl,
-            cancellable,
-        });
+        }, {cancellable});
         const eff = selection?.effectiveBackend || 'unconfigured';
         const config = this._registry.buildRuntimeConfig(eff, {apiKey});
 
