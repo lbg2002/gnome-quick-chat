@@ -31,7 +31,7 @@ jobs:
           done
 
       - name: Check shell script syntax
-        run: bash -n install.sh uninstall.sh pack.sh
+        run: bash -n install.sh uninstall.sh pack.sh scripts/diagnose-local.sh
 
       - name: Validate GSettings XML schema strictly
         run: glib-compile-schemas --strict --dry-run schemas
@@ -53,6 +53,20 @@ jobs:
 
       - name: Run headless GJS pure-module & Gio integration smoke check
         run: gjs -m tests/gjs_smoke.js
+
+      - name: Test installed extension bundle in real headless GJS
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf -- "$tmp"' EXIT
+          mkdir -p "$tmp/home"
+          XDG_DATA_HOME="$tmp/data" HOME="$tmp/home" bash install.sh
+          bundle="$tmp/data/gnome-shell/extensions/quick-chat@lbg2002.github.io"
+          test -f "$bundle/schemas/gschemas.compiled"
+          mkdir -p "$bundle/tests/fixtures"
+          cp tests/gjs_smoke.js "$bundle/tests/"
+          cp tests/fixtures/productionAdapterFixtures.js "$bundle/tests/fixtures/"
+          (cd "$bundle" && gjs -m tests/gjs_smoke.js)
 
       - name: Run automated unit, security, streaming & lifecycle tests
         run: npm test
