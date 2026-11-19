@@ -1211,13 +1211,21 @@ export function normalizeEvent(backend, record) {
                     isError: record.status === 'error',
                     detail: String(record.error?.message || record.result || '').slice(0, 2048),
                 };
-            case 'final':
+            case 'final': {
+                // DSH's durable final.reason is a structured turn/end reason
+                // ({kind:'completed'}), not a bare string. Fail closed for any
+                // other reason even when a CLI wrapper exits with code 0.
+                const kind = typeof record.reason === 'object' && record.reason !== null
+                    ? String(record.reason.kind || '')
+                    : String(record.reason || '');
+                const completed = kind === 'completed';
                 return {
                     type: 'turn_result', sessionId: String(record.sessionId || ''),
                     text: String(record.text || ''), authoritative: true,
-                    isError: record.reason === null || record.reason === 'error' || record.reason === 'aborted',
-                    errorMessage: record.reason === null ? 'DSH 未确认本次任务完成' : '',
+                    isError: !completed,
+                    errorMessage: completed ? '' : `DSH 未正常完成本次任务：${kind || '缺少终止原因'}`,
                 };
+            }
             case 'error':
                 return {
                     type: 'message_end',
