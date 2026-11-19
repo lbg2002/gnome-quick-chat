@@ -75,7 +75,7 @@ test('ZCode and Codex argument builders map permission modes, reasoning effort, 
     assert.equal(zChat[zChat.indexOf('--mode') + 1], 'plan');
 
     const zRead = buildZCodeArgs({executable: 'zcode', mode: 'readonly'}, '查股价');
-    assert.equal(zRead[zRead.indexOf('--mode') + 1], 'build');
+    assert.equal(zRead[zRead.indexOf('--mode') + 1], 'plan');
 
     const zFull = buildZCodeArgs({executable: 'zcode', mode: 'full'}, '执行');
     assert.equal(zFull[zFull.indexOf('--mode') + 1], 'yolo');
