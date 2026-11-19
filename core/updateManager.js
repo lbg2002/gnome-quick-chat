@@ -26,10 +26,14 @@ export function compareVersions(a, b) {
 function readAsset(assets, tag, name, limit) {
     const asset = assets.find(a => a?.name === name);
     if (!asset) return null;
-    const expected = `https://github.com/${RELEASE_REPOSITORY}/releases/download/${tag}/${encodeURIComponent(name)}`;
+    // GitHub may return a literal '@' or a percent-encoded '%40' in asset URLs.
+    // Accept only those two exact representations; reject foreign hosts, queries
+    // and paths with traversal/extra segments.
+    const prefix = `https://github.com/${RELEASE_REPOSITORY}/releases/download/${tag}/`;
     const url = String(asset.browser_download_url || '');
+    const exactPaths = [prefix + name, prefix + encodeURIComponent(name)];
     const size = Number(asset.size || 0);
-    if (url !== expected || !Number.isSafeInteger(size) || size <= 0 || size > limit) {
+    if (!exactPaths.includes(url) || !Number.isSafeInteger(size) || size <= 0 || size > limit) {
         return null;
     }
     return {name, url, size};
