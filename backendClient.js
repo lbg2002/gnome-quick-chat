@@ -458,10 +458,11 @@ export async function resolveBackendRuntimeAsync(config = {}, {
         const pathDirs = await buildSearchPathAsync(rawDshPath);
         if (cancellable?.is_cancelled?.()) throw new Error('连接已取消');
         const env = createGioCliEnv(rawDshPath, pathDirs);
-        const executable = (rawDshPath ? env.resolveCandidate(rawDshPath) : '')
-            || findExecutableInDirs('dsh', pathDirs);
+        // Pin the executable whose real headless --help contract was probed.
+        // Avoid switching to another PATH candidate between detection and spawn.
+        const executable = String(selection.executable || '');
         if (!executable || !env.isExecutable(executable)) {
-            throw new Error('未检测到 DeepSeek Harness CLI（dsh），请检查 PATH 或指定 dsh 路径');
+            throw new Error('DSH 检测结果已失效：已验证的 dsh 可执行文件不存在或不可执行，请重新连接');
         }
         const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode);
         return {
