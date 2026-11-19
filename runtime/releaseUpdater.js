@@ -32,11 +32,11 @@ export function getInstalledExtensionMode() {
     return classifyInstallMode(user, system);
 }
 
-async function downloadTrustedBytes(url, {cancellable, maxBytes, session}) {
+async function downloadTrustedBytes(url, {cancellable, maxBytes, session, accept = 'application/octet-stream'}) {
     ensureNotCancelled(cancellable);
     const msg = Soup.Message.new('GET', url);
     if (!msg) throw new Error('无法创建安全更新请求');
-    msg.get_request_headers().append('Accept', 'application/octet-stream');
+    msg.get_request_headers().append('Accept', accept);
     msg.get_request_headers().append('User-Agent', 'Quick-Chat-GNOME-Updater');
     const {status, bytes} = await readSoupResponseBytesBoundedAsync(session, msg, {
         maxBytes, cancellable,
@@ -51,9 +51,22 @@ async function downloadTrustedBytes(url, {cancellable, maxBytes, session}) {
 export async function checkGitHubRelease(currentVersion, {cancellable = null} = {}) {
     const session = new Soup.Session({timeout: 20, user_agent: 'Quick Chat GNOME updater'});
     try {
-        const bytes = await downloadTrustedBytes(RELEASE_API, {
-            cancellable, maxBytes: MAX_RELEASE_RESPONSE_BYTES, session,
-        });
+        let bytes;
+        try {
+            bytes = await downloadTrustedBytes(RELEASE_API, {
+                cancellable, maxBytes: MAX_RELEASE_RESPONSE_BYTES, session,
+                accept: 'application/vnd.github+json',
+            });
+        } catch (err) {
+            // Some enterprise proxies reject vendor media types with HTTP 415.
+            // A standards-compatible JSON Accept is safe for the same GET URL;
+            // never retry a POST or change the update origin.
+            if (!/HTTP 415\b/.test(String(err?.message || err))) throw err;
+            bytes = await downloadTrustedBytes(RELEASE_API, {
+                cancellable, maxBytes: MAX_RELEASE_RESPONSE_BYTES, session,
+                accept: 'application/json',
+            });
+        }
         let parsed;
         try { parsed = JSON.parse(decoder.decode(bytes)); }
         catch (_) { throw new Error('GitHub Release 返回了无法解析的 JSON'); }
