@@ -22,7 +22,7 @@ else
   echo '扩展状态: 未安装 gnome-extensions 命令'
 fi
 
-for engine in zcode codex; do
+for engine in zcode codex dsh; do
   echo
   echo "CLI: $engine"
   if command -v "$engine" >/dev/null 2>&1; then
@@ -36,12 +36,19 @@ for engine in zcode codex; do
     else
       echo '缺少 timeout，跳过可能卡住的版本探测'
     fi
+    if [[ "$engine" == dsh ]] && command -v timeout >/dev/null 2>&1; then
+      if timeout 6 "$engine" --profile headless --help 2>/dev/null | grep -q -- '--permission-mode'; then
+        echo 'Headless JSONL 权限接口：帮助中已检测到'
+      else
+        echo 'Headless 接口：未验证（请在随问诊断中检查 CLI 版本或配置档）'
+      fi
+    fi
   else
     echo 'PATH 中未找到该命令（如使用自定义路径，请在扩展设置中核查）'
   fi
 done
 
 echo
-echo '注意：此脚本不会连接模型或验证 ZCode/Codex 账号、权限桥接。'
+echo '注意：此脚本不会连接模型或验证 ZCode/Codex/DSH 的真实登录与权限审批。'
 echo '请在随问中分别进行一次纯问答和一次只读任务，再检查界面内的脱敏诊断信息。'
 echo '请勿直接公开包含 API Key、提示词或文件正文的原始日志。'
