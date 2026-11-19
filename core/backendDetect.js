@@ -1053,7 +1053,17 @@ export async function detectBackendSelectionAsync({
             if (cancellable?.is_cancelled?.()) {
                 throw new Error('Backend detection cancelled');
             }
-            const extra = zcodePath || codexPath || '';
+            // An explicitly configured HTTP API must never wait for the local
+            // ZCode/Codex PATH scan, binary header reads, or CLI --version.
+            if (configuredBackend === 'openai') {
+                return resolveBackendSelection(
+                    {configuredBackend, zcodePath, codexPath, openaiBaseUrl},
+                    {hasZCode: () => false, hasCodex: () => false}
+                );
+            }
+            const extra = configuredBackend === 'zcode' ? zcodePath
+                : configuredBackend === 'codex' ? codexPath
+                : (zcodePath || codexPath);
             const pathDirs = await buildSearchPathAsync(extra, {forceRefresh});
             if (cancellable?.is_cancelled?.()) {
                 throw new Error('Backend detection cancelled');
@@ -1092,9 +1102,13 @@ export async function detectBackendSelectionAsync({
                 }
             };
 
-            const rawCandidates = new Set(['zcode', 'codex']);
-            if (zcodePath) rawCandidates.add(zcodePath);
-            if (codexPath) rawCandidates.add(codexPath);
+            const rawCandidates = new Set(
+                configuredBackend === 'zcode' ? ['zcode']
+                    : configuredBackend === 'codex' ? ['codex']
+                    : ['zcode', 'codex']
+            );
+            if (zcodePath && configuredBackend !== 'codex') rawCandidates.add(zcodePath);
+            if (codexPath && configuredBackend !== 'zcode') rawCandidates.add(codexPath);
 
             await Promise.all(Array.from(rawCandidates).map(c => preloadCandidate(c)));
             if (cancellable?.is_cancelled?.()) {
