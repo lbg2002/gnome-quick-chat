@@ -51,11 +51,13 @@ test('DSH: normalize official JSON line events with committed final answer', () 
     assert.equal(normalizeEvent('dsh',{type:'thinking',text:'思考'}).assistantMessageEvent.type,'thinking_delta');
     assert.equal(normalizeEvent('dsh',{type:'tool_call',callId:'call-1',tool:'read_file'}).type,'tool_execution_start');
     assert.equal(normalizeEvent('dsh',{type:'tool_result',callId:'call-1',status:'error'}).isError,true);
-    const final = normalizeEvent('dsh',{type:'final',sessionId:'session-abcd',reason:'completed',text:'最终结果'});
+    const final = normalizeEvent('dsh',{type:'final',sessionId:'session-abcd',reason:{kind:'completed'},text:'最终结果'});
     assert.equal(final.type,'turn_result');
     assert.equal(final.text,'最终结果');
     assert.equal(final.authoritative,true);
     assert.equal(final.isError,false);
+    assert.equal(normalizeEvent('dsh',{type:'final',reason:{kind:'error',error:{message:'failed'}},text:''}).isError,true);
+    assert.equal(normalizeEvent('dsh',{type:'final',reason:null,text:''}).isError,true);
 });
 test('DSH: config is selected explicitly and isolated from Codex/ZCode profiles', () => {
     const sel=resolveBackendSelection({configuredBackend:'dsh',dshPath:'/usr/bin/dsh'},{hasDsh:()=>true});
