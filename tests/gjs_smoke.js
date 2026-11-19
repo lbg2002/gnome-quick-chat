@@ -507,8 +507,9 @@ let mockHttpProc = null;
         assert(dshSettled.status === 'completed',
             `DSH headless turn failed in real GJS: ${dshSettled.errorMessage}`);
         assert(dshEvents.some(e => e.type === 'message_end' &&
-            String(e.message?.content || '').includes('DSH 完成:测试 DSH')),
-            'DSH official final event must replace interim text');
+            String(e.message?.content || '').startsWith('DSH 完成:') &&
+            String(e.message?.content || '').includes('测试 DSH')),
+            'DSH official final event must replace interim text (including injected desktop context)');
 
         // 5E. Full startup pipeline: detect CLI identity -> async capability probe ->
         // BackendClient.startAsync -> get_state/get_messages (not just direct adapters).
