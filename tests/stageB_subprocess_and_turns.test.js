@@ -149,8 +149,9 @@ async function runMonitoredFakeCli({
 test('B2: Capability matrix is honest (ZCode approval agent vs Codex read-only sandbox vs OpenAI pure chat) and CLI flags are validated', () => {
     const zCaps = getBackendCapabilities('zcode');
     assert.equal(zCaps.supportsApproval, true);
-    assert.equal(zCaps.modeBadges.readonly, '需审批 Agent');
-    assert.ok(zCaps.modeLabels[1].includes('非系统级沙箱'));
+    assert.equal(zCaps.modeBadges.readonly, '只读');
+    assert.equal(zCaps.modeBadges.smart, '智能审批');
+    assert.ok(zCaps.modeLabels[1].includes('需由 ZCode 权限桥接确认') || zCaps.modeLabels[1].includes('高风险'));
 
     // Codex without a real --no-tools flag disables pureChat and downgrades 'chat' to 'readonly' sandbox without fake prompt injection
     const codexProbed = parseCodexHelpCapabilities(
@@ -163,7 +164,7 @@ test('B2: Capability matrix is honest (ZCode approval agent vs Codex read-only s
 
     const cCaps = getBackendCapabilities('codex', codexProbed);
     assert.equal(cCaps.pureChat, false);
-    assert.deepEqual(cCaps.supportedModes, ['readonly', 'full']);
+    assert.deepEqual(cCaps.supportedModes, ['readonly', 'smart', 'full']);
 
     const eff = normalizeEffectiveAgentMode('codex', 'chat', codexProbed);
     assert.equal(eff.effectiveMode, 'readonly');
