@@ -2661,10 +2661,18 @@ export async function deleteSessionDirectoryWithIo(sessionsRootDir, sessionId, i
         paths.corruptPath,
         paths.legacyPath,
     ];
-    for (const fp of knownFiles) {
-        await io.unlink?.(fp);
+    try {
+        for (const fp of knownFiles) {
+            await io.unlink?.(fp);
+        }
+        await io.rmdir?.(paths.dir);
+    } catch (err) {
+        return {
+            ok: false,
+            sessionId: paths.sessionId,
+            error: `删除会话未完成，请核查剩余文件：${err?.message || err}`,
+        };
     }
-    await io.rmdir?.(paths.dir);
     return {ok: true, sessionId: paths.sessionId};
 }
 
