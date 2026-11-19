@@ -424,3 +424,64 @@ console.log('no probe expected');
         await fs.rm(tmpRoot, {recursive: true, force: true});
     }
 });
+
+test('DSH: custom wrapper is accepted only when its actual headless help supports our JSONL contract', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'qc-dsh-wrapper-'));
+    try {
+        const wrapper = path.join(tmpRoot, 'my-deepseek-wrapper');
+        await fs.writeFile(wrapper, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args.includes('--help')) {
+  console.log('Usage: dsh --profile headless [options] [task...]');
+  console.log('--json --session-id --permission-mode --approval-policy');
+} else if (args.includes('--version')) {
+  console.log('deepseek-harness 0.2.0');
+}
+`, {mode: 0o755});
+        invalidateBackendDetectionCaches('all');
+        const good = await detectBackendSelectionAsync({
+            configuredBackend: 'dsh', dshPath: wrapper,
+        }, {forceRefresh: true});
+        assert.equal(good.effectiveBackend, 'dsh');
+        assert.equal(good.available, true);
+        assert.equal(good.executable, wrapper);
+
+        // A deceptive wrapper filename must not be enough to pass capability detection.
+        const bogus = path.join(tmpRoot, 'dsh');
+        await fs.writeFile(bogus, `#!/usr/bin/env node
+console.log('not the official dsh headless interface');
+`, {mode: 0o755});
+        const invalid = await detectBackendSelectionAsync({
+            configuredBackend: 'dsh', dshPath: bogus,
+        }, {forceRefresh: true});
+        assert.equal(invalid.available, false);
+    } finally {
+        await fs.rm(tmpRoot, {recursive: true, force: true});
+    }
+});
+
+test('DSH: auto mode falls back to a verified DSH before OpenAI if ZCode and Codex are missing', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'qc-dsh-auto-'));
+    try {
+        const customDsh = path.join(tmpRoot, 'custom-headless');
+        await fs.writeFile(customDsh, `#!/usr/bin/env node
+if (process.argv.includes('--help')) {
+  console.log('Usage: dsh --profile headless [options] [task...]');
+  console.log('--json --session-id --permission-mode --approval-policy');
+}
+`, {mode: 0o755});
+        invalidateBackendDetectionCaches('all');
+        const found = await detectBackendSelectionAsync({
+            configuredBackend: 'auto',
+            zcodePath: path.join(tmpRoot, 'missing-zcode'),
+            codexPath: path.join(tmpRoot, 'missing-codex'),
+            dshPath: customDsh,
+            openaiBaseUrl: 'https://api.example.test/v1',
+        }, {forceRefresh: true});
+        assert.equal(found.effectiveBackend, 'dsh');
+        assert.equal(found.available, true);
+        assert.equal(found.executable, customDsh);
+    } finally {
+        await fs.rm(tmpRoot, {recursive: true, force: true});
+    }
+});
