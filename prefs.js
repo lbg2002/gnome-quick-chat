@@ -769,11 +769,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         uiPage.add(agentGroup);
 
-        const modes = ['chat', 'readonly', 'full'];
+        const modes = ['readonly', 'smart', 'full'];
         const modeComboModel = Gtk.StringList.new([
-            '纯问答 (禁用本地工具)',
-            '需审批 Agent (推荐 · 敏感操作气泡内审批)',
-            '全自动高权限 Agent (高危 · 免审批直接执行)',
+            '只读（允许查看文件与检索，禁止修改）',
+            '智能（低风险自动执行，修改/删除需真实审批；Codex 无审批通道时仍只读）',
+            '完全权限（危险：允许无审批修改与删除）',
         ]);
         const modeRow = new Adw.ComboRow({
             title: 'Agent 权限模式',
