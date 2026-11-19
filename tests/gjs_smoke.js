@@ -464,7 +464,7 @@ let mockHttpProc = null;
             const cliFile = GLib.build_filenamev([tmpRoot, kind]);
             const cliStub = [
                 '#!/usr/bin/env node',
-                '// @zcode/cli / codex-cli startup fixture',
+                kind === 'zcode' ? '// @zcode/cli startup fixture' : '// codex-cli startup fixture',
                 "const args = process.argv.slice(2);",
                 "if (args.includes('--version')) {",
                 `  console.log('${kind === 'zcode' ? 'zcode 1.1.0' : 'codex-cli 0.42.0'}');`,
