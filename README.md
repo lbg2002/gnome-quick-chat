@@ -157,6 +157,28 @@ stateDiagram-v2
 * **基础依赖**：`gjs`、`glib-compile-schemas`、`gir1.2-soup-3.0`（Ubuntu 26.04 默认已预装）
 * **智能后端（三选一即可）**：`ZCode CLI`、`Codex CLI`，或任意 **OpenAI 兼容 API 地址**
 
+### 发布版安装包（无需克隆源码）
+
+GitHub Actions 每次提交到 `main` 都会构建可下载的安装包（在 Actions → **Build install packages and GitHub Release** → Artifacts 中）；推送与项目版本一致的 `vX.Y.Z` 标签会自动创建 GitHub Release，上传：
+
+- **`gnome-shell-extension-quick-chat_X.Y.Z_all.deb`**：Ubuntu 26.04 / GNOME Shell 50 的系统级安装包，依赖由 APT 管理，可用 `sudo apt install ./gnome-shell-extension-quick-chat_X.Y.Z_all.deb` 安装和升级；
+- **`quick-chat@lbg2002.github.io.shell-extension.zip`**：GNOME 官方扩展 ZIP 格式，可使用 `gnome-extensions install --force ./quick-chat@lbg2002.github.io.shell-extension.zip` 安装到当前用户目录；
+- **`SHA256SUMS`**：包的 SHA-256 校验清单，供应用内更新和手动校验使用。
+
+从 [GitHub Releases](https://github.com/lbg2002/gnome-quick-chat/releases) 下载正式版本。ZIP 和 DEB **二选一**：请不要同时保留用户级与系统级同一 UUID 的扩展（用户目录会覆盖系统目录）。安装后在 Wayland 桌面需要**注销并重新登录**，不能热替换当前 GNOME Shell 进程。
+
+**应用内检查更新**：打开 `⚙ 设置 → 关于与更新 → 检查更新`。用户级 ZIP 安装支持点击 **「下载并安装 ZIP」**，自动从官方 Release 下载 ZIP 和 `SHA256SUMS`、校验哈希，再调用 GNOME 扩展管理器；整个过程不需要自己的服务器，也不访问任何第三方更新源。若当前是 DEB 系统级安装，设置页只提供发布页面，请下载新 DEB 使用包管理器升级（不在扩展内请求 sudo 权限）。**不会在后台自动检查或安装更新。**
+
+开发者可本地构建：
+
+```bash
+bash scripts/build-packages.sh dist
+# 需要 gnome-extensions、dpkg-deb、unzip、python3、glib-compile-schemas
+# 输出 ZIP / DEB / SHA256SUMS
+```
+
+Release 发布：维护者先在 `metadata.json` 的 `version-name` 和 `package.json` 中设置相同的 `X.Y.Z`，验证 Actions 通过后，推送 Git 标签 `vX.Y.Z`（例如 `git tag v0.3.0 && git push origin v0.3.0`）。工作流校验 tag 与项目版本一致后才发布，避免误发布不同版本号的包。
+
 ### 原子化一键安装
 
 ```bash
@@ -208,7 +230,7 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 ├── backendClient.js           # 统一后端门面（委托三后端适配器、SessionStore 与 TurnController）
 ├── protocol.js                # 协议事件归一化、能力矩阵、上下文整轮预算与 CLI 参数构建
 ├── zcodeBridge.cjs            # ZCode 无头模式权威权限桥接（版本握手 + 同源策略校验）
-├── prefs.js                   # Libadwaita 三分页设置中心（模型与后端 / 界面与权限 / 脱敏诊断）
+├── prefs.js                   # Libadwaita 四分页设置中心（模型与后端 / 界面与权限 / 脱敏诊断 / 关于与更新）
 ├── backends/                  # 统一接口三后端适配器 (baseAdapter / zcode / codex / openai)
 ├── core/                      # 纯 JS 核心引擎（零 GI 硬依赖，单测直接验证真实生产代码）
 │   ├── chatController.js      # 连接合并、防抖重连、生命周期世代隔离与权限范围自动撤销
@@ -229,6 +251,8 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 │   └── diagnosticsReport.js   # 白名单脱敏运行诊断快照与复制报告生成
 ├── runtime/                   # 独立进程组管理 (processManager / cliProcessRunner)、Soup 有界流与跨域重定向守卫 (httpStreamClient)、SSE 解析 (sseParser) 与系统密钥环 (secretStorage)
 ├── ui/                        # 原生 St/Clutter 视图组件 (chatPanel / messageCard / approvalCard / modelPicker / historyWindow / traceBar / turnComposer / statusHeader / quickActionsPopover)
+├── runtime/releaseUpdater.js  # 用户级 ZIP 下载安装、SHA-256 校验及更新权限边界
+├── scripts/build-packages.sh  # 统一 ZIP / DEB 打包，输出 SHA256SUMS
 ├── schemas/                   # GSettings XML Schema 定义（含旧版配置幂等迁移字段）
 ├── tests/                     # Node.js + GJS 生产路径自动化测试套件（132 项单测与假 CLI / 双源 HTTP / Gio 子进程集成测试）
 ├── install.sh / uninstall.sh  # 带锁原子安装回滚与支持 --purge 精确清理的卸载脚本
