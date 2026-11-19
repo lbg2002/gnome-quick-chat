@@ -11,6 +11,7 @@ registerGiMocks();
 const Gio = (await import('gi://Gio')).default;
 const {parseLinuxProcStat} = await import('../runtime/cliProcessRunner.js');
 const {
+    detectBackendSelection,
     detectBackendSelectionAsync,
     invalidateBackendDetectionCaches,
     peekBackendSelection,
@@ -361,6 +362,35 @@ setTimeout(() => {
         assert.equal(stateChanges.length, 1);
 
         controller.dispose();
+    } finally {
+        await fs.rm(tmpRoot, {recursive: true, force: true});
+    }
+});
+
+test('R4.5: a synchronous unavailable result must not suppress later async CLI discovery', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'qc-r4-cache-'));
+    try {
+        invalidateBackendDetectionCaches('all');
+        const customCodex = path.join(tmpRoot, 'custom-cli');
+        const initial = detectBackendSelection({
+            configuredBackend: 'codex',
+            codexPath: customCodex,
+        });
+        assert.equal(initial.available, false, 'Missing CLI correctly appears unavailable');
+
+        // Simulate installation after a Preferences/UI synchronous inspection.
+        // The authoritative async probe must not reuse the earlier negative result.
+        await fs.writeFile(customCodex, `#!/usr/bin/env node
+if (process.argv.includes('--version')) console.log('codex-cli 0.99.0');
+if (process.argv.includes('--help')) console.log('codex exec --json --sandbox read-only');
+`, {mode: 0o755});
+
+        const resolved = await detectBackendSelectionAsync({
+            configuredBackend: 'codex',
+            codexPath: customCodex,
+        });
+        assert.equal(resolved.effectiveBackend, 'codex');
+        assert.equal(resolved.available, true, 'Async detection must discover a newly available CLI');
     } finally {
         await fs.rm(tmpRoot, {recursive: true, force: true});
     }
