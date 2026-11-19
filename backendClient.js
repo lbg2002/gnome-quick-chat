@@ -264,6 +264,7 @@ export async function resolveBackendRuntimeAsync(config = {}, {
         zcodePath: rawZCodePath,
         codexPath: rawCodexPath,
         openaiBaseUrl: rawBaseUrl,
+    }, {
         forceRefresh,
         cancellable,
         timeoutMs,
