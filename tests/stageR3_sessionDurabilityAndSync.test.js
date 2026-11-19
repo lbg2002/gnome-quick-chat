@@ -401,10 +401,11 @@ test('R3.3: Rapid double-click Retry (↻) and Rewind vs. New/Delete session con
 
 test('R3.4: remoteSyncedRevision advances ONLY on backend confirmation; CLI spawn failure invalidates remoteSessionId and avoids duplicate prompt injection', async () => {
     const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'qc-r3-remotesync-'));
+    let store = null;
     try {
         const io = createControllableIo();
         const cfg = {provider: '', model: '', workspace: tmpRoot, mode: 'full', effectiveMode: 'full'};
-        const store = new SessionStoreEngine('sess_r3_sync', {
+        store = new SessionStoreEngine('sess_r3_sync', {
             sessionsRootDir: tmpRoot,
             io,
             buildContextSignature: buildRuntimeContextSignature,
@@ -573,7 +574,10 @@ process.exit(0);
         assert.match(turn3Call.promptContent, /第三问：现在只查看当前状态/);
     } finally {
         delete process.env.QC_TEST_ARGS_LOG;
-        await fs.rm(tmpRoot, {recursive: true, force: true});
+        // agent_settled arrives before durable JSONL writes have necessarily
+        // closed. Await persistence before removing the fixture directory.
+        try { await store?.flush(); } catch (_) {}
+        await fs.rm(tmpRoot, {recursive: true, force: true, maxRetries: 5, retryDelay: 75});
     }
 });
 
