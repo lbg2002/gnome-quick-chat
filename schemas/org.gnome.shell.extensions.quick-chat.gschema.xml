@@ -79,7 +79,7 @@
     </key>
     <key name="agent-mode" type="s">
       <default>'readonly'</default>
-      <summary>Agent permission mode (chat, readonly, full)</summary>
+      <summary>Agent permission mode (chat legacy, readonly, smart, full)</summary>
     </key>
     <key name="reasoning-effort" type="s">
       <default>'default'</default>
