@@ -104,6 +104,7 @@ for req in \
   backends/baseAdapter.js \
   backends/zcodeAdapter.js \
   backends/codexAdapter.js \
+  backends/dshAdapter.js \
   backends/openaiAdapter.js \
   core/backendRegistry.js \
   core/chatController.js \
