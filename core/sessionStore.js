@@ -538,19 +538,29 @@ export function createGioSessionIo() {
             });
         },
         unlink(filePath) {
-            try {
-                if (filePath && GLib.file_test(filePath, GLib.FileTest.EXISTS) && !GLib.file_test(filePath, GLib.FileTest.IS_DIR)) {
-                    GLib.unlink(filePath);
-                }
-            } catch (_) {}
+            if (!filePath) return Promise.resolve();
+            if (GLib.file_test(filePath, GLib.FileTest.IS_SYMLINK)) {
+                return Promise.reject(new Error(`拒绝删除符号链接会话文件：${filePath}`));
+            }
+            if (!GLib.file_test(filePath, GLib.FileTest.EXISTS)) {
+                return Promise.resolve();
+            }
+            if (GLib.file_test(filePath, GLib.FileTest.IS_DIR) || GLib.unlink(filePath) !== 0) {
+                return Promise.reject(new Error(`无法删除会话文件：${filePath}`));
+            }
             return Promise.resolve();
         },
         rmdir(dirPath) {
-            try {
-                if (dirPath && GLib.file_test(dirPath, GLib.FileTest.IS_DIR) && !GLib.file_test(dirPath, GLib.FileTest.IS_SYMLINK)) {
-                    GLib.rmdir(dirPath);
-                }
-            } catch (_) {}
+            if (!dirPath) return Promise.resolve();
+            if (GLib.file_test(dirPath, GLib.FileTest.IS_SYMLINK)) {
+                return Promise.reject(new Error(`拒绝删除符号链接会话目录：${dirPath}`));
+            }
+            if (!GLib.file_test(dirPath, GLib.FileTest.IS_DIR)) {
+                return Promise.resolve();
+            }
+            if (GLib.rmdir(dirPath) !== 0) {
+                return Promise.reject(new Error(`无法删除会话目录（可能包含未识别文件）：${dirPath}`));
+            }
             return Promise.resolve();
         },
     };
