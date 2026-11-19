@@ -395,3 +395,32 @@ if (process.argv.includes('--help')) console.log('codex exec --json --sandbox re
         await fs.rm(tmpRoot, {recursive: true, force: true});
     }
 });
+
+test('QA-06: explicit OpenAI selection never executes local CLI identity probes', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'qc-openai-no-cli-'));
+    const marker = path.join(tmpRoot, 'was-probed');
+    try {
+        invalidateBackendDetectionCaches('all');
+        const cliPaths = {};
+        for (const name of ['zcode', 'codex']) {
+            const cliPath = path.join(tmpRoot, name);
+            await fs.writeFile(cliPath, `#!/usr/bin/env node
+require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'probe\\n');
+console.log('no probe expected');
+`, {mode: 0o755});
+            cliPaths[name] = cliPath;
+        }
+        const selection = await detectBackendSelectionAsync({
+            configuredBackend: 'openai',
+            zcodePath: cliPaths.zcode,
+            codexPath: cliPaths.codex,
+            openaiBaseUrl: 'https://api.example.test/v1',
+        }, {forceRefresh: true});
+        assert.equal(selection.effectiveBackend, 'openai');
+        assert.equal(selection.available, true);
+        assert.equal(fsSync.existsSync(marker), false,
+            'Explicit API configuration must skip all ZCode/Codex subprocess probes');
+    } finally {
+        await fs.rm(tmpRoot, {recursive: true, force: true});
+    }
+});
