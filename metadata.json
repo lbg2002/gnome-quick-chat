@@ -1,12 +1,12 @@
 {
   "uuid": "quick-chat@lbg2002.github.io",
   "name": "Quick Chat · 随问",
-  "description": "GNOME 50 通知栏原生 AI 随问与 Agent 工具助手（支持 ZCode / Codex / OpenAI API）",
+  "description": "GNOME 50 通知栏原生 AI 随问，支持 ZCode / Codex / DeepSeek Harness (DSH) / OpenAI API",
   "shell-version": [
     "50"
   ],
   "settings-schema": "org.gnome.shell.extensions.quick-chat",
   "url": "https://github.com/lbg2002/gnome-quick-chat",
-  "version": 3,
-  "version-name": "0.3.0"
+  "version": 4,
+  "version-name": "0.3.1"
 }
