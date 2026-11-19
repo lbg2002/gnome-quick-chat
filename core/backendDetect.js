@@ -10,6 +10,7 @@ import {
 import {
     createGSettingsStoreAdapter,
     identifyCliCandidate,
+    matchesDshHeadlessHelp,
     migrateLegacyConfig,
     resolveBackendSelection,
 } from './configMigration.js';
@@ -1043,6 +1044,29 @@ export function detectBackendSelection({
     return {...resolved};
 }
 
+/**
+ * Verify the exact headless JSONL and permission capabilities used by our DSH
+ * adapter. Do not reject a user-provided executable merely because its wrapper
+ * filename isn't "dsh", and do not accept a random executable named "dsh".
+ * This probe is bounded, cancellable, and never blocks the Shell main loop.
+ */
+async function probeDshHeadlessCandidateAsync(dshPath = '', {cancellable = null, forceRefresh = false, timeoutMs = 1400} = {}) {
+    const dirs = await buildSearchPathAsync(dshPath, {forceRefresh});
+    if (cancellable?.is_cancelled?.()) throw new Error('Backend detection cancelled');
+    const cliEnv = createGioCliEnv(dshPath, dirs);
+    const candidate = dshPath ? cliEnv.resolveCandidate(dshPath)
+        : findExecutableInDirs('dsh', dirs);
+    if (!candidate || !cliEnv.isExecutable(candidate)) return {available: false, executable: ''};
+
+    const probe = await runShortProbeCommandWithMetaAsync(
+        [candidate, '--profile', 'headless', '--help'],
+        {}, 8192,
+        {timeoutMs: Math.max(5000, Number(timeoutMs) || 0), cancellable}
+    );
+    if (probe.cancelled || cancellable?.is_cancelled?.()) throw new Error('Backend detection cancelled');
+    return {available: Boolean(probe.ok && matchesDshHeadlessHelp(probe.output)), executable: candidate};
+}
+
 export async function detectBackendSelectionAsync({
     configuredBackend = 'auto',
     zcodePath = '',
@@ -1073,20 +1097,16 @@ export async function detectBackendSelectionAsync({
                 );
             }
             if (configuredBackend === 'dsh') {
-                const pathDirs = await buildSearchPathAsync(dshPath, {forceRefresh});
-                if (cancellable?.is_cancelled?.()) throw new Error('Backend detection cancelled');
-                const env = createGioCliEnv(dshPath, pathDirs);
-                const selected = dshPath ? env.resolveCandidate(dshPath)
-                    : findExecutableInDirs('dsh', pathDirs);
-                const hasDsh = Boolean(
-                    selected && env.isExecutable(selected) &&
-                    // Do not accept an arbitrary unrelated binary via custom path.
-                    /^(dsh|dsh-cli)$/.test(String(selected).split('/').pop())
-                );
-                return resolveBackendSelection(
-                    {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
-                    {hasDsh: () => hasDsh}
-                );
+                const dsh = await probeDshHeadlessCandidateAsync(dshPath, {
+                    cancellable, forceRefresh, timeoutMs,
+                });
+                return {
+                    ...resolveBackendSelection(
+                        {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
+                        {hasDsh: () => dsh.available}
+                    ),
+                    ...(dsh.available ? {executable: dsh.executable} : {}),
+                };
             }
             const extra = configuredBackend === 'zcode' ? zcodePath
                 : configuredBackend === 'codex' ? codexPath
@@ -1148,9 +1168,7 @@ export async function detectBackendSelectionAsync({
                 readFileHead: p => (headPreload.has(p) ? headPreload.get(p) : ''),
                 probeVersion: p => (verPreload.has(p) ? verPreload.get(p) : ''),
             };
-            return resolveBackendSelection(
-                {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
-                {
+            const selectionEnv = {
                     ...asyncAwareEnv,
                     hasZCode(customZCodePath = '') {
                         const custom = String(customZCodePath || '').trim();
@@ -1172,7 +1190,29 @@ export async function detectBackendSelectionAsync({
                         const pathCodex = findExecutableInDirs('codex', pathDirs);
                         return Boolean(pathCodex && identifyCliCandidate(pathCodex, asyncAwareEnv) === 'codex');
                     },
-                }
+                };
+            // In automatic mode DSH is considered only after ZCode and Codex.
+            // The old selection environment omitted hasDsh entirely, so the
+            // runtime never chose an installed DSH without manual selection.
+            if (configuredBackend === 'auto' &&
+                !selectionEnv.hasZCode(zcodePath) &&
+                !selectionEnv.hasCodex(codexPath)) {
+                const dsh = await probeDshHeadlessCandidateAsync(dshPath, {
+                    cancellable, forceRefresh, timeoutMs,
+                });
+                selectionEnv.hasDsh = () => dsh.available;
+                const selected = resolveBackendSelection(
+                    {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
+                    selectionEnv
+                );
+                return {
+                    ...selected,
+                    ...(selected.effectiveBackend === 'dsh' ? {executable: dsh.executable} : {}),
+                };
+            }
+            return resolveBackendSelection(
+                {configuredBackend, zcodePath, codexPath, dshPath, openaiBaseUrl},
+                selectionEnv
             );
         },
         {forceRefresh}
