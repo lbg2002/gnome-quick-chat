@@ -3,14 +3,14 @@
 
 import {messageText, messageThinking} from '../protocol.js';
 
-export const SUPPORTED_BACKENDS = Object.freeze(['auto', 'zcode', 'codex', 'openai']);
+export const SUPPORTED_BACKENDS = Object.freeze(['auto', 'zcode', 'codex', 'dsh', 'openai']);
 export const CURRENT_CONFIG_VERSION = 1;
 
 export const PI_MIGRATION_NOTICE =
     '旧版 Pi 后端已移除，已安全迁移为「自动检测」；请确认或重新选择 ZCode、Codex 或 OpenAI 兼容 API。';
 
 export const UNCONFIGURED_BACKEND_MESSAGE =
-    '未检测到可用后端：请安装 ZCode CLI / Codex CLI，或在设置（⚙）中配置自定义 OpenAI 兼容 API。';
+    '未检测到可用后端：请安装 ZCode CLI / Codex CLI / DeepSeek Harness (dsh)，或在设置（⚙）中配置自定义 OpenAI 兼容 API。';
 
 function pathBasename(p) {
     const clean = String(p || '').trim().replace(/\/+$/, '');
@@ -133,6 +133,7 @@ export function resolveBackendSelection(
         configuredBackend = 'auto',
         zcodePath = '',
         codexPath = '',
+        dshPath = '',
         openaiBaseUrl = '',
     } = {},
     env = {}
@@ -141,6 +142,7 @@ export function resolveBackendSelection(
     const normalizedConfigured = SUPPORTED_BACKENDS.includes(rawBackend) ? rawBackend : 'auto';
     const hasZCode = Boolean(env.hasZCode?.(String(zcodePath || '').trim()));
     const hasCodex = Boolean(env.hasCodex?.(String(codexPath || '').trim()));
+    const hasDsh = Boolean(env.hasDsh?.(String(dshPath || '').trim()));
     const hasOpenAI = Boolean(String(openaiBaseUrl || '').trim());
 
     if (normalizedConfigured === 'zcode') {
@@ -169,6 +171,12 @@ export function resolveBackendSelection(
         };
     }
 
+    if (normalizedConfigured === 'dsh') {
+        return {
+            configuredBackend: 'dsh', effectiveBackend: 'dsh', available: hasDsh,
+            reason: hasDsh ? '' : '未检测到 DeepSeek Harness CLI (dsh)，请安装 dsh 或设置自定义路径',
+        };
+    }
     if (normalizedConfigured === 'openai') {
         return {
             configuredBackend: 'openai',
@@ -186,6 +194,9 @@ export function resolveBackendSelection(
     }
     if (hasCodex) {
         return {configuredBackend: 'auto', effectiveBackend: 'codex', available: true, reason: ''};
+    }
+    if (hasDsh) {
+        return {configuredBackend: 'auto', effectiveBackend: 'dsh', available: true, reason: ''};
     }
     if (hasOpenAI) {
         return {configuredBackend: 'auto', effectiveBackend: 'openai', available: true, reason: ''};
