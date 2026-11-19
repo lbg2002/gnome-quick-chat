@@ -523,6 +523,7 @@ export function resolveModelPickerState({
         {id: 'auto', label: '自动'},
         {id: 'zcode', label: 'ZCode'},
         {id: 'codex', label: 'Codex'},
+        {id: 'dsh', label: 'DSH'},
         {id: 'openai', label: 'OpenAI'},
     ].map(item => {
         const active = configured === item.id;
@@ -588,13 +589,15 @@ export function resolveModelPickerState({
             ? (unavailableReason.includes('未安装') || unavailableReason.includes('未配置')
                 ? `⚠️ ${unavailableReason}`
                 : `⚠️ 未安装/不可用：${unavailableReason}`)
-            : '⚠️ 未检测到已安装或已配置的后端（ZCode / Codex 未安装，OpenAI 未配置）';
+            : '⚠️ 未检测到已安装或已配置的后端（ZCode / Codex / DSH 未安装，OpenAI 未配置）';
     } else if (configured !== 'auto' && hasAvailabilityInfo && !availSet.has(configured)) {
         capabilityNotice = configured === 'openai'
             ? '⚠️ OpenAI API 尚未配置 Base URL，请点击「更多设置…」配置'
-            : `⚠️ 所选 ${configured === 'zcode' ? 'ZCode' : 'Codex'} CLI 未安装或路径无效`;
+            : `⚠️ 所选 ${configured === 'zcode' ? 'ZCode' : configured === 'dsh' ? 'DSH' : 'Codex'} CLI 未安装或路径无效`;
     } else if (eff === 'openai') {
         capabilityNotice = '能力: 纯对话 API（不支持本地工具执行与会话内审批）';
+    } else if (eff === 'dsh') {
+        capabilityNotice = '能力: DeepSeek Harness headless（支持文件读取；智能模式无审批回传时保持只读）';
     } else if (eff === 'codex') {
         capabilityNotice = '能力: 只读沙箱工具调用（不支持会话内交互式审批提问）';
     } else if (eff === 'zcode') {
