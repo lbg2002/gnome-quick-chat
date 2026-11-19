@@ -1592,6 +1592,36 @@ export default class QuickChat extends Extension {
                 clientGeneration: generation,
                 lifecycleGeneration: lifeGen,
             });
+            if (result?.disposition === 'rejected_budget') {
+                // OpenAI may reject AFTER async model metadata discovery. This is
+                // a structured result rather than an exception, but the request
+                // was never sent and must not consume the user's draft/attachments.
+                if (
+                    !this._isSessionUnlockedAndAlive(lifeGen) ||
+                    generation !== this._chatController?.clientGeneration ||
+                    (this._chatController.activeTurnState &&
+                     this._chatController.activeTurnState.turnId !== turnId)
+                ) {
+                    return;
+                }
+                this._chatController.activeTurnState = null;
+                this._setBusy(false);
+                if (!reuseExistingUserCard) {
+                    this._panel?.truncateMessagesFromId(effectiveUserMessageId);
+                }
+                this._panel?.setStatusIndicator('error',
+                    `⚠️ 请求未发送：${result.error || '超出模型上下文预算'}`);
+                if (restoreDraftOnEarlyError && this._panel?.entry && !this._panel.entry.get_text()) {
+                    this._panel.setEntryTextProgrammatically(restoreDraftOnEarlyError, {
+                        focus: true, cursorAtEnd: true,
+                    });
+                }
+                if (clearAttachments && attachmentSnapshot && this._attachments && this._attachments.count === 0) {
+                    this._attachments.restoreFromSnapshot(attachmentSnapshot);
+                    this._refreshAttachmentBarUi();
+                }
+                return;
+            }
             if (
                 this._isSessionUnlockedAndAlive(lifeGen) &&
                 generation === this._chatController.clientGeneration &&
