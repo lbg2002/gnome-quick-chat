@@ -2545,6 +2545,25 @@ export default class QuickChat extends Extension {
         } catch (_) {}
     }
 
+    async _flushBeforeSessionTransition(actionLabel = '切换会话') {
+        const client = this._chatController?.client;
+        if (!client) return true;
+        try {
+            const result = await client.request('flush_session');
+            if (result?.ok && !result?.hasUnsavedChanges) return true;
+            const reason = result?.error || '仍有未持久化的消息';
+            this._panel?.setStatusIndicator('error', `⚠️ ${actionLabel}已暂停：历史未保存（${reason}）。请先重试保存或导出。`);
+            this._syncDiagnosticsSnapshot({
+                sessionSaveStatus: '未保存',
+                sessionSaveWarning: reason,
+            });
+            return false;
+        } catch (err) {
+            this._panel?.setStatusIndicator('error', `⚠️ ${actionLabel}已暂停：无法确认历史已保存（${err?.message || err}）`);
+            return false;
+        }
+    }
+
     async _restoreSessionById(targetSessionId) {
         if (!this._chatController || this._isBusyOrMutating()) return;
         let validTarget = '';
@@ -2562,8 +2581,8 @@ export default class QuickChat extends Extension {
         try {
             const prevClient = this._chatController.client;
             prevClient?.revokeApprovedScopes?.();
-            if (prevClient) {
-                try { await prevClient.request('flush_session'); } catch (_) {}
+            if (prevClient && !await this._flushBeforeSessionTransition('切换会话')) {
+                return;
             }
             if (
                 !this._isSessionUnlockedAndAlive(lifeGen) ||
@@ -2622,9 +2641,20 @@ export default class QuickChat extends Extension {
                 this._settings.set_string('previous-session-id', '');
             }
 
+            let deletion = null;
             try {
-                await deleteStoredSessionAsync(victimId);
-            } catch (_) {}
+                deletion = await deleteStoredSessionAsync(victimId);
+            } catch (err) {
+                deletion = {ok: false, error: err?.message || String(err)};
+            }
+            if (!deletion?.ok) {
+                if (this._isSessionUnlockedAndAlive(lifeGen)) {
+                    await this._ensureClient();
+                    this._panel?.setStatusIndicator('error',
+                        `⚠️ 删除会话失败：${deletion?.error || '文件删除未完成'}。会话未切换，请核查原始文件。`);
+                }
+                return;
+            }
             if (
                 !this._isSessionUnlockedAndAlive(lifeGen) ||
                 this._chatController.busy ||
@@ -2702,8 +2732,8 @@ export default class QuickChat extends Extension {
             }
             const prevClient = this._chatController.client;
             prevClient?.revokeApprovedScopes?.();
-            if (prevClient) {
-                try { await prevClient.request('flush_session'); } catch (_) {}
+            if (prevClient && !await this._flushBeforeSessionTransition('切换会话')) {
+                return;
             }
             if (
                 !this._isSessionUnlockedAndAlive(lifeGen) ||
