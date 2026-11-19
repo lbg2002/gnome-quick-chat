@@ -579,10 +579,11 @@ process.exit(0);
 
 test('R3.5: Cancelled partial CLI turn invalidates remoteSessionId and next turn resumes cleanly from local context', async () => {
     const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'qc-r3-cancelpartial-'));
+    let store = null;
     try {
         const io = createControllableIo();
         const cfg = {provider: '', model: '', workspace: tmpRoot, mode: 'full', effectiveMode: 'full'};
-        const store = new SessionStoreEngine('sess_r3_cancel', {
+        store = new SessionStoreEngine('sess_r3_cancel', {
             sessionsRootDir: tmpRoot,
             io,
             buildContextSignature: buildRuntimeContextSignature,
@@ -719,7 +720,10 @@ if (promptText.includes('第二问：需要中途取消') && !promptText.include
         assert.match(calls[2].promptText, /第三问：基于上文继续/);
     } finally {
         delete process.env.QC_CANCEL_TEST_LOG;
-        await fs.rm(tmpRoot, {recursive: true, force: true});
+        // SessionStore persists asynchronously; let all scheduled writes settle
+        // before removing the temporary session directory to avoid ENOTEMPTY.
+        try { await store?.flush(); } catch (_) {}
+        await fs.rm(tmpRoot, {recursive: true, force: true, maxRetries: 5, retryDelay: 75});
     }
 });
 
