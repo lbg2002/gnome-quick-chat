@@ -876,8 +876,10 @@ export function spawnManagedCliTurn({
                     turn.error = norm.errorMessage || `${backend.toUpperCase()} 执行返回错误`;
                 } else {
                     turn.sawDoneMarker = true;
-                    if (norm.text && !turn.text) {
-                        turns.replaceText(turn, norm.text, norm.segmentId || '');
+                    if (norm.authoritative || (norm.text && !turn.text)) {
+                        // DSH final carries the lossless committed answer and may correct
+                        // text previously emitted as bounded JSON events.
+                        turns.replaceText(turn, norm.text || '', norm.segmentId || '');
                     }
                 }
             } else if (norm.type === 'text_snapshot') {
