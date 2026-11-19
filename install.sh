@@ -9,6 +9,8 @@ staging="${dest}.staging.$$"
 backup="${dest}.backup.$$"
 lock_file="${ext_root}/.quick-chat-install.lock"
 swap_committed=false
+prior_enabled_state="unknown"
+activation_confirmed=false
 
 cleanup_and_rollback() {
   local exit_code=$?
@@ -20,6 +22,9 @@ cleanup_and_rollback() {
       rm -rf -- "$dest" 2>/dev/null || true
     fi
     if mv -- "$backup" "$dest" 2>/dev/null; then
+      if [[ "$prior_enabled_state" == "enabled" ]] && command -v gnome-extensions >/dev/null; then
+        gnome-extensions enable "$uuid" >/dev/null 2>&1 || true
+      fi
       echo "⚠️ 安装未完成，已自动回滚至先前扩展版本：$dest" >&2
     else
       echo "❌ 安装失败且回滚备份失败，备份目录保留在：$backup" >&2
@@ -112,12 +117,19 @@ do
   }
 done
 
-# 3. Disable Only This Extension (if already installed), Backup Previous Version & Swap with Rollback
+# 3. Preserve the extension's prior enable state. Never turn a disabled
+# extension on merely because the user upgraded its files.
 was_upgrade=false
 if [[ -d "$dest" ]]; then
   was_upgrade=true
   if command -v gnome-extensions >/dev/null; then
-    gnome-extensions disable "$uuid" 2>/dev/null || true
+    previous_info=$(gnome-extensions info "$uuid" 2>/dev/null || true)
+    if [[ "$previous_info" =~ State:[[:space:]]*(ACTIVE|ENABLED) ]]; then
+      prior_enabled_state="enabled"
+      gnome-extensions disable "$uuid" 2>/dev/null || true
+    elif [[ "$previous_info" =~ State:[[:space:]]*(INACTIVE|DISABLED) ]]; then
+      prior_enabled_state="disabled"
+    fi
   fi
   rm -rf -- "$backup"
   mv -- "$dest" "$backup"
@@ -125,36 +137,50 @@ fi
 
 mv -- "$staging" "$dest"
 
-# Post-swap sanity verification before committing and discarding backup
 [[ -f "$dest/extension.js" && -f "$dest/schemas/gschemas.compiled" ]] || {
   echo "错误：目标目录交换校验未通过：$dest" >&2
   exit 1
 }
 
-swap_committed=true
-if [[ -d "$backup" ]]; then
-  rm -rf -- "$backup"
-fi
-
-# 4. Enable ONLY This Extension & Report Actual Activation Result
-enable_note="未检测到 gnome-extensions 命令；登录 GNOME 桌面后请执行: gnome-extensions enable $uuid"
-if command -v gnome-extensions >/dev/null; then
+# 4. Verify activation BEFORE discarding the rollback copy.
+# On Wayland the shell may only discover/reload modules after a new login;
+# distinguish "activation deferred" from "confirmed working" rather than
+# claiming success for code which has never been loaded.
+enable_note="已安装文件；未验证 GNOME Shell 激活（重新登录后请检查扩展状态）"
+if [[ "$was_upgrade" == true && "$prior_enabled_state" == "disabled" ]]; then
+  activation_confirmed=true
+  enable_note="已升级并保持原有禁用状态（如需启用请手动启用扩展）"
+elif command -v gnome-extensions >/dev/null; then
   if gnome-extensions enable "$uuid" >/dev/null 2>&1; then
     ext_info=$(gnome-extensions info "$uuid" 2>/dev/null || true)
     if [[ "$ext_info" =~ State:[[:space:]]*(ACTIVE|ENABLED) ]]; then
+      activation_confirmed=true
       if [[ "$was_upgrade" == true ]]; then
-        enable_note="已请求启用（当前状态：ACTIVE/ENABLED；Wayland 下更新已加载扩展的 JS 模块需重新登录桌面后完全生效）"
+        enable_note="已请求启用（Shell 报告 ACTIVE/ENABLED；Wayland 下需要重新登录以确保新 JS 生效）"
       else
-        enable_note="已成功启用（当前状态：ACTIVE/ENABLED）"
+        enable_note="已成功启用（Shell 报告 ACTIVE/ENABLED）"
       fi
-    elif [[ "$ext_info" =~ State:[[:space:]]*([A-Z_]+) ]]; then
-      enable_note="已写入启用请求（当前状态：${BASH_REMATCH[1]}；Wayland 首次发现新扩展通常需重新登录桌面后生效）"
+    elif [[ "$ext_info" =~ State:[[:space:]]*(ERROR|OUT_OF_DATE) ]]; then
+      echo "错误：GNOME Shell 拒绝激活更新后的扩展：${BASH_REMATCH[1]}" >&2
+      exit 1
     else
-      enable_note="已请求启用 $uuid（Wayland 会话下首次安装或更新扩展建议重新登录桌面生效）"
+      enable_note="已请求启用，但尚未确认新版本已加载；Wayland 请注销并重新登录后检查"
     fi
   else
-    enable_note="当前终端未连接活动 GNOME Shell 会话，进入桌面后请执行: gnome-extensions enable $uuid"
+    if gnome-extensions info "$uuid" >/dev/null 2>&1; then
+      echo "错误：GNOME Shell 可访问，但启用扩展失败；将回滚文件安装" >&2
+      exit 1
+    fi
+    enable_note="当前终端未连接可用 GNOME Shell 会话；安装完成但尚未启用，重新登录后请手动启用"
   fi
+fi
+
+swap_committed=true
+if [[ "$activation_confirmed" == true ]]; then
+  [[ ! -d "$backup" ]] || rm -rf -- "$backup"
+elif [[ -d "$backup" ]]; then
+  echo "⚠️ 新版尚未确认加载，保留旧版回滚副本：$backup" >&2
+  echo "   验证后可手动清理；需要回滚时先禁用扩展，再将备份目录恢复为 $dest" >&2
 fi
 
 echo "✓ 安装完成：$dest"
