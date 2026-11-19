@@ -178,6 +178,16 @@ export default class QuickChat extends Extension {
                 settings: this._settings,
                 registry: this._registry,
                 getEffectiveBackend: () => this._getEffectiveBackend(),
+                getActiveRuntimeInfo: () => {
+                    const state = this._chatController?.lastState;
+                    return this._chatController?.ready && state
+                        ? {
+                            modelId: state.model?.modelId || '',
+                            providerId: state.model?.provider || '',
+                            capabilities: state.capabilities || null,
+                        }
+                        : {};
+                },
                 getClient: () => this._chatController?.client || null,
                 isExtensionAlive: () => this._isSessionUnlockedAndAlive(lifeGen),
                 onNudgeLayout: () => this._dateIntegration?.nudgeLayout(),
@@ -389,8 +399,15 @@ export default class QuickChat extends Extension {
     }
 
     _getEffectiveBackend() {
+        const configured = this._getSettingString('backend', 'auto');
+        const confirmed = this._chatController?.ready ? this._chatController.lastState?.backend : '';
+        // Prefer the connected runtime over the cold-cache placeholder; explicit
+        // switching to another backend still shows the newly selected engine.
+        if (confirmed && (configured === 'auto' || confirmed === configured)) {
+            return confirmed;
+        }
         return detectEffectiveBackend({
-            configuredBackend: this._getSettingString('backend', 'auto'),
+            configuredBackend: configured,
             zcodePath: this._getSettingString('zcode-path', ''),
             codexPath: this._getSettingString('codex-path', ''),
             openaiBaseUrl: this._getSettingString('openai-base-url', ''),
