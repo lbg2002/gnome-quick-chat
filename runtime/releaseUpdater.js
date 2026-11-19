@@ -22,10 +22,16 @@ function ensureNotCancelled(cancellable) {
     if (cancellable?.is_cancelled?.()) throw new Error('更新操作已取消');
 }
 
+export function getUserExtensionDirectory() {
+    // This matches install.sh's XDG_DATA_HOME location. Never create a
+    // versioned/parallel install directory when applying an update.
+    return GLib.build_filenamev([
+        GLib.get_user_data_dir(), 'gnome-shell', 'extensions', 'quick-chat@lbg2002.github.io',
+    ]);
+}
+
 export function getInstalledExtensionMode() {
-    const user = Gio.File.new_for_path(
-        GLib.build_filenamev([GLib.get_user_data_dir(), 'gnome-shell', 'extensions', 'quick-chat@lbg2002.github.io'])
-    ).query_exists(null);
+    const user = Gio.File.new_for_path(getUserExtensionDirectory()).query_exists(null);
     const system = Gio.File.new_for_path(
         '/usr/share/gnome-shell/extensions/quick-chat@lbg2002.github.io'
     ).query_exists(null);
@@ -118,6 +124,10 @@ export async function installUserRelease(release, {currentVersion, cancellable =
     if (!release.zip || !release.checksum) {
         throw new Error('发布缺少扩展 ZIP 或 SHA256SUMS，拒绝未经验证的更新');
     }
+    const installTarget = getUserExtensionDirectory();
+    if (!Gio.File.new_for_path(installTarget).query_exists(null)) {
+        throw new Error('未找到原来的用户级扩展目录；已拒绝将更新安装到其他位置');
+    }
     const session = new Soup.Session({timeout: 60, user_agent: 'Quick Chat GNOME updater'});
     let tmpPath = '';
     try {
@@ -135,7 +145,17 @@ export async function installUserRelease(release, {currentVersion, cancellable =
         tmpPath = GLib.build_filenamev([getPrivateRuntimeDir(), `update-${GLib.uuid_string_random()}.zip`]);
         await writePrivateFileAsync(tmpPath, zipBytes, cancellable);
         await runInstallCommand(tmpPath, cancellable);
-        return {installed: true, needsRelogin: true};
+        // Confirm same directory/UUID and updated on-disk metadata rather than
+        // relying on GNOME Shell's stale in-memory extension version on Wayland.
+        const metadataFile = Gio.File.new_for_path(GLib.build_filenamev([installTarget, 'metadata.json']));
+        const [loaded, bytes] = metadataFile.load_contents(null);
+        if (!loaded) throw new Error('更新完成后无法检查原安装目录的元数据');
+        const newMetadata = JSON.parse(decoder.decode(bytes));
+        if (newMetadata.uuid !== 'quick-chat@lbg2002.github.io' ||
+            newMetadata['version-name'] !== release.version) {
+            throw new Error('原安装目录中的版本号与下载的 Release 不一致，请检查扩展安装结果');
+        }
+        return {installed: true, installTarget, needsRelogin: true};
     } finally {
         try { session.abort(); } catch (_) {}
         if (tmpPath) removeFileQuietly(tmpPath);
