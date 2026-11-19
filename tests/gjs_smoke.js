@@ -525,7 +525,7 @@ let mockHttpProc = null;
                 "if (args.includes('--version')) {",
                 `  console.log('${kind === 'zcode' ? 'zcode 1.1.0' : kind === 'dsh' ? 'dsh v0.1.0' : 'codex-cli 0.42.0'}');`,
                 '} else if (args.includes("--help")) {',
-                `  console.log('${kind === 'zcode' ? 'zcode --output-format --prompt --cwd --mode --resume' : kind === 'dsh' ? 'dsh --profile headless --json --permission-mode --session-id' : 'codex exec --json --sandbox read-only --model'}');`,
+                `  console.log('${kind === 'zcode' ? 'zcode --output-format --prompt --cwd --mode --resume' : kind === 'dsh' ? 'Usage: dsh --profile headless [options] [task...] --json --permission-mode --session-id --approval-policy' : 'codex exec --json --sandbox read-only --model'}');`,
                 '}',
             ].join('\n') + '\n';
             writeExecutableScriptSync(cliFile, cliStub);
@@ -544,7 +544,7 @@ let mockHttpProc = null;
                     backend: kind,
                     zcodePath: kind === 'zcode' ? cliFile : '',
                     codexPath: kind === 'codex' ? cliFile : '',
-                dshPath: kind === 'dsh' ? cliFile : '',
+                    dshPath: kind === 'dsh' ? cliFile : '',
                     mode: 'readonly',
                     workspace: tmpRoot,
                 }, tmpRoot, tmpRoot, `gjs_startup_${kind}`, {clientGeneration: 1});
@@ -576,7 +576,7 @@ let mockHttpProc = null;
                             backend: kind,
                             zcodePath: kind === 'zcode' ? cliFile : '',
                             codexPath: kind === 'codex' ? cliFile : '',
-                dshPath: kind === 'dsh' ? cliFile : '',
+                            dshPath: kind === 'dsh' ? cliFile : '',
                             mode: 'readonly',
                             workspace: tmpRoot,
                         },
