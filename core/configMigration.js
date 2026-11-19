@@ -123,10 +123,25 @@ export function identifyCliCandidate(candidatePath, env = {}) {
 }
 
 /**
+ * Check the documented dsh headless command surface, not just the CLI file
+ * name. This also admits user-configured wrappers with arbitrary filenames,
+ * but only when the helper actually advertises the expected JSONL protocol
+ * and safety mode flags. Use only after an asynchronous, bounded --help probe.
+ */
+export function matchesDshHeadlessHelp(helpText) {
+    const help = String(helpText || '');
+    return /Usage:\s*dsh\s+(?:--profile\s+headless|headless)\b/i.test(help) &&
+        /--json\b/.test(help) &&
+        /--session-id\b/.test(help) &&
+        /--permission-mode\b/.test(help) &&
+        /--approval-policy\b/.test(help);
+}
+
+/**
  * Resolves effective backend without ever silently switching an explicitly selected backend
  * and without returning a phantom ZCode when no backend is configured.
  *
- * Auto order: ZCode -> Codex -> configured OpenAI -> 'unconfigured'.
+ * Auto order: ZCode -> Codex -> DSH -> configured OpenAI -> 'unconfigured'.
  */
 export function resolveBackendSelection(
     {
@@ -188,7 +203,7 @@ export function resolveBackendSelection(
         };
     }
 
-    // Auto detection: ZCode -> Codex -> configured OpenAI -> unconfigured
+    // Auto detection: ZCode -> Codex -> DSH -> configured OpenAI -> unconfigured
     if (hasZCode) {
         return {configuredBackend: 'auto', effectiveBackend: 'zcode', available: true, reason: ''};
     }
