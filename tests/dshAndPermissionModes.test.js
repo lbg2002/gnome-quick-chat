@@ -29,6 +29,16 @@ test('permissions: ZCode real plan/read-only, build/smart with bridge, yolo/full
     assert.ok(cap.supportedModes.includes('smart'));
     assert.equal(cap.modeBadges.smart,'智能审批');
 });
+test('preferences: permission labels map one-to-one to readonly/smart/full for all local agents', () => {
+    for (const backend of ['zcode','codex','dsh']) {
+        const caps = getBackendCapabilities(backend);
+        assert.equal(caps.modeLabels.length, 3,
+            `${backend}: extra legacy chat label would shift security settings labels`);
+        assert.match(caps.modeLabels[0], /只读/);
+        assert.match(caps.modeLabels[1], /智能/);
+        assert.match(caps.modeLabels[2], /完全权限/);
+    }
+});
 test('permissions: Codex smart must stay sandboxed read-only and never grant write silently', () => {
     const mode = normalizeEffectiveAgentMode('codex','smart');
     assert.equal(mode.effectiveMode,'readonly');
