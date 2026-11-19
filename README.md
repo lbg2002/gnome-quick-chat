@@ -173,7 +173,7 @@ GitHub Actions 每次提交到 `main` 都会构建可下载的安装包（在 Ac
 
 ```bash
 bash scripts/build-packages.sh dist
-# 需要 gnome-extensions、dpkg-deb、unzip、python3、glib-compile-schemas
+# 需要 dpkg-deb、python3、glib-compile-schemas（无须安装完整 GNOME 桌面）
 # 输出 ZIP / DEB / SHA256SUMS
 ```
 
