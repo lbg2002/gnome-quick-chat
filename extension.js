@@ -939,6 +939,8 @@ export default class QuickChat extends Extension {
             'workspace',
             'zcode-workspace',
             'codex-workspace',
+            'dsh-workspace',
+            'dsh-agent-mode',
             'agent-mode',
             'zcode-agent-mode',
             'codex-agent-mode',
@@ -948,6 +950,7 @@ export default class QuickChat extends Extension {
             'backend',
             'zcode-path',
             'codex-path',
+            'dsh-path',
             'openai-base-url',
         ]);
 
@@ -985,6 +988,9 @@ export default class QuickChat extends Extension {
             'codex-reasoning-effort',
             'codex-workspace',
             'codex-agent-mode',
+            'dsh-path',
+            'dsh-workspace',
+            'dsh-agent-mode',
             'openai-base-url',
             'openai-api-key',
             'openai-model',
@@ -1096,6 +1102,7 @@ export default class QuickChat extends Extension {
             configuredBackend: this._getSettingString('backend', 'auto'),
             zcodePath: this._getSettingString('zcode-path', ''),
             codexPath: this._getSettingString('codex-path', ''),
+            dshPath: this._getSettingString('dsh-path', ''),
             openaiBaseUrl,
         }, {cancellable});
         const eff = selection?.effectiveBackend || 'unconfigured';
