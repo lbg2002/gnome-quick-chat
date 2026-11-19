@@ -1027,7 +1027,9 @@ export function detectBackendSelection({
         {configuredBackend, zcodePath, codexPath, openaiBaseUrl},
         cliEnv
     );
-    cliDetectionCache.set(cacheKey, resolved);
+    // Synchronous inspection must never seed the async detection cache: a transient
+    // miss (CLI not yet discovered, PATH not initialized, probe timeout) could
+    // otherwise suppress the authoritative asynchronous discovery for its TTL.
     return {...resolved};
 }
 
@@ -1141,24 +1143,21 @@ export async function detectBackendSelectionAsync({
  * Shared backend detection logic used identically by Preferences UI, Quick Model Switcher, and Runtime.
  * Returns 'zcode' | 'codex' | 'openai' | 'unconfigured'.
  */
+/**
+ * Immediate UI hint only. Do not run synchronous CLI probes in the GNOME Shell
+ * main thread. Actual executable availability is confirmed by
+ * detectBackendSelectionAsync during connection.
+ */
 export function detectEffectiveBackend(configuredBackend = 'auto', options = {}) {
-    if (typeof configuredBackend === 'object' && configuredBackend !== null) {
-        return detectBackendSelection({
-            configuredBackend: configuredBackend.configuredBackend || 'auto',
-            zcodePath: configuredBackend.zcodePath || '',
-            codexPath: configuredBackend.codexPath || '',
-            openaiBaseUrl: configuredBackend.openaiBaseUrl || '',
-        }).effectiveBackend;
-    }
-    const normalizedOpts = typeof options === 'object' && options !== null
-        ? options
-        : {openaiBaseUrl: ''};
-    return detectBackendSelection({
-        configuredBackend,
-        zcodePath: normalizedOpts.zcodePath || '',
-        codexPath: normalizedOpts.codexPath || '',
-        openaiBaseUrl: normalizedOpts.openaiBaseUrl || '',
-    }).effectiveBackend;
+    const selectionOpts = typeof configuredBackend === 'object' && configuredBackend !== null
+        ? configuredBackend
+        : {
+            configuredBackend,
+            zcodePath: options?.zcodePath || '',
+            codexPath: options?.codexPath || '',
+            openaiBaseUrl: options?.openaiBaseUrl || '',
+        };
+    return peekBackendSelection(selectionOpts).effectiveBackend;
 }
 
 function emptyCatalogSkeleton(effectiveBackend) {
