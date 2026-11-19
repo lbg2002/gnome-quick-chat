@@ -160,7 +160,7 @@ export class ZCodeAdapter extends BaseBackendAdapter {
             ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptWithDesktopEnv)
             : promptWithDesktopEnv;
 
-        const requireBridgeHandshake = effectiveMode === 'readonly';
+        const requireBridgeHandshake = effectiveMode === 'smart';
         if (requireBridgeHandshake && !this._runtime?.bridgePath) {
             const err = new Error('未找到 ZCode 权限审批桥接模块（zcodeBridge.cjs），已阻止在需审批模式下启动任务');
             this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
