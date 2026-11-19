@@ -6,7 +6,7 @@
 
 [![GNOME Shell](https://img.shields.io/badge/GNOME_Shell-50-4a86cf?logo=gnome&logoColor=white)](https://www.gnome.org/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-26.04_LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
-[![Backends](https://img.shields.io/badge/Engines-ZCode_%7C_Codex_%7C_OpenAI_API-2ec27e)](#3-三大智能后端与能力矩阵)
+[![Backends](https://img.shields.io/badge/Engines-ZCode_%7C_Codex_%7C_DSH_%7C_OpenAI-2ec27e)](#3-四大智能后端与能力矩阵)
 [![Tests](https://img.shields.io/badge/Unit_&_State_Tests-Passed-success)](#8-模块化架构开发与测试)
 [![Interactive Demo](https://img.shields.io/badge/▶_在线交互式动画演示-1080p_60fps-f5a623)](https://lbg2002.github.io/gnome-quick-chat/)
 
@@ -37,7 +37,7 @@
 
 1. [核心特性一览](#1-核心特性一览)
 2. [横向彩色小圆点轨迹与分级工具审批](#2-横向彩色小圆点轨迹与分级工具审批)
-3. [三大智能后端与能力矩阵](#3-三大智能后端与能力矩阵)
+3. [四大智能后端与能力矩阵](#3-四大智能后端与能力矩阵)
 4. [真实桌面运行实拍](#4-真实桌面运行实拍)
 5. [桌面流畅性、会话状态机与安全边界设计](#5-桌面流畅性会话状态机与安全边界设计)
 6. [快速安装、打包与配置指南](#6-快速安装打包与配置指南)
@@ -84,7 +84,7 @@
 
 ---
 
-## 3. 三大智能后端与能力矩阵
+## 3. 四大智能后端与能力矩阵
 
 在 `gnome-extensions prefs quick-chat@lbg2002.github.io` 设置面板中，根据当前生效后端自动同步真实能力说明：
 
@@ -92,6 +92,7 @@
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **ZCode CLI** (`zcode`) | ✓ | ✓ (桥接权威校验) | ✓ (`--resume`) | ✓ | `zcodeBridge.cjs` 版本握手校验 + `setsid` 进程组回收 + `0600` 临时配置 |
 | **Codex CLI** (`codex`) | ✓ | — (CLI 沙箱策略) | ✓ (`exec resume`) | ✓ | 原生 `read-only` / `danger-full-access` 沙箱，支持并发 `item.id` 与退出码追踪 |
+| **DeepSeek Harness** (`dsh`) | ✓ | 不支持 Headless 实时回传审批 | ✓ (`--session-id`) | ✓（提交后的 JSONL 事件） | `dsh --profile headless --json`，默认只读，完全权限需用户明确开启 |
 | **OpenAI API** (`openai`) | — | — | ✓ (整轮预算裁剪) | ✓ (`reasoning_content`) | `Soup 3.0` 事件级 SSE 解析器（兼容 CRLF/分片/中断检测）+ 按端点 Keyring 隔离 |
 
 > **跨后端无缝续接与诚实回退**：当在同一对话中途切换模型/引擎，或执行原地重新生成/编辑提问回退历史时，`SessionStore` 会自动失效过期的远端会话标识，并在下一轮按整轮预算精确重建本地上下文。
@@ -149,13 +150,29 @@ stateDiagram-v2
 
 ---
 
+## DeepSeek Harness 与权限分级
+
+在设置中可以选择 **ZCode、Codex、DeepSeek Harness (dsh)、OpenAI API** 四种后端。DSH 需先按照 [DeepSeek Harness 官方说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/headless/README.zh.md) 安装并配置可运行的 `dsh`，再通过“模型与后端”或“界面与权限”选择它。
+
+权限改为三档：
+
+| 档位 | ZCode | Codex 非交互执行 | DSH Headless |
+| --- | --- | --- | --- |
+| **只读** | Plan：可读取文件，禁止修改 | `read-only` 沙箱 | `read-only` 权限预设 |
+| **智能** | Build：允许低风险操作，修改/删除需由 ZCode 权限桥接确认 | **安全保持只读**（缺少随问内审批回传） | **安全保持只读**（Headless 无实时审批） |
+| **完全权限** | YOLO：不再逐次审批 | `danger-full-access`，无审批 | `danger-full-access`，无审批 |
+
+**注意**：智能档不是凭自然语言关键词自动放权；删除与修改均需要可验证的后端审批通道，否则退回只读。这意味着 Codex/DSH 的智能档不能自动帮你写文件；要安全支持可审批写操作，后续需对接 Codex App Server / DSH ACP 等具有真实审批响应通道的协议。完全权限会有较大安全风险，请仅对信任任务手动启用。
+
+ZCode 最新 CLI 即使帮助文本未罗列所有可用选项，也不会仅据此被错误判断为“版本过旧”；程序会使用显式 `--mode` 交由 CLI 实际检验。GitHub 更新检查采用正确的 JSON Accept 请求；若代理错误返回 HTTP 415，会对同一安全 GET 请求使用普通 JSON Accept 重试。用户级更新仍写入原来的 `~/.local/share/gnome-shell/extensions/quick-chat@lbg2002.github.io`，系统 DEB 安装不会被用户级更新越权覆盖。
+
 ## 6. 快速安装、打包与配置指南
 
 ### 环境要求
 
 * **桌面环境**：Ubuntu 26.04 LTS（或搭载 **GNOME Shell 50** 的 Linux 发行版）
 * **基础依赖**：`gjs`、`glib-compile-schemas`、`gir1.2-soup-3.0`（Ubuntu 26.04 默认已预装）
-* **智能后端（三选一即可）**：`ZCode CLI`、`Codex CLI`，或任意 **OpenAI 兼容 API 地址**
+* **智能后端（三选一即可）**：`ZCode CLI`、`Codex CLI`、`DeepSeek Harness (dsh)`，或任意 **OpenAI 兼容 API 地址**
 
 ### 发布版安装包（无需克隆源码）
 
@@ -230,8 +247,8 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 ├── backendClient.js           # 统一后端门面（委托三后端适配器、SessionStore 与 TurnController）
 ├── protocol.js                # 协议事件归一化、能力矩阵、上下文整轮预算与 CLI 参数构建
 ├── zcodeBridge.cjs            # ZCode 无头模式权威权限桥接（版本握手 + 同源策略校验）
-├── prefs.js                   # Libadwaita 四分页设置中心（模型与后端 / 界面与权限 / 脱敏诊断 / 关于与更新）
-├── backends/                  # 统一接口三后端适配器 (baseAdapter / zcode / codex / openai)
+├── prefs.js                   # Libadwaita 四分页设置中心（含 ZCode / Codex / DSH / OpenAI 与更新）
+├── backends/                  # 统一接口四后端适配器 (baseAdapter / zcode / codex / dsh / openai)
 ├── core/                      # 纯 JS 核心引擎（零 GI 硬依赖，单测直接验证真实生产代码）
 │   ├── chatController.js      # 连接合并、防抖重连、生命周期世代隔离与权限范围自动撤销
 │   ├── turnController.js      # 每轮独立 TurnContext 状态机与幂等单次结算
