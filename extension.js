@@ -125,7 +125,8 @@ export default class QuickChat extends Extension {
             this._chatController = new ChatController({
                 registry: this._registry,
                 createClient: (onEvent, onError) => new BackendClient(onEvent, onError),
-                loadRuntimeEnvironment: () => this._loadRuntimeEnvironment(),
+                loadRuntimeEnvironment: options => this._loadRuntimeEnvironment(options),
+                createCancellable: () => new Gio.Cancellable(),
                 onEvent: event => this._onEvent(event),
                 onStateChanged: info => this._onClientStateReady(info),
                 onConnectionError: err => {
