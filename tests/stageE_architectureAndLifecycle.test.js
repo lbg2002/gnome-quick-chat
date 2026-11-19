@@ -509,6 +509,8 @@ test('E5 Shell Lifecycle: install.sh (install, upgrade, rollback) and uninstall.
         const logFile = path.join(tmpRoot, 'cmd.log');
         const failFlagFile = path.join(tmpRoot, 'fail-schema');
         const failSecretFlagFile = path.join(tmpRoot, 'fail-secret');
+        const disabledFlagFile = path.join(tmpRoot, 'extension-disabled');
+        const enableFailFlagFile = path.join(tmpRoot, 'enable-fails');
 
         fs.mkdirSync(fakeBin, {recursive: true});
         fs.mkdirSync(homeDir, {recursive: true});
@@ -536,7 +538,15 @@ fi
 echo "gnome-extensions $*" >> "${logFile}"
 if [[ "$1" == "info" ]]; then
   echo "Name: Quick Chat"
-  echo "State: ACTIVE"
+  if [[ -f "${disabledFlagFile}" ]]; then
+    echo "State: INACTIVE"
+  else
+    echo "State: ACTIVE"
+  fi
+fi
+if [[ "$1" == "enable" && -f "${enableFailFlagFile}" ]]; then
+  echo "Simulated enable failure" >&2
+  exit 1
 fi
 `);
         writeFakeCmd('gsettings', `
@@ -611,6 +621,31 @@ fi
             false,
             'No leftover backup or staging dirs after successful upgrade'
         );
+
+        // QA-08: an upgrade of a disabled extension must NOT enable it.
+        fs.writeFileSync(disabledFlagFile, '1');
+        const oldLog = fs.readFileSync(logFile, 'utf8');
+        const disabledUpgrade = spawnSync('bash', [path.join(REPO_ROOT, 'install.sh')], {
+            cwd: REPO_ROOT, env, encoding: 'utf8',
+        });
+        assert.equal(disabledUpgrade.status, 0, disabledUpgrade.stderr);
+        assert.match(disabledUpgrade.stdout, /保持原有禁用状态/);
+        assert.ok(!fs.readFileSync(logFile, 'utf8').slice(oldLog.length)
+            .includes('gnome-extensions enable'),
+            'Disabled extension must remain disabled after upgrade');
+        fs.unlinkSync(disabledFlagFile);
+
+        // QA-08: if the active shell rejects enable, restore the old installed bytes.
+        const rollbackMarker = path.join(extDest, 'rollback-enabled-failed.txt');
+        fs.writeFileSync(rollbackMarker, 'old-build');
+        fs.writeFileSync(enableFailFlagFile, '1');
+        const failedEnable = spawnSync('bash', [path.join(REPO_ROOT, 'install.sh')], {
+            cwd: REPO_ROOT, env, encoding: 'utf8',
+        });
+        assert.notEqual(failedEnable.status, 0, 'Failed active enable must not be reported as success');
+        assert.equal(fs.readFileSync(rollbackMarker, 'utf8'), 'old-build',
+            'Failed enable must restore original installed files');
+        fs.unlinkSync(enableFailFlagFile);
 
         // 4. Create user session history, cache fallback dir, runtime dir, and external CLI dirs (~/.zcode, ~/.codex)
         const sessionDir = path.join(dataHome, 'gnome-quick-chat', 'sessions', 'sess_demo');
