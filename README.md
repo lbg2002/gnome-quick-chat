@@ -154,6 +154,20 @@ stateDiagram-v2
 
 在设置中可以选择 **ZCode、Codex、DeepSeek Harness (dsh)、OpenAI API** 四种后端。DSH 需先按照 [DeepSeek Harness 官方说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/headless/README.zh.md) 安装并配置可运行的 `dsh`，再通过“模型与后端”或“界面与权限”选择它。
 
+**DSH 首次连接检查：**
+
+```bash
+command -v dsh
+dsh --version
+dsh --profile headless --help
+bash scripts/diagnose-local.sh
+```
+
+随问会核对 `headless --help` 是否提供 `--json`、`--session-id`、`--permission-mode`、`--approval-policy`；**自定义启动脚本可以不叫 dsh**，但必须真正转发以上接口。自动选择后端按 ZCode → Codex → DSH → OpenAI 的顺序检查。DSH 的模型、插件、权限预设由自身的 Headless profile 配置控制，随问不会擅自覆盖 `$DSH_HOME`。
+
+**常见连接成功却无法回答的原因：** DSH 官方默认 Headless profile 不使用 Web/GUI 保存的登录凭据。模型 API Key 会按启动环境 → 工作目录下 `.env` → `$DSH_HOME/.env` 读取。GNOME Shell 的启动环境未必继承终端的变量；如果终端可以运行而随问无法回答，先检查 Headless 配置与环境可见性。请勿将密钥粘贴到公开诊断或 GitHub Issue。仅有 `dsh --version` 成功并不能证明已经配置可用的模型。Headless 任务一轮执行后退出，通过 `--session-id` 在同一工作目录续接；在运行过程中无法交互式审批。
+
+
 权限改为三档：
 
 | 档位 | ZCode | Codex 非交互执行 | DSH Headless |
@@ -172,7 +186,7 @@ ZCode 最新 CLI 即使帮助文本未罗列所有可用选项，也不会仅据
 
 * **桌面环境**：Ubuntu 26.04 LTS（或搭载 **GNOME Shell 50** 的 Linux 发行版）
 * **基础依赖**：`gjs`、`glib-compile-schemas`、`gir1.2-soup-3.0`（Ubuntu 26.04 默认已预装）
-* **智能后端（三选一即可）**：`ZCode CLI`、`Codex CLI`、`DeepSeek Harness (dsh)`，或任意 **OpenAI 兼容 API 地址**
+* **智能后端（四选一即可）**：`ZCode CLI`、`Codex CLI`、`DeepSeek Harness (dsh)`，或任意 **OpenAI 兼容 API 地址**
 
 ### 发布版安装包（无需克隆源码）
 
