@@ -471,7 +471,7 @@ let mockHttpProc = null;
                 '} else if (args.includes("--help")) {',
                 `  console.log('${kind === 'zcode' ? 'zcode --output-format --prompt --cwd --mode --resume' : 'codex exec --json --sandbox read-only --model'}');`,
                 '}',
-            ].join('\\n') + '\\n';
+            ].join('\n') + '\n';
             writeExecutableScriptSync(cliFile, cliStub);
 
             const detected = await detectBackendSelectionAsync({
