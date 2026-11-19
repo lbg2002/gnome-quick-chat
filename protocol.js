@@ -167,6 +167,20 @@ export function getBackendCapabilities(backend, cliCaps = null) {
                 },
             };
         }
+        case 'dsh':
+            return {
+                pureChat: false, readOnlyFiles: true, fileWrite: true, shellExec: true,
+                supportsTools: true, supportsApproval: false, networkAccess: true,
+                interactiveQuestions: false, supportsCancel: true, supportsResume: true,
+                supportsThinking: true, supportsSkills: true, supportsMcp: true,
+                supportedModes: ['readonly', 'smart', 'full'],
+                modeLabels: [
+                    '只读（DeepSeek Harness headless · 不修改文件）',
+                    '智能（headless 无回传审批，安全降级为只读）',
+                    '完全权限（危险：显式解锁 DSH 的高权限预设）',
+                ],
+                modeBadges: {chat: '只读', readonly: '只读', smart: '智能（只读限制）', full: '完全权限'},
+            };
         case 'unconfigured':
             return {
                 pureChat: false,
@@ -220,6 +234,12 @@ export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly',
     const mode = ['chat', 'readonly', 'smart', 'full'].includes(requestedMode) ? requestedMode : 'readonly';
     if (backend === 'openai') {
         return {effectiveMode: 'chat', downgradedFromChat: false, notice: ''};
+    }
+    if (backend === 'dsh' && (mode === 'smart' || mode === 'chat')) {
+        return {
+            effectiveMode: 'readonly', downgradedFromChat: mode === 'chat',
+            notice: 'DeepSeek Harness headless 没有随问可用的交互审批回传通道，已安全降级为只读；不会自动执行修改或删除。',
+        };
     }
     if (backend === 'codex' && mode === 'smart') {
         return {
@@ -584,6 +604,25 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
         args.push(`--resume=${resumeSessionId}`);
     }
     return args;
+}
+
+/**
+ * DeepSeek Harness official headless one-shot API:
+ * dsh --profile headless --json --permission-mode <preset> --approval-policy never -
+ * Prompt is read verbatim from stdin, cwd is supplied by Gio.SubprocessLauncher.
+ * No interactive approval transport exists in headless, so smart must stay read-only.
+ */
+export function buildDshArgs(config, resumeSessionId = '') {
+    const executable = String(config?.executable || 'dsh').trim() || 'dsh';
+    const {effectiveMode} = normalizeEffectiveAgentMode('dsh', config?.mode || 'readonly');
+    const preset = effectiveMode === 'full' ? 'danger-full-access' : 'read-only';
+    return [
+        executable, '--profile', 'headless', '--json',
+        '--permission-mode', preset,
+        '--approval-policy', 'never',
+        ...(resumeSessionId ? ['--session-id', String(resumeSessionId)] : []),
+        '-',
+    ];
 }
 
 export function buildCodexArgs(config, workspace, prompt, resumeSessionId = '', options = {}) {
@@ -1135,6 +1174,53 @@ export function normalizeEvent(backend, record) {
             };
         }
         return null;
+    }
+
+    if (backend === 'dsh') {
+        // Official @deepseek-ai/dsh-headless JSONL projection:
+        // session, status, text, thinking, tool_call, tool_result, final, error.
+        switch (record.type) {
+            case 'session':
+                return record.sessionId ? {type: 'session_bound', sessionId: String(record.sessionId)} : null;
+            case 'text':
+                return typeof record.text === 'string'
+                    ? {type: 'message_update', assistantMessageEvent: {type: 'text_delta', delta: record.text}}
+                    : null;
+            case 'thinking':
+                return typeof record.text === 'string'
+                    ? {type: 'message_update', assistantMessageEvent: {type: 'thinking_delta', delta: record.text}}
+                    : null;
+            case 'tool_call':
+                return {
+                    type: 'tool_execution_start',
+                    toolCallId: String(record.callId || ''),
+                    toolName: String(record.tool || '工具'),
+                    summary: String(record.tool || '工具'),
+                    rawInput: record.input && typeof record.input === 'object' ? record.input : null,
+                };
+            case 'tool_result':
+                return {
+                    type: 'tool_execution_end',
+                    toolCallId: String(record.callId || ''),
+                    toolName: '工具',
+                    isError: record.status === 'error',
+                    detail: String(record.error?.message || record.result || '').slice(0, 2048),
+                };
+            case 'final':
+                return {
+                    type: 'turn_result', sessionId: String(record.sessionId || ''),
+                    text: String(record.text || ''), authoritative: true,
+                    isError: record.reason === null || record.reason === 'error' || record.reason === 'aborted',
+                    errorMessage: record.reason === null ? 'DSH 未确认本次任务完成' : '',
+                };
+            case 'error':
+                return {
+                    type: 'message_end',
+                    message: {role: 'assistant', content: '', errorMessage: String(record.message || 'DSH 运行失败')},
+                };
+            default:
+                return null;
+        }
     }
 
     if (backend === 'codex') {
