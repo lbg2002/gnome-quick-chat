@@ -498,6 +498,30 @@ test('QA-03: failed durable flush blocks reconnection and preserves the existing
     }
 });
 
+test('QA-02/07: connection failure diagnostics identify the failing initialization phase', async () => {
+    let lastError = '';
+    const controller = new ChatController({
+        loadRuntimeEnvironment: async () => ({
+            config: {backend: 'codex'},
+            workspace: '/tmp',
+            sessionsDir: '/tmp',
+            sessionId: 'qa7_connection',
+        }),
+        createClient: () => ({
+            start() { throw new Error('simulated probe failure'); },
+            close() {},
+        }),
+        onConnectionError: error => { lastError = String(error?.message || error); },
+    });
+    try {
+        assert.equal(await controller.ensureConnected(), null);
+        assert.match(lastError, /后端检测与初始化/);
+        assert.match(lastError, /simulated probe failure/);
+    } finally {
+        controller.dispose();
+    }
+});
+
 test('E5 Shell Lifecycle: install.sh (install, upgrade, rollback) and uninstall.sh (preserve vs scoped --purge)', () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qc-stageE-scripts-'));
     try {
