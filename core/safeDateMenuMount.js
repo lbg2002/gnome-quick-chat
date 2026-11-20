@@ -76,7 +76,10 @@ export function mountChatAsLeftColumn(dateMenu, wrapperActor) {
         try {
             if (wrapperActor.get_parent?.() === parent) parent.remove_child(wrapperActor);
             if (nativeList.get_parent?.() === wrapperActor) wrapperActor.remove_child(nativeList);
-            if (!nativeList.get_parent?.()) parent.insert_child_at_index(nativeList, index);
+            if (!nativeList.get_parent?.()) {
+                try { parent.insert_child_at_index(nativeList, index); }
+                catch (_) { parent.add_child(nativeList); }
+            }
             nativeList.visible = nativeVisible;
         } catch (restoreError) {
             return {ok:false,reason:'rollback_failed',error:String(restoreError)};
