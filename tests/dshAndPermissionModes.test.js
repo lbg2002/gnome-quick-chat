@@ -180,7 +180,7 @@ test('DSH: web profile custom model catalog is secret-free and headless patch is
         '- id: system-prompt',
         '  config:',
         '    personaPrefix: web-only',
-    ].join('\\n');
+    ].join('\n');
     const providers = extractDshPiAiProviders(yaml);
     assert.deepEqual(providers.map(p => ({id:p.id,models:p.models})), [
         {id:'llm-pi-ai:personal-api',models:['alpha-1','beta-2']},
