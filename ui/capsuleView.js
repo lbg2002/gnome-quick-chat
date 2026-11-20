@@ -1,13 +1,15 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 /**
- * Independent, non-modal command capsule. Does not steal GNOME DateMenu
- * actors, use Main.pushModal(), or keep a full-screen reactive overlay.
- * Streaming updates are bounded and coalesced to protect the Shell main loop.
+ * Independent command capsule with a brief GNOME-managed keyboard grab
+ * while typing. It always releases that grab on Send, Esc, Hide and Dispose;
+ * the answer waterfall is non-modal and never covers the full screen.
+ * Streaming updates are bounded and coalesced to protect the Shell loop.
  */
 export class CapsuleView {
     constructor({onSubmit, onExpand} = {}) {
@@ -20,6 +22,7 @@ export class CapsuleView {
         this._status = null;
         this._buffer = '';
         this._flushId = 0;
+        this._modalGrab = null;
         this._pending = false;
         this._disposed = false;
     }
@@ -56,6 +59,10 @@ export class CapsuleView {
             } catch (err) {
                 this.fail(err?.message || String(err));
             }
+        });
+        entry.connect('button-press-event', () => {
+            if (!this._modalGrab) this._acquireKeyboard();
+            return Clutter.EVENT_PROPAGATE;
         });
         entry.clutter_text.connect('key-press-event', (_text, event) => {
             if (event.get_key_symbol() === Clutter.KEY_Escape) {
@@ -127,6 +134,26 @@ export class CapsuleView {
         return Boolean(this.actor?.visible);
     }
 
+    _acquireKeyboard() {
+        if (!this.actor || this._modalGrab) return;
+        try {
+            this._modalGrab = Main.pushModal(this.actor, {actionMode: Shell.ActionMode.NORMAL});
+            this.entry?.grab_key_focus();
+        } catch (err) {
+            console.warn('[Quick Chat] Capsule keyboard grab unavailable: ' + err.message);
+            this._modalGrab = null;
+        }
+    }
+
+    _releaseKeyboard() {
+        const grab = this._modalGrab;
+        this._modalGrab = null;
+        if (grab) {
+            try { Main.popModal(grab); }
+            catch (err) { console.warn('[Quick Chat] Capsule modal release: ' + err.message); }
+        }
+    }
+
     show() {
         if (!this.actor) this.build();
         if (!this.actor) return;
@@ -141,7 +168,7 @@ export class CapsuleView {
             );
         }
         this.actor.show();
-        this.entry.grab_key_focus();
+        this._acquireKeyboard();
     }
 
     toggle() {
@@ -150,10 +177,13 @@ export class CapsuleView {
     }
 
     hide() {
+        this._releaseKeyboard();
         this.actor?.hide();
     }
 
     beginAnswer() {
+        // The response can stream while the user works in other applications.
+        this._releaseKeyboard();
         this._pending = true;
         this._buffer = '';
         if (this._responseLabel) this._responseLabel.text = '';
@@ -212,6 +242,7 @@ export class CapsuleView {
     }
 
     dispose() {
+        this._releaseKeyboard();
         this._disposed = true;
         if (this._flushId) {
             try { GLib.source_remove(this._flushId); } catch (_) {}
