@@ -228,13 +228,16 @@ export function resolveBackendRuntime(config = {}) {
         if (!executable || !env.isExecutable(executable)) {
             throw new Error('未检测到 DeepSeek Harness CLI（dsh）');
         }
-        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode);
+        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode, {
+            enableAutoReview: config.dshAutoReview === true,
+        });
         return {
             backend: 'dsh', available: true, executable,
             setsidPath: resolveSetsidExecutable(pathDirs),
             pathEnv: pathDirs.join(':'),
-            resolvedProvider: 'deepseek-harness', resolvedModel: '',
-            label: 'DeepSeek Harness（由 dsh profile 选择模型）',
+            resolvedProvider: String(config.provider || '').trim() || 'deepseek-official',
+            resolvedModel: String(config.model || '').trim(),
+            label: String(config.model || '').trim() || 'DeepSeek Harness（使用 DSH profile 默认模型）',
             cliCapabilities: null, effectiveModeInfo,
             capabilities: getBackendCapabilities('dsh'),
         };
@@ -464,15 +467,17 @@ export async function resolveBackendRuntimeAsync(config = {}, {
         if (!executable || !env.isExecutable(executable)) {
             throw new Error('DSH 检测结果已失效：已验证的 dsh 可执行文件不存在或不可执行，请重新连接');
         }
-        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode);
+        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode, {
+            enableAutoReview: config.dshAutoReview === true,
+        });
         return {
             backend: 'dsh', available: true,
             executable,
             setsidPath: resolveSetsidExecutable(pathDirs),
             pathEnv: pathDirs.join(':'),
-            resolvedProvider: 'deepseek-harness',
-            resolvedModel: '',
-            label: 'DeepSeek Harness（由 dsh profile 选择模型）',
+            resolvedProvider: String(config.provider || '').trim() || 'deepseek-official',
+            resolvedModel: String(config.model || '').trim(),
+            label: String(config.model || '').trim() || 'DeepSeek Harness（使用 DSH profile 默认模型）',
             cliCapabilities: null,
             effectiveModeInfo,
             capabilities: getBackendCapabilities('dsh'),
