@@ -226,12 +226,12 @@ test('DSH: upstream pi-ai adapter registers plain provider route IDs; migrate ol
         '      codex:',
         '        models:',
         '          - id: gpt-6-luna',
-    ].join('\\n');
+    ].join('\n');
     const listed = extractDshPiAiProviders(web);
     assert.deepEqual(listed.map(p => p.id), ['codex']);
     assert.deepEqual(listed[0].models, ['gpt-6-luna']);
     const fullOverlay = buildDshProfileOverlay({
         provider: 'codex', model: 'gpt-6-luna', piAiPatch: web,
     });
-    assert.match(fullOverlay, /providers:\\n      codex:/);
+    assert.match(fullOverlay, /providers:\n      codex:/);
 });
