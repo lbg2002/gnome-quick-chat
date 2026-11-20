@@ -11,6 +11,7 @@ import {BackendRegistry, MemorySettingsStore} from '../core/backendRegistry.js';
 import {
     buildDshProfileOverlay, extractDshConfiguredModel, makeDshModelCatalog,
     extractDshPiAiProviders, extractDshPiAiPatch,
+    normalizeDshProviderId,
     resolveDesktopAssistantPrompt, DEFAULT_DESKTOP_ASSISTANT_PROMPT,
 } from '../core/dshModelCatalog.js';
 
@@ -85,7 +86,7 @@ test('DSH: read only configuration defaults and model catalog from composited pr
     const catalog = makeDshModelCatalog(current);
     assert.ok(catalog.providers[0].models.includes('deepseek-flash'));
     assert.ok(catalog.providers[0].models.includes('deepseek-v4-pro'));
-    assert.equal(catalog.defaultProviderId,'llm-pi-ai:custom');
+    assert.equal(catalog.defaultProviderId,'custom');
     assert.equal(catalog.defaultModelId,'my-model-v2');
     assert.ok(!JSON.stringify(catalog).includes('TEST_DO_NOT_EXPOSE'));
 });
@@ -183,17 +184,54 @@ test('DSH: web profile custom model catalog is secret-free and headless patch is
     ].join('\n');
     const providers = extractDshPiAiProviders(yaml);
     assert.deepEqual(providers.map(p => ({id:p.id,models:p.models})), [
-        {id:'llm-pi-ai:personal-api',models:['alpha-1','beta-2']},
+        {id:'personal-api',models:['alpha-1','beta-2']},
     ]);
     const catalog = makeDshModelCatalog({}, providers);
-    assert.ok(catalog.providers.some(p => p.id === 'llm-pi-ai:personal-api'));
+    assert.ok(catalog.providers.some(p => p.id === 'personal-api'));
     assert.ok(!JSON.stringify(catalog).includes('PRIVATE_SECRET'));
     assert.ok(!JSON.stringify(catalog).includes('gateway.private'));
     assert.ok(!extractDshPiAiPatch(yaml).includes('web-only'));
     const overlay = buildDshProfileOverlay({
         provider:'llm-pi-ai:personal-api', model:'alpha-1', piAiPatch:yaml,
     });
-    assert.ok(overlay.includes('provider: "llm-pi-ai:personal-api"'));
+    assert.ok(overlay.includes('provider: "personal-api"'));
     assert.ok(overlay.includes('baseURL: https://gateway.private.example/v1'));
     assert.ok(!overlay.includes('web-only'));
+});
+
+
+test('DSH: upstream pi-ai adapter registers plain provider route IDs; migrate old selections', () => {
+    assert.equal(normalizeDshProviderId('llm-pi-ai:codex'), 'codex');
+    assert.equal(normalizeDshProviderId('codex'), 'codex');
+    assert.equal(normalizeDshProviderId('llm-pi-ai:'), '');
+    const store = new MemorySettingsStore({
+        backend: 'dsh',
+        'dsh-provider': 'llm-pi-ai:codex',
+        'dsh-model': 'gpt-6-luna',
+    });
+    const registry = new BackendRegistry(store);
+    assert.equal(registry.getBackendProfile('dsh').provider, 'codex');
+    assert.equal(registry.buildRuntimeConfig('dsh').provider, 'codex');
+    registry.updateBackendProfile('dsh', {provider: 'llm-pi-ai:codex'});
+    assert.equal(store.get_string('dsh-provider'), 'codex');
+    const overlay = buildDshProfileOverlay({
+        provider: 'llm-pi-ai:codex', model: 'gpt-6-luna',
+    });
+    assert.ok(overlay.includes('provider: "codex"'));
+    assert.ok(!overlay.includes('llm-pi-ai:codex'));
+    const web = [
+        '- id: llm-pi-ai',
+        '  config:',
+        '    providers:',
+        '      codex:',
+        '        models:',
+        '          - id: gpt-6-luna',
+    ].join('\\n');
+    const listed = extractDshPiAiProviders(web);
+    assert.deepEqual(listed.map(p => p.id), ['codex']);
+    assert.deepEqual(listed[0].models, ['gpt-6-luna']);
+    const fullOverlay = buildDshProfileOverlay({
+        provider: 'codex', model: 'gpt-6-luna', piAiPatch: web,
+    });
+    assert.match(fullOverlay, /providers:\\n      codex:/);
 });
