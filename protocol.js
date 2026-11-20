@@ -517,10 +517,14 @@ export function expandHomePath(rawPath, homeDir = '') {
     return raw;
 }
 
-export function augmentPromptWithDesktopContext(promptText, envDirs = null, {isFirstTurn = false, mode = 'readonly', workspace = ''} = {}) {
+export function augmentPromptWithDesktopContext(promptText, envDirs = null, {
+    isFirstTurn = false, mode = 'readonly', workspace = '', assistantInstructions = '',
+} = {}) {
     const rawPrompt = String(promptText ?? '');
-    if (!rawPrompt || !envDirs || typeof envDirs !== 'object' || mode === 'chat') {
-        return rawPrompt;
+    if (!rawPrompt || mode === 'chat') return rawPrompt;
+    const persona = isFirstTurn ? String(assistantInstructions || '').trim().slice(0, 8192) : '';
+    if (!envDirs || typeof envDirs !== 'object') {
+        return persona ? `[随问桌面助手指引]\n${persona}\n\n[用户指令]\n${rawPrompt}` : rawPrompt;
     }
 
     const mentionsUserDir = USER_DIR_MENTION_RE.test(rawPrompt);
@@ -538,7 +542,9 @@ export function augmentPromptWithDesktopContext(promptText, envDirs = null, {isF
     if (envDirs.documents) parts.push(`文档=${envDirs.documents}`);
     if (envDirs.pictures) parts.push(`图片=${envDirs.pictures}`);
 
-    if (!parts.length) return rawPrompt;
+    if (!parts.length) {
+        return persona ? `[随问桌面助手指引]\n${persona}\n\n[用户指令]\n${rawPrompt}` : rawPrompt;
+    }
 
     let clashWarning = '';
     if (
@@ -550,7 +556,8 @@ export function augmentPromptWithDesktopContext(promptText, envDirs = null, {isF
         clashWarning = `；特别注意：本机真实桌面为 ${envDirs.desktop}，请勿误查残留的英文 ${home}/Desktop 目录`;
     }
 
-    return `[Ubuntu GNOME 用户目录环境：${parts.join('，')}${clashWarning}]\n${rawPrompt}`;
+    const decorated = `[Ubuntu GNOME 用户目录环境：${parts.join('，')}${clashWarning}]\n${rawPrompt}`;
+    return persona ? `[随问桌面助手指引]\n${persona}\n\n[用户指令]\n${decorated}` : decorated;
 }
 
 function assertPromptWithinLimit(rawPrompt, {viaArgv = false} = {}) {
