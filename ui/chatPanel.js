@@ -1124,13 +1124,16 @@ export class ChatPanelView {
         else this.wrapper.remove_style_class_name('qc-light');
     }
 
-    applyDimensions(nudgeLayoutFn) {
+    applyDimensions(nudgeLayoutFn, {embeddedInDateMenu = false} = {}) {
         if (!this.wrapper || !this.chatBox || !this.scroll) return;
         const width = this._getSettingInt('panel-width', 460);
         const height = this._getSettingInt('panel-height', 380);
         this.wrapper.set_width(width);
         this.chatBox.set_width(Math.max(300, width - 16));
-        this.scroll.set_height(height);
+        // Share the DateMenu viewport with its untouched calendar/notifications.
+        // Prevent an oversized chat scroll actor from expanding the popup past
+        // the monitor, which can cause allocation churn on GNOME Shell 50.
+        this.scroll.set_height(embeddedInDateMenu ? Math.min(height, 300) : height);
         nudgeLayoutFn?.();
     }
 
