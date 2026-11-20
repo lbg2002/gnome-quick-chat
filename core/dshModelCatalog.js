@@ -16,6 +16,18 @@ export function cleanDshModelId(value) {
     return VALID_ID.test(raw) ? raw : '';
 }
 
+/**
+ * DSH's provider registry uses the configured route key directly (e.g.
+ * "codex"), NOT "llm-pi-ai:codex". The prefix was introduced by an older
+ * Quick Chat release; normalize it at the persistence and CLI boundaries.
+ */
+export function normalizeDshProviderId(value) {
+    const raw = String(value || '').trim();
+    const withoutLegacyPrefix = raw.startsWith('llm-pi-ai:')
+        ? raw.slice('llm-pi-ai:'.length) : raw;
+    return cleanDshModelId(withoutLegacyPrefix);
+}
+
 function yamlScalarValue(raw) {
     const v = String(raw || '').trim();
     if (v.startsWith('"')) {
@@ -95,7 +107,7 @@ export function extractDshPiAiProviders(profileText) {
         }
         if (indent === routeIndent && scalar) {
             const id = cleanDshModelId(yamlScalarValue(scalar[1]));
-            route = id ? {id: 'llm-pi-ai:' + id, name: id + '（DSH 自定义配置）', models: []} : null;
+            route = id ? {id, name: id + '（DSH 自定义配置）', models: []} : null;
             if (route) providers.push(route);
             modelsIndent = -1;
             continue;
@@ -121,7 +133,7 @@ export function extractDshPiAiProviders(profileText) {
 }
 
 export function makeDshModelCatalog(configured = {}, profileProviders = []) {
-    const provider = cleanDshModelId(configured.provider);
+    const provider = normalizeDshProviderId(configured.provider);
     const model = cleanDshModelId(configured.model);
     const providers = [{
         id: 'deepseek-official',
@@ -129,7 +141,7 @@ export function makeDshModelCatalog(configured = {}, profileProviders = []) {
         models: [...DSH_OFFICIAL_MODELS],
     }];
     for (const item of profileProviders) {
-        const id = cleanDshModelId(item?.id);
+        const id = normalizeDshProviderId(item?.id);
         if (!id) continue;
         const existing = providers.find(p => p.id === id);
         const target = existing || {id, name: id + '（DSH 自定义配置）', models: []};
@@ -160,7 +172,7 @@ export function makeDshModelCatalog(configured = {}, profileProviders = []) {
 }
 
 export function buildDshProfileOverlay({provider = '', model = '', persona = '', piAiPatch = ''} = {}) {
-    const cleanProvider = cleanDshModelId(provider);
+    const cleanProvider = normalizeDshProviderId(provider);
     const cleanModel = cleanDshModelId(model);
     if (Boolean(provider) !== Boolean(model) || (provider && (!cleanProvider || !cleanModel))) {
         throw new Error('DSH 模型必须同时指定有效的 Provider 与模型 ID');
