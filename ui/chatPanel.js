@@ -1,5 +1,6 @@
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
+import Pango from 'gi://Pango';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {getBackendCapabilities} from '../protocol.js';
 import {
@@ -300,6 +301,11 @@ export class ChatPanelView {
         });
         statusBox.add_child(this._statusDot);
         this._status = createWrapLabel('未连接', 'qc-status');
+        // Bound the status label. Long backend diagnostics belong in the
+        // settings report, not in an infinitely expanding Shell header.
+        this._status.set_width(160);
+        this._status.clutter_text.line_wrap = false;
+        this._status.clutter_text.ellipsize = Pango.EllipsizeMode.END;
         this._status.y_align = Clutter.ActorAlign.CENTER;
         statusBox.add_child(this._status);
 
@@ -426,7 +432,7 @@ export class ChatPanelView {
             y_align: Clutter.ActorAlign.CENTER,
         });
         this.entry = new St.Entry({
-            hint_text: '输入问题（/ 快捷命令，Enter 发送，↑↓ 历史，Esc 停止）…',
+            hint_text: '输入问题 · Enter 发送 · / 快捷操作',
             can_focus: true,
             x_expand: true,
             style_class: 'qc-entry',
@@ -724,7 +730,7 @@ export class ChatPanelView {
         if (!Array.isArray(items) || items.length === 0) {
             this._attachmentBar.visible = false;
             if (this.entry) {
-                this.entry.hint_text = '输入问题（/ 快捷命令，Enter 发送，↑↓ 历史，Esc 停止）…';
+                this.entry.hint_text = '输入问题 · Enter 发送 · / 快捷操作';
             }
             return;
         }
@@ -814,7 +820,7 @@ export class ChatPanelView {
         }
         this._attachmentBar.visible = true;
         if (this.entry) {
-            this.entry.hint_text = `已附带 ${items.length} 个上下文引用，输入问题后按 Enter 发送…`;
+            this.entry.hint_text = `已附带 ${items.length} 个引用 · Enter 发送`;
         }
     }
 
