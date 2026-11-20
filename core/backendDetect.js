@@ -22,6 +22,7 @@ import {
     sanitizeProviderCatalogSecrets,
 } from './modelCatalogCache.js';
 import {readFileBytesBoundedAsync} from './paths.js';
+import {extractDshConfiguredModel, makeDshModelCatalog} from './dshModelCatalog.js';
 import {
     buildProcessGroupKillArgv,
     isSafeProcessGroupId,
@@ -1246,6 +1247,7 @@ function emptyCatalogSkeleton(effectiveBackend) {
     const labels = {
         zcode: 'ZCode CLI',
         codex: 'Codex CLI',
+        dsh: 'DeepSeek Harness',
         unconfigured: '未配置后端',
         openai: '自定义 OpenAI API',
     };
@@ -1272,7 +1274,9 @@ export function peekCachedBackendCatalog(effectiveBackend) {
         };
     }
     return {
-        ...emptyCatalogSkeleton(effectiveBackend),
+        ...(effectiveBackend === 'dsh'
+            ? makeDshModelCatalog()
+            : emptyCatalogSkeleton(effectiveBackend)),
         fromCache: false,
         stale: true,
     };
@@ -1282,7 +1286,9 @@ export function peekCachedBackendCatalog(effectiveBackend) {
  * Asynchronous Gio I/O loader for ZCode / Codex local model catalogs (Stage D4).
  * Strips all secret fields before caching in memory.
  */
-export async function loadLocalBackendCatalogAsync(effectiveBackend, {forceRefresh = false} = {}) {
+export async function loadLocalBackendCatalogAsync(effectiveBackend, {
+    forceRefresh = false, dshPath = '', cancellable = null,
+} = {}) {
     const key = `catalog:${effectiveBackend}`;
     return backendCatalogCache.getOrLoadAsync(
         key,
@@ -1302,6 +1308,33 @@ export async function loadLocalBackendCatalogAsync(effectiveBackend, {forceRefre
                     defaultProviderId: cat.defaultSelection?.providerId || '',
                     defaultModelId: cat.defaultSelection?.modelId || '',
                 });
+            }
+
+            if (effectiveBackend === 'dsh') {
+                const pathDirs = await buildSearchPathAsync(dshPath, {forceRefresh});
+                const env = createGioCliEnv(dshPath, pathDirs);
+                const executable = dshPath ? env.resolveCandidate(dshPath)
+                    : findExecutableInDirs('dsh', pathDirs);
+                if (!executable || !env.isExecutable(executable)) {
+                    return makeDshModelCatalog();
+                }
+                // DSH headless deliberately exposes no "list models" command.
+                // Dump layered config without starting an Agent and retain only
+                // validated provider/model ids; the raw YAML may include secrets.
+                const probe = await runShortProbeCommandWithMetaAsync(
+                    [executable, '--profile', 'headless', '--dump-config'],
+                    {}, 96000, {
+                        timeoutMs: 8000, maxBytes: 128 * 1024, cancellable,
+                    }
+                );
+                if (probe.cancelled || cancellable?.is_cancelled?.()) {
+                    throw new Error('DSH model scan cancelled');
+                }
+                return sanitizeProviderCatalogSecrets(
+                    makeDshModelCatalog(
+                        probe.ok ? extractDshConfiguredModel(probe.output) : {}
+                    )
+                );
             }
 
             if (effectiveBackend === 'codex') {
@@ -1357,6 +1390,8 @@ export function loadLocalBackendCatalog(effectiveBackend) {
             defaultProviderId: cat.defaultProvider || 'openai',
             defaultModelId: cat.defaultModel || '',
         });
+    } else if (effectiveBackend === 'dsh') {
+        result = sanitizeProviderCatalogSecrets(makeDshModelCatalog());
     } else {
         result = sanitizeProviderCatalogSecrets(emptyCatalogSkeleton(effectiveBackend));
     }
