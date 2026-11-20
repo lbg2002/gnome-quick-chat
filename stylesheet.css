@@ -1135,3 +1135,77 @@
 }
 
 
+
+
+/* v0.3.5 compact readability: short labels keep DateMenu columns bounded. */
+.qc-wrapper .qc-status,
+.qc-wrapper .qc-mini-label,
+.qc-wrapper .qc-empty-subtitle {
+    font-size: 0.79em;
+}
+.qc-wrapper .qc-header { spacing: 5px; padding: 4px 7px; }
+.qc-wrapper .qc-button-subtle { font-size: 0.75em; padding: 4px 7px; }
+.qc-wrapper .qc-entry { font-size: 0.88em; }
+.qc-wrapper .qc-chip { font-size: 0.77em; padding: 5px 8px; }
+.qc-wrapper .qc-tabs { padding: 3px; }
+.qc-wrapper .qc-empty-card { padding: 12px 10px; }
+
+/* Capsule: transparent, non-modal, compact command pill and gradual waterfall.
+ * Bounded surface size (not a full-screen reactive overlay).
+ */
+.qc-capsule-root {
+    spacing: 12px;
+    padding: 7px 8px 12px;
+    border-radius: 23px;
+    background-color: rgba(14, 19, 30, 0.58);
+    border: 1px solid rgba(158, 205, 255, 0.26);
+    box-shadow: 0 14px 52px rgba(0, 0, 0, 0.40);
+}
+.qc-capsule-pill {
+    spacing: 8px;
+    padding: 5px 7px 5px 14px;
+    border-radius: 999px;
+    background-color: rgba(33, 43, 60, 0.66);
+    border: 1px solid rgba(128, 190, 255, 0.25);
+}
+.qc-capsule-glyph {
+    font-size: 1.35em;
+    color: #7dd3fc;
+}
+.qc-capsule-input {
+    padding: 9px 3px;
+    border-radius: 12px;
+    background-color: transparent;
+    color: #f0f7ff;
+    font-size: 1.02em;
+    border: none;
+    box-shadow: none;
+}
+.qc-capsule-control {
+    min-width: 29px;
+    padding: 5px 7px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.10);
+    color: rgba(235, 245, 255, 0.9);
+    font-size: 1.03em;
+}
+.qc-capsule-control:hover { background-color: rgba(125, 211, 252, 0.26); }
+.qc-capsule-waterfall {
+    spacing: 9px;
+    padding: 5px 18px 12px;
+    border-radius: 15px;
+    background-color: rgba(15, 23, 42, 0.26);
+}
+.qc-capsule-state {
+    font-size: 0.78em;
+    color: rgba(153, 218, 255, 0.86);
+}
+.qc-capsule-answer-scroll {
+    height: 260px;
+    padding: 4px;
+}
+.qc-capsule-answer {
+    font-size: 0.96em;
+    line-height: 1.5;
+    color: rgba(242, 248, 255, 0.96);
+}
