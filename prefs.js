@@ -692,7 +692,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const tabs = ['ai', 'notifications'];
         const tabRow = new Adw.ComboRow({
             title: '默认打开标签',
-            subtitle: '系统通知仍由 GNOME 原生日期菜单负责',
+            subtitle: '安全嵌入模式会同时保留系统通知，不接管原生通知树',
             model: Gtk.StringList.new(['✦ 随问 (AI 助手)', '通知 (系统消息)']),
         });
         tabRow.selected = Math.max(0, tabs.indexOf(getStr('default-tab', 'ai')));
@@ -704,23 +704,24 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const fallbackModes = ['auto', 'datemenu', 'panel-button'];
         const fallbackRow = new Adw.ComboRow({
             title: '面板挂载方式与兼容回退',
-            subtitle: '为避免 GNOME Shell 冻结，当前版本只使用独立顶栏按钮',
+            subtitle: '默认安全嵌入日期与通知弹窗，保留 GNOME 原生通知；失败时可回退独立按钮',
             model: Gtk.StringList.new([
-                '自动嵌入日期菜单（失败时回退独立顶栏按钮）',
-                '仅嵌入原生日期菜单（不显示独立按钮）',
-                '独立顶栏按钮模式 (PanelMenu.Button)',
+                '自动嵌入通知中心（失败时回退顶栏按钮）',
+                '仅嵌入原生通知中心（安全并列挂载）',
+                '独立顶栏按钮模式',
             ]),
         });
         if (hasKey('panel-fallback-mode')) {
             fallbackRow.selected = Math.max(0, fallbackModes.indexOf(getStr('panel-fallback-mode', 'auto')));
-            fallbackRow.selected = 2;
-            fallbackRow.sensitive = false;
+            fallbackRow.connect('notify::selected', () => {
+                setStr('panel-fallback-mode', fallbackModes[fallbackRow.selected] || 'auto');
+            });
             uiGroup.add(fallbackRow);
         }
 
         const widthRow = new Adw.SpinRow({
             title: '面板宽度 (px)',
-            subtitle: '设置随问独立弹窗的宽度',
+            subtitle: '随问聊天区宽度（嵌入模式不改变原生通知组件）',
             adjustment: new Gtk.Adjustment({
                 lower: 340,
                 upper: 680,
