@@ -18,6 +18,7 @@ import {
     peekCachedBackendCatalog,
 } from './core/backendDetect.js';
 import {BackendRegistry} from './core/backendRegistry.js';
+import {DEFAULT_DESKTOP_ASSISTANT_PROMPT} from './core/dshModelCatalog.js';
 import {
     attachCrossOriginRedirectGuard,
     readSoupResponseBytesBoundedAsync,
@@ -934,6 +935,84 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         }));
         agentGroup.add(workspaceRow);
 
+        // --- Editable, multi-line agent persona (does not change executable authority) ---
+        const personaRow = new Adw.ActionRow({
+            title: '桌面助手提示词',
+            subtitle: '适用于 ZCode / Codex / DSH。默认适合 GNOME 桌面控制、打开应用和简短问答。',
+        });
+        const editPersonaButton = new Gtk.Button({
+            label: '编辑提示词',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        personaRow.add_suffix(editPersonaButton);
+        agentGroup.add(personaRow);
+        const updatePersonaSubtitle = () => {
+            const userValue = getStr('desktop-assistant-prompt', '').trim();
+            personaRow.subtitle = userValue
+                ? `已启用自定义指引（${userValue.length} 字），仅用于下一次 Agent 请求。权限仍由 CLI 预设控制。`
+                : '使用内置 GNOME 桌面助手指引；支持编辑为自己的中文提示词。';
+        };
+        updatePersonaSubtitle();
+        const resetPersonaButton = makeResetButton('恢复内置桌面助手提示词', () => {
+            setStr('desktop-assistant-prompt', '');
+            updatePersonaSubtitle();
+        });
+        personaRow.add_suffix(resetPersonaButton);
+        editPersonaButton.connect('clicked', () => {
+            const dialog = new Adw.AlertDialog({
+                heading: '自定义桌面助手提示词',
+                body: '设置智能助手的工作方式，不改变 DSH/ZCode/Codex 的真实文件与系统权限。打开程序属于系统操作；修改、删除和危险 Bash 指令仍须遵守权限策略。',
+            });
+            dialog.add_response('cancel', '取消');
+            dialog.add_response('save', '保存');
+            dialog.set_default_response('save');
+            dialog.set_close_response('cancel');
+            const editor = new Gtk.TextView({
+                wrap_mode: Gtk.WrapMode.WORD_CHAR,
+                top_margin: 8, bottom_margin: 8,
+                left_margin: 8, right_margin: 8,
+                monospace: false,
+            });
+            editor.get_buffer().set_text(
+                getStr('desktop-assistant-prompt', '') || DEFAULT_DESKTOP_ASSISTANT_PROMPT, -1
+            );
+            const scroller = new Gtk.ScrolledWindow({
+                min_content_height: 260,
+                max_content_height: 340,
+                vexpand: true,
+                hscrollbar_policy: Gtk.PolicyType.NEVER,
+            });
+            scroller.set_child(editor);
+            dialog.set_extra_child(scroller);
+            dialog.connect('response', (_d, response) => {
+                if (response !== 'save') return;
+                const buffer = editor.get_buffer();
+                const edited = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false).trim();
+                if (!edited || edited.length > 8192) {
+                    personaRow.subtitle = '⚠️ 提示词不能为空，且最多 8192 字；未覆盖之前的设置';
+                    return;
+                }
+                setStr('desktop-assistant-prompt',
+                    edited === DEFAULT_DESKTOP_ASSISTANT_PROMPT ? '' : edited);
+                updatePersonaSubtitle();
+            });
+            dialog.present(window);
+        });
+
+        // DSH native Auto Review is a model-based approval substitute, NOT a
+        // reliable sandbox or Quick Chat interactive approval. Leave off by
+        // default and require the user to install the experimental bundle.
+        const dshReviewRow = new Adw.SwitchRow({
+            title: 'DSH 智能操作 · 实验性 Auto Review',
+            subtitle: '默认关闭；仅智能模式生效。开启后原生模型审查可能允许低风险主机操作，也可能误放行；高风险拒绝而非弹窗。须自行在 DSH Headless 配置档安装 auto-review 插件。',
+        });
+        if (hasKey('dsh-auto-review')) {
+            s.bind('dsh-auto-review', dshReviewRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+        }
+        dshReviewRow.visible = getEffectiveBackend() === 'dsh';
+        agentGroup.add(dshReviewRow);
+
         // --- Group 4: 隐私与本地历史管理 ---
         const privacyGroup = new Adw.PreferencesGroup({
             title: '隐私与本地会话存储',
@@ -1479,6 +1558,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 syncingWorkspace = false;
             }
             workspaceRow.sensitive = eff === 'zcode' || eff === 'codex' || eff === 'dsh';
+            dshReviewRow.visible = eff === 'dsh';
 
             modeRow.sensitive = caps.supportsTools;
             if (eff === 'unconfigured') {
