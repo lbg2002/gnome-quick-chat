@@ -3,8 +3,8 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import {
-    mountChatAsDateMenuSibling,
-    unmountChatDateMenuSibling,
+    mountChatAsLeftColumn,
+    restoreChatLeftColumn,
 } from '../core/safeDateMenuMount.js';
 
 /**
@@ -21,6 +21,7 @@ export class DateMenuIntegration {
         this.nativeMessageList = null;
         this.parentBox = null;
         this.insertIndex = -1;
+        this._nativeSnapshot = null;
         this._fallbackButton = null;
         this.mounted = false;
         this.mountMode = 'unmounted'; // datemenu-safe | panel-button | unmounted
@@ -40,14 +41,15 @@ export class DateMenuIntegration {
         }
 
         const dateMenu = Main.panel?.statusArea?.dateMenu;
-        const menuBox = dateMenu?.menu?.box || null;
-        const result = mountChatAsDateMenuSibling(menuBox, wrapperActor);
+        const result = mountChatAsLeftColumn(dateMenu, wrapperActor);
         if (result.ok) {
             this.dateMenu = dateMenu;
             this.parentBox = result.parentBox;
-            this.nativeMessageList = null;
+            this.nativeMessageList = result.nativeList;
+            this.insertIndex = result.index;
+            this._nativeSnapshot = result;
             this.mounted = true;
-            this.mountMode = 'datemenu-safe';
+            this.mountMode = 'datemenu';
             return true;
         }
 
@@ -100,8 +102,16 @@ export class DateMenuIntegration {
     nudgeLayout() {}
 
     unmount(wrapperActor) {
-        if (this.mountMode === 'datemenu-safe') {
-            unmountChatDateMenuSibling(this.parentBox, wrapperActor);
+        if (this.mountMode === 'datemenu') {
+            const recovered = restoreChatLeftColumn(this._nativeSnapshot, wrapperActor, {
+                hasNotifications: Main.sessionMode?.hasNotifications !== false &&
+                    !Main.sessionMode?.isGreeter && !Main.sessionMode?.isLocked,
+            });
+            if (!recovered) {
+                console.error('[Quick Chat] Native notification left column could not be restored');
+                // Never destroy a wrapper still owning GNOME's native notification actor.
+                if (this.nativeMessageList?.get_parent?.() === wrapperActor) return;
+            }
         } else if (this.mountMode === 'panel-button' && this._fallbackButton) {
             const box = this._fallbackButton.menu?.box;
             if (box && wrapperActor?.get_parent?.() === box) {
@@ -121,5 +131,6 @@ export class DateMenuIntegration {
         this.nativeMessageList = null;
         this.parentBox = null;
         this.insertIndex = -1;
+        this._nativeSnapshot = null;
     }
 }
