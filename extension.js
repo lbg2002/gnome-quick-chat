@@ -70,6 +70,7 @@ import {
     validateSessionId,
 } from './core/sessionStore.js';
 import {ChatPanelView} from './ui/chatPanel.js';
+import {CapsuleView} from './ui/capsuleView.js';
 import {DateMenuIntegration} from './ui/dateMenuIntegration.js';
 import {MessageCardFactory} from './ui/messageCard.js';
 import {ModelPickerController} from './ui/modelPicker.js';
@@ -100,6 +101,7 @@ export default class QuickChat extends Extension {
         this._modelLabel = '随问';
         this._idleStatus = '随问';
         this._tab = 'ai';
+        this._capsule = null;
 
         this._attachments = new AttachmentManager();
         this._notifGate = new BackgroundNotificationGate();
@@ -133,6 +135,7 @@ export default class QuickChat extends Extension {
                     this._live = null;
                     this._setBusy(false);
                     const errMsg = err?.message || String(err || '未知错误');
+                    if (this._capsule?.isPending) this._capsule.fail(errMsg);
                     this._panel?.setStatusIndicator('error', `连接失败：${errMsg}`);
                     this._syncDiagnosticsSnapshot({lastConnectionError: errMsg});
                 },
@@ -341,6 +344,17 @@ export default class QuickChat extends Extension {
                 }
             });
 
+            this._capsule = new CapsuleView({
+                onSubmit: text => this._sendCapsuleQuestion(text),
+                onExpand: () => this._toggleQuickChatPanel(),
+            });
+            // Chrome actor creation stays cheap and hidden until its keybinding
+            // is invoked; no modal grab and no additional backend connection.
+            try { this._capsule.build(); } catch (err) {
+                console.warn('[Quick Chat] Capsule unavailable: ' + err.message);
+                this._capsule?.dispose();
+                this._capsule = null;
+            }
             this._connectSettingsSignals();
             this._connectNotificationSignals();
             this._registerGlobalKeybindings();
@@ -509,6 +523,7 @@ export default class QuickChat extends Extension {
 
         addBinding('toggle-shortcut', () => this._toggleQuickChatPanel());
         addBinding('clipboard-shortcut', () => this._triggerClipboardAsk(true));
+        addBinding('capsule-shortcut', () => this._toggleCapsule());
     }
 
     _unregisterGlobalKeybindings() {
@@ -518,8 +533,32 @@ export default class QuickChat extends Extension {
         this._registeredKeybindings?.clear();
     }
 
+    _toggleCapsule() {
+        if (!this._isSessionUnlockedAndAlive()) return;
+        if (!this._capsule) return;
+        if (!this._capsule.visible) this._dateIntegration?.menu?.close?.();
+        this._capsule.toggle();
+    }
+
+    _sendCapsuleQuestion(text) {
+        if (!this._isSessionUnlockedAndAlive() || this._isBusyOrMutating()) {
+            this._capsule?.fail('当前有任务正在执行，请稍后再试');
+            return Promise.resolve(null);
+        }
+        // Capsule input is separate from the main composer, so the latter's
+        // unsent draft and pending attachments are never silently included.
+        return this._executePromptTurn({
+            promptText: text,
+            displayUserText: text,
+            recordHistoryText: text,
+            clearEntry: false,
+            clearAttachments: false,
+        });
+    }
+
     _toggleQuickChatPanel() {
         if (!this._isSessionUnlockedAndAlive()) return;
+        this._capsule?.hide();
         const menu = this._dateIntegration?.menu;
         if (!menu) return;
         if (menu.isOpen && this._tab === 'ai') {
@@ -928,6 +967,7 @@ export default class QuickChat extends Extension {
         watch('render-markdown', () => this._panel?.rerenderAllMessages());
         watch('toggle-shortcut', () => this._registerGlobalKeybindings());
         watch('clipboard-shortcut', () => this._registerGlobalKeybindings());
+        watch('capsule-shortcut', () => this._registerGlobalKeybindings());
         watch('migration-notice', () => {
             if (this._enabled && !this._panel?.mountedCards?.length) {
                 this._panel?.buildEmptyState();
@@ -1935,6 +1975,7 @@ export default class QuickChat extends Extension {
         if (event.turnId && activeTurn?.turnId && event.turnId !== activeTurn.turnId) {
             return;
         }
+        this._capsule?.recordEvent(event);
 
         if (event.type === 'session_save_error') {
             const msg = event.message || '历史未保存';
@@ -2860,6 +2901,8 @@ export default class QuickChat extends Extension {
         this._sessionMutationLock = false;
 
         this._unregisterGlobalKeybindings();
+        this._capsule?.dispose();
+        this._capsule = null;
 
         const hostMenu = this._dateIntegration?.menu;
         if (this._menuSignal && hostMenu) {
