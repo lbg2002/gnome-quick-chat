@@ -1226,15 +1226,27 @@ export function normalizeEvent(backend, record) {
                 // DSH's durable final.reason is a structured turn/end reason
                 // ({kind:'completed'}), not a bare string. Fail closed for any
                 // other reason even when a CLI wrapper exits with code 0.
-                const kind = typeof record.reason === 'object' && record.reason !== null
-                    ? String(record.reason.kind || '')
-                    : String(record.reason || '');
+                const reason = record.reason && typeof record.reason === 'object'
+                    ? record.reason : null;
+                const kind = reason ? String(reason.kind || '') : String(record.reason || '');
                 const completed = kind === 'completed';
+                // Headless returns a structured turn error with code/message.
+                // Do not collapse it to "error": that hid provider authentication,
+                // sandbox errors and other actionable failures from diagnostics.
+                const detail = reason?.error && typeof reason.error === 'object'
+                    ? [
+                        String(reason.error.code || '').slice(0, 96),
+                        String(reason.error.message || reason.error.reason || '').slice(0, 320),
+                    ].filter(Boolean).join(': ')
+                    : '';
+                const errorMessage = completed ? ''
+                    : `DSH 任务${kind === 'aborted' ? '已中止' : '失败'}（${kind || '缺少终止原因'}）${detail ? '：' + detail : ''}`;
                 return {
                     type: 'turn_result', sessionId: String(record.sessionId || ''),
                     text: String(record.text || ''), authoritative: true,
                     isError: !completed,
-                    errorMessage: completed ? '' : `DSH 未正常完成本次任务：${kind || '缺少终止原因'}`,
+                    errorMessage,
+                    ...(reason?.error?.code ? {errorCode: String(reason.error.code).slice(0, 96)} : {}),
                 };
             }
             case 'error':
