@@ -126,9 +126,7 @@ export class ChatPanelView {
         this.scroll = null;
         this.messagesBox = null;
         this._aiTab = null;
-        this._notificationTab = null;
         this._aiBadge = null;
-        this._notifBadge = null;
         this._reconnectButton = null;
         this._status = null;
         this._statusDot = null;
@@ -182,7 +180,7 @@ export class ChatPanelView {
         return Boolean(this._slashMenuBox?.visible && this._slashMatches.length > 0);
     }
 
-    build({showNotificationTab = true} = {}) {
+    build() {
         this.wrapper = new St.BoxLayout({
             orientation: V,
             style_class: 'qc-wrapper',
@@ -190,7 +188,7 @@ export class ChatPanelView {
             y_expand: true,
         });
 
-        this._buildTopTabs({showNotificationTab});
+        this._buildTopTabs();
         this.chatBox = new St.BoxLayout({
             orientation: V,
             style_class: 'qc-chat',
@@ -202,7 +200,7 @@ export class ChatPanelView {
         return this.wrapper;
     }
 
-    _buildTopTabs({showNotificationTab = true} = {}) {
+    _buildTopTabs() {
         const tabs = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-tabs',
@@ -215,7 +213,7 @@ export class ChatPanelView {
             can_focus: true,
             reactive: true,
             track_hover: true,
-            accessible_name: '切换到随问助手',
+            accessible_name: '聚焦随问输入框',
         });
         const aiContent = new St.BoxLayout({
             orientation: H,
@@ -233,32 +231,6 @@ export class ChatPanelView {
         this._aiTab.set_child(aiContent);
         this._aiTab.connect('clicked', () => this._onSelectTab('ai'));
         tabGroup.add_child(this._aiTab);
-
-        if (showNotificationTab) {
-            this._notificationTab = new St.Button({
-                style_class: 'qc-tab-button',
-                can_focus: true,
-                reactive: true,
-                track_hover: true,
-                accessible_name: '切换到系统通知',
-            });
-            const notifContent = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-tab-content',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-            notifContent.add_child(new St.Label({text: '通知', y_align: Clutter.ActorAlign.CENTER}));
-            this._notifBadge = new St.Label({
-                text: '0',
-                style_class: 'qc-tab-badge',
-                y_align: Clutter.ActorAlign.CENTER,
-                visible: false,
-            });
-            notifContent.add_child(this._notifBadge);
-            this._notificationTab.set_child(notifContent);
-            this._notificationTab.connect('clicked', () => this._onSelectTab('notifications'));
-            tabGroup.add_child(this._notificationTab);
-        }
 
         tabs.add_child(tabGroup);
         tabs.add_child(new St.Widget({x_expand: true}));
@@ -1024,44 +996,6 @@ export class ChatPanelView {
         }
     }
 
-    setNotificationTabAvailable(available) {
-        if (this._notificationTab) {
-            this._notificationTab.visible = Boolean(available);
-        }
-    }
-
-    applyTabVisualState(tab, {nativeList = null, showNotif = false, animate = true, changed = false} = {}) {
-        if (!this.wrapper) return;
-        const showAi = tab === 'ai';
-        this.chatBox.visible = showAi;
-        if (nativeList) nativeList.visible = showNotif;
-        this._aiTab?.set_checked?.(showAi);
-        this._notificationTab?.set_checked?.(tab === 'notifications');
-
-        if (showAi) {
-            this._aiTab?.add_style_pseudo_class('checked');
-            this._notificationTab?.remove_style_pseudo_class('checked');
-        } else {
-            this._notificationTab?.add_style_pseudo_class('checked');
-            this._aiTab?.remove_style_pseudo_class('checked');
-        }
-
-        const targetActor = showAi ? this.chatBox : (showNotif ? nativeList : null);
-        if (animate && changed && targetActor && this._isAnimEnabled()) {
-            targetActor.opacity = 0;
-            targetActor.translation_y = 7;
-            this._easeActor(targetActor, {
-                opacity: 255,
-                translation_y: 0,
-                duration: 170,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
-        } else if (targetActor) {
-            targetActor.opacity = 255;
-            targetActor.translation_y = 0;
-        }
-    }
-
     buildEmptyState() {
         if (!this.messagesBox) return;
         if (this._empty) {
@@ -1130,33 +1064,13 @@ export class ChatPanelView {
         else this.wrapper.remove_style_class_name('qc-light');
     }
 
-    applyDimensions(nudgeLayoutFn, {embeddedInDateMenu = false} = {}) {
+    applyDimensions() {
         if (!this.wrapper || !this.chatBox || !this.scroll) return;
         const width = this._getSettingInt('panel-width', 460);
         const height = this._getSettingInt('panel-height', 380);
         this.wrapper.set_width(width);
         this.chatBox.set_width(Math.max(300, width - 16));
-        // Share the DateMenu viewport with its untouched calendar/notifications.
-        // Prevent an oversized chat scroll actor from expanding the popup past
-        // the monitor, which can cause allocation churn on GNOME Shell 50.
-        this.scroll.set_height(embeddedInDateMenu ? Math.min(height, 300) : height);
-        nudgeLayoutFn?.();
-    }
-
-    updateNotificationBadge() {
-        if (!this._notifBadge) return;
-        let total = 0;
-        try {
-            for (const src of Main.messageTray?.getSources?.() || []) {
-                total += Number(src.count || src.unseenCount || 0);
-            }
-        } catch (_) {}
-        if (total > 0) {
-            this._notifBadge.text = total > 99 ? '99+' : String(total);
-            this._notifBadge.visible = true;
-        } else {
-            this._notifBadge.visible = false;
-        }
+        this.scroll.set_height(height);
     }
 
     updateAiTabBadge({isAiTabOpenAndVisible = false} = {}) {
@@ -1417,7 +1331,8 @@ export class ChatPanelView {
     }
 
     renderInitialHistory(allDetailed, onUserPromptSeen, {externalArchivedCount = 0} = {}) {
-        this.clearMessages();
+        if (!this.messagesBox || !this.historyWindow) return;
+        this.clearMessages({buildEmpty: false});
         const normalized = Array.isArray(allDetailed) ? allDetailed : [];
         for (const msg of normalized) {
             if (msg.role === 'user' && msg.text) {
@@ -1426,6 +1341,7 @@ export class ChatPanelView {
         }
         const {initialSlice} = this.historyWindow.reset(normalized, {externalArchivedCount});
         if (!initialSlice.length) {
+            this.buildEmptyState();
             this.syncHistoryWindowButtons();
             return;
         }
@@ -1678,7 +1594,7 @@ export class ChatPanelView {
         this.scrollBottom(true, true);
     }
 
-    clearMessages() {
+    clearMessages({buildEmpty = true} = {}) {
         for (const c of this.mountedCards) {
             this._cardFactory.destroyCardActor(c);
         }
@@ -1687,7 +1603,7 @@ export class ChatPanelView {
         this._loadNewerBtn = null;
         this._empty = null;
         this.messagesBox?.destroy_all_children();
-        this.buildEmptyState();
+        if (buildEmpty) this.buildEmptyState();
     }
 
     rerenderAllMessages() {
@@ -1728,7 +1644,7 @@ export class ChatPanelView {
         }
 
         this.wrapper = this.chatBox = this.entry = this.scroll = this.messagesBox = null;
-        this._aiTab = this._notificationTab = this._aiBadge = this._notifBadge = null;
+        this._aiTab = this._aiBadge = null;
         this._reconnectButton = this._status = this._statusDot = null;
         this._sendButton = this._stopButton = this._newButton = this._sessionMenuBtn = null;
         this._sessionMenuBox = this._editBanner = this._editBannerLabel = null;

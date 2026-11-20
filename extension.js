@@ -84,9 +84,7 @@ export default class QuickChat extends Extension {
         this._lifecycleGeneration = lifeGen;
         this._enabled = true;
         this._timers = new Set();
-        this._sourceSignals = new Map();
         this._settingSignals = [];
-        this._traySignals = [];
         this._registeredKeybindings = new Set();
         this._menuSignal = 0;
         this._sessionSignal = 0;
@@ -122,6 +120,7 @@ export default class QuickChat extends Extension {
             this._settings = this.getSettings();
             migrateGSettingsIfNeeded(this._settings);
 
+            this._observedSessionId = this._getSettingString('session-id', '');
             this._registry = new BackendRegistry(this._settings);
             this._dateIntegration = new DateMenuIntegration();
 
@@ -215,7 +214,7 @@ export default class QuickChat extends Extension {
                 scheduleIdle: fn => this._scheduleIdle(fn),
                 clearTimer: id => this._clearTimer(id),
                 easeActor: (actor, params) => this._easeActor(actor, params),
-                onSelectTab: tab => this._setTab(tab),
+                onSelectTab: () => this._showChat(),
                 onReconnectNow: () => this._reconnectNow(),
                 onOpenPreferences: () => this._openExtensionPreferences(),
                 onClipboardAsk: openFirst => this._triggerClipboardAsk(openFirst),
@@ -245,40 +244,14 @@ export default class QuickChat extends Extension {
                 onSwitchToAgentBackendForPath: () => this._switchToAgentBackendForPath(),
             });
 
-            const wrapper = this._panel.build({showNotificationTab: true});
-            const fallbackMode = this._getSettingString('panel-fallback-mode', 'auto') || 'auto';
-            const mounted = this._dateIntegration.mount(
-                wrapper,
-                () => Boolean(
-                    this._enabled &&
-                    this._dateIntegration?.mountMode === 'datemenu' &&
-                    this._tab === 'ai'
-                ),
-                {fallbackMode}
-            );
-
-            if (!mounted) {
-                const mountErr = this._dateIntegration.lastMountError || 'unknown';
-                this._syncDiagnosticsSnapshot({
-                    mountMode: `failed (${fallbackMode})`,
-                    lastConnectionError: `面板挂载回退失败：${mountErr}`,
-                });
-                console.warn(
-                    `[Quick Chat] Panel mount unavailable (mode=${fallbackMode}): ${mountErr}; preserving native DateMenu.`
-                );
+            const wrapper = this._panel.build();
+            if (!this._dateIntegration.mount(wrapper)) {
+                console.warn('[Quick Chat] Panel mount unavailable: ' + this._dateIntegration.lastMountError);
                 this.disable();
                 return;
             }
-
-            this._syncDiagnosticsSnapshot({mountMode: this._dateIntegration.mountMode || 'datemenu'});
-
-            const hasNativeNotifications = this._dateIntegration.mountMode === 'datemenu';
-            this._panel.setNotificationTabAvailable(hasNativeNotifications);
-            const preferredTab = this._getSettingString('default-tab', 'ai') === 'notifications'
-                ? 'notifications'
-                : 'ai';
-            this._tab = hasNativeNotifications ? preferredTab : 'ai';
-            this._setTab(this._tab, false, false);
+            this._syncDiagnosticsSnapshot({mountMode: this._dateIntegration.mountMode});
+            this._showChat(false);
 
             const hostMenu = this._dateIntegration.menu;
             if (hostMenu) {
@@ -286,7 +259,6 @@ export default class QuickChat extends Extension {
                     if (!this._isSessionUnlockedAndAlive(lifeGen)) return;
                     if (open) {
                         this._panel?.syncThemeStyle(this._interfaceSettings);
-                        this._panel?.updateNotificationBadge();
                         if (this._tab === 'ai') {
                             this._panel?.flushPendingBackgroundWork({isAiTabOpenAndVisible: true});
                             if (this._chatController?.client) {
@@ -322,55 +294,42 @@ export default class QuickChat extends Extension {
                 });
             }
 
-            this._sessionSignal = Main.sessionMode.connect('updated', () => {
-                if (!this._enabled || this._lifecycleGeneration !== lifeGen) return;
-                // Never expose transcript, pending attachments, or approved session scopes across lock screen / greeter.
-                if (Main.sessionMode.isLocked || Main.sessionMode.isGreeter) {
-                    // Release any capsule keyboard grab and hide private
-                    // streaming output before GNOME changes session mode.
-                    this._capsule?.hide();
-                    this._notifGate?.onLockScreenEntered?.();
-                    if (this._modelPicker?.isOpen) this._modelPicker.toggle(false);
-                    this._panel?.toggleSessionMenu(false);
-                    this._panel?.toggleFileAttachBar(false);
-                    this._panel?.closeSlashMenu();
-                    this._panel?.setRouteSuggestion(null);
-                    this._cancelEditQuestion({keepEntry: true});
-                    this._attachments?.clear();
-                    this._panel?.renderAttachments([], '');
-                    this._panel?.wrapper?.hide();
-                    this._live = null;
-                    this._chatController?.stopClient();
-                    this._setBusy(false);
-                } else {
-                    this._panel?.wrapper?.show();
-                    this._setTab(this._tab, false, false);
-                }
-            });
+            this._sessionSignal = Main.sessionMode.connect('updated', () => this._onSessionModeUpdated(lifeGen));
 
-            this._capsule = new CapsuleView({
-                onSubmit: text => this._sendCapsuleQuestion(text),
-                onExpand: () => this._toggleQuickChatPanel(),
-            });
-            // Chrome actor creation stays cheap and hidden until its keybinding
-            // is invoked; no modal grab and no additional backend connection.
-            try { this._capsule.build(); } catch (err) {
-                console.warn('[Quick Chat] Capsule unavailable: ' + err.message);
-                this._capsule?.dispose();
-                this._capsule = null;
-            }
             this._connectSettingsSignals();
-            this._connectNotificationSignals();
             this._registerGlobalKeybindings();
             this._panel.syncThemeStyle(this._interfaceSettings);
-            this._panel.applyDimensions(
-                () => this._dateIntegration?.nudgeLayout(),
-                {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu'}
-            );
+            this._panel.applyDimensions();
             this._refreshAvailableBackendsAsync();
         } catch (err) {
             console.error('[Quick Chat] enable() failed, rolling back cleanly:', err);
             this.disable();
+        }
+    }
+
+    _onSessionModeUpdated(lifeGen) {
+        if (!this._enabled || this._lifecycleGeneration !== lifeGen) return;
+        // Never expose transcript, pending attachments, or approved session scopes across lock screen / greeter.
+        if (Main.sessionMode.isLocked || Main.sessionMode.isGreeter) {
+            this._capsule?.reset();
+            this._dateIntegration?.menu?.close();
+            this._sessionSwitchInFlight = false;
+            this._notifGate?.onLockScreenEntered?.();
+            if (this._modelPicker?.isOpen) this._modelPicker.toggle(false);
+            this._panel?.toggleSessionMenu(false);
+            this._panel?.toggleFileAttachBar(false);
+            this._panel?.closeSlashMenu();
+            this._panel?.setRouteSuggestion(null);
+            this._cancelEditQuestion({keepEntry: true});
+            this._attachments?.clear();
+            this._panel?.renderAttachments([], '');
+            this._panel?.wrapper?.hide();
+            this._live = null;
+            this._chatController?.stopClient();
+            this._setBusy(false);
+        } else {
+            this._panel?.wrapper?.show();
+            this._showChat(false);
         }
     }
 
@@ -507,7 +466,8 @@ export default class QuickChat extends Extension {
 
     _registerGlobalKeybindings() {
         this._unregisterGlobalKeybindings();
-        const addBinding = (keyName, handler) => {
+        const addBinding = (keyName, handler,
+            actionMode = Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW | Shell.ActionMode.POPUP) => {
             if (!this._hasKey(keyName)) return;
             const shortcuts = this._settings.get_strv(keyName);
             if (!shortcuts || !shortcuts.length || !shortcuts[0]) return;
@@ -516,7 +476,7 @@ export default class QuickChat extends Extension {
                     keyName,
                     this._settings,
                     Meta.KeyBindingFlags.NONE,
-                    Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW | Shell.ActionMode.POPUP,
+                    actionMode,
                     handler
                 );
                 this._registeredKeybindings.add(keyName);
@@ -527,7 +487,10 @@ export default class QuickChat extends Extension {
 
         addBinding('toggle-shortcut', () => this._toggleQuickChatPanel());
         addBinding('clipboard-shortcut', () => this._triggerClipboardAsk(true));
-        addBinding('capsule-shortcut', () => this._toggleCapsule());
+        if (this._hasKey('enable-experimental-capsule') &&
+            this._settings.get_boolean('enable-experimental-capsule')) {
+            addBinding('capsule-shortcut', () => this._toggleCapsule(), Shell.ActionMode.NORMAL);
+        }
     }
 
     _unregisterGlobalKeybindings() {
@@ -539,9 +502,19 @@ export default class QuickChat extends Extension {
 
     _toggleCapsule() {
         if (!this._isSessionUnlockedAndAlive()) return;
-        if (!this._capsule) return;
-        if (!this._capsule.visible) this._dateIntegration?.menu?.close?.();
-        this._capsule.toggle();
+        if (!this._settings?.get_boolean('enable-experimental-capsule')) return;
+        this._capsule ??= new CapsuleView({
+            onSubmit: text => this._sendCapsuleQuestion(text),
+            onExpand: () => this._toggleQuickChatPanel(),
+        });
+        try {
+            if (!this._capsule.visible) this._dateIntegration?.menu?.close();
+            this._capsule.toggle();
+        } catch (err) {
+            console.warn('[Quick Chat] Capsule unavailable: ' + err.message);
+            this._capsule.dispose();
+            this._capsule = null;
+        }
     }
 
     _sendCapsuleQuestion(text) {
@@ -557,6 +530,7 @@ export default class QuickChat extends Extension {
             recordHistoryText: text,
             clearEntry: false,
             clearAttachments: false,
+            capsule: this._capsule,
         });
     }
 
@@ -572,7 +546,7 @@ export default class QuickChat extends Extension {
         if (!menu.isOpen) {
             menu.open(true);
         }
-        this._setTab('ai', true, true);
+        this._showChat();
         this._scheduleTimeout(50, () => {
             if (this._isSessionUnlockedAndAlive() && this._tab === 'ai') {
                 this._panel?.entry?.grab_key_focus();
@@ -793,7 +767,7 @@ export default class QuickChat extends Extension {
             menu.open(true);
         }
         if (this._tab !== 'ai') {
-            this._setTab('ai', true, true);
+            this._showChat();
         }
 
         const clip = St.Clipboard.get_default();
@@ -960,18 +934,17 @@ export default class QuickChat extends Extension {
             }
         };
 
-        watch('panel-width', () => this._panel?.applyDimensions(
-            () => this._dateIntegration?.nudgeLayout(),
-            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu'}
-        ));
-        watch('panel-height', () => this._panel?.applyDimensions(
-            () => this._dateIntegration?.nudgeLayout(),
-            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu'}
-        ));
+        watch('panel-width', () => this._panel?.applyDimensions());
+        watch('panel-height', () => this._panel?.applyDimensions());
         watch('render-markdown', () => this._panel?.rerenderAllMessages());
         watch('toggle-shortcut', () => this._registerGlobalKeybindings());
         watch('clipboard-shortcut', () => this._registerGlobalKeybindings());
         watch('capsule-shortcut', () => this._registerGlobalKeybindings());
+        watch('enable-experimental-capsule', () => {
+            this._capsule?.dispose();
+            this._capsule = null;
+            this._registerGlobalKeybindings();
+        });
         watch('migration-notice', () => {
             if (this._enabled && !this._panel?.mountedCards?.length) {
                 this._panel?.buildEmptyState();
@@ -1015,16 +988,17 @@ export default class QuickChat extends Extension {
 
         const onBackendConfigChanged = keyName => {
             if (!this._enabled) return;
-            // Internal session transitions explicitly stop and restart the client.
-            // Scheduling a *second* reconnect from changed::session-id used to
-            // tear down the new client while its history was being rendered.
-            if (keyName === 'session-id' && this._sessionMutationLock) return;
+            if (keyName === 'session-id') {
+                const sessionId = this._getSettingString('session-id', '');
+                if (sessionId === this._observedSessionId) return;
+                this._observedSessionId = sessionId;
+            }
             this._registry?.bumpGeneration();
             if (cacheInvalidateKeys.has(keyName)) {
                 invalidateBackendDetectionCaches();
                 this._refreshAvailableBackendsAsync();
             }
-            if (!this._panel?.mountedCards?.length) {
+            if (keyName !== 'session-id' && !this._panel?.mountedCards?.length) {
                 this._panel?.buildEmptyState();
             }
             this._refreshAttachmentBarUi();
@@ -1082,89 +1056,36 @@ export default class QuickChat extends Extension {
         } catch (_) {}
     }
 
-    _connectNotificationSignals() {
-        this._traySignals = [];
-        const tray = Main.messageTray;
-        if (!tray) return;
+    _showChat(connect = true) {
+        if (!this._panel?.wrapper) return;
 
-        const bindSource = source => {
-            if (!source || this._sourceSignals.has(source)) return;
-            const id = source.connect('notify::count', () => this._panel?.updateNotificationBadge());
-            this._sourceSignals.set(source, id);
-        };
-        const unbindSource = source => {
-            const id = this._sourceSignals.get(source);
-            if (id) {
-                try { source.disconnect(id); } catch (_) {}
-                this._sourceSignals.delete(source);
-            }
-        };
-
-        this._traySignals.push(tray.connect('source-added', (_, src) => {
-            bindSource(src);
-            this._panel?.updateNotificationBadge();
-        }));
-        this._traySignals.push(tray.connect('source-removed', (_, src) => {
-            unbindSource(src);
-            this._panel?.updateNotificationBadge();
-        }));
-        this._traySignals.push(tray.connect('queue-changed', () => this._panel?.updateNotificationBadge()));
-
-        try {
-            for (const src of tray.getSources()) bindSource(src);
-        } catch (_) {}
-
-        this._panel?.updateNotificationBadge();
+        this._panel.flushPendingBackgroundWork({
+            isAiTabOpenAndVisible: Boolean(this._dateIntegration?.menu?.isOpen),
+        });
+        if (connect) {
+            this._ensureClient();
+            this._panel.entry?.grab_key_focus();
+        }
     }
 
-    _setTab(tab, connect = true, animate = true) {
-        if (!this._panel?.wrapper) return;
-        const effectiveTab = this._dateIntegration?.mountMode === 'datemenu' ? tab : 'ai';
-        const changed = this._tab !== effectiveTab;
-        this._tab = effectiveTab;
-
-        const showAi = effectiveTab === 'ai';
-        const nativeList = this._dateIntegration?.nativeMessageList || null;
-        const showNotif = Boolean(
-            effectiveTab === 'notifications' &&
-            nativeList &&
-            Main.sessionMode.hasNotifications &&
-            !Main.sessionMode.isLocked &&
-            !Main.sessionMode.isGreeter
-        );
-
-        if (showAi) {
-            this._dateIntegration?.collapseNativeMessageExpansion();
-        } else if (this._modelPicker?.isOpen) {
-            this._modelPicker.toggle(false);
-        }
-
-        this._panel.applyTabVisualState(effectiveTab, {
-            nativeList,
-            showNotif,
-            animate,
-            changed,
-        });
-
-        if (showAi) {
-            this._panel.flushPendingBackgroundWork({
-                isAiTabOpenAndVisible: Boolean(this._dateIntegration?.menu?.isOpen),
-            });
-            if (connect) {
-                this._ensureClient();
-                this._panel.entry?.grab_key_focus();
-            }
-        } else {
-            this._updateAiTabBadge();
-        }
-
-        this._dateIntegration?.nudgeLayout();
+    _setSessionId(sessionId) {
+        const previous = this._observedSessionId;
+        this._observedSessionId = sessionId;
+        if (this._settings.set_string('session-id', sessionId)) return;
+        this._observedSessionId = previous;
+        throw new Error('无法保存会话 ID');
     }
 
     async _loadRuntimeEnvironment({cancellable = null} = {}) {
-        migrateGSettingsIfNeeded(this._settings);
+        const lifeGen = this._lifecycleGeneration;
+        const assertCurrent = () => {
+            if (cancellable?.is_cancelled() || !this._isSessionUnlockedAndAlive(lifeGen)) {
+                throw new Error('连接已取消');
+            }
+        };
         const openaiBaseUrl = this._getSettingString('openai-base-url', '').trim();
         const apiKey = await loadOpenAIApiKey(this._settings, openaiBaseUrl);
+        assertCurrent();
         const selection = await detectBackendSelectionAsync({
             configuredBackend: this._getSettingString('backend', 'auto'),
             zcodePath: this._getSettingString('zcode-path', ''),
@@ -1172,6 +1093,7 @@ export default class QuickChat extends Extension {
             dshPath: this._getSettingString('dsh-path', ''),
             openaiBaseUrl,
         }, {cancellable});
+        assertCurrent();
         const eff = selection?.effectiveBackend || 'unconfigured';
         const config = this._registry.buildRuntimeConfig(eff, {apiKey});
 
@@ -1193,7 +1115,7 @@ export default class QuickChat extends Extension {
             sessionId = validateSessionId(sessionId);
         } catch (_) {
             sessionId = GLib.uuid_string_random();
-            this._settings.set_string('session-id', sessionId);
+            this._setSessionId(sessionId);
         }
 
         return {
@@ -1307,7 +1229,7 @@ export default class QuickChat extends Extension {
             effectiveMode,
             capabilities: caps,
             bridgeHandshake: defaultBridgeDiag,
-            mountMode: this._dateIntegration?.mountMode || 'datemenu',
+            mountMode: this._dateIntegration?.mountMode || 'unmounted',
             lastConnectionError: '无',
             sessionSaveStatus: state.sessionUnsavedWarning || '正常',
             sessionSaveWarning: state.sessionUnsavedWarning || '',
@@ -1556,6 +1478,7 @@ export default class QuickChat extends Extension {
         clearEditState = false,
         recordHistoryText = '',
         restoreDraftOnEarlyError = '',
+        capsule = null,
     } = {}) {
         if (!promptText || !this._panel || !this._chatController || this._isBusyOrMutating()) return;
         this._sessionMutationLock = true;
@@ -1624,6 +1547,7 @@ export default class QuickChat extends Extension {
             const messageId = `msg_${GLib.uuid_string_random()}`;
             const shownUserText = displayUserText || promptText;
 
+            capsule?.trackTurn(turnId);
             this._chatController.activeTurnState = {
                 turnId,
                 userMessageId: effectiveUserMessageId,
@@ -1717,7 +1641,7 @@ export default class QuickChat extends Extension {
             }
             if (
                 this._isSessionUnlockedAndAlive(lifeGen) &&
-                generation === this._chatController.clientGeneration &&
+                generation === this._chatController?.clientGeneration &&
                 this._chatController.activeTurnState?.turnId === turnId &&
                 result?.disposition === 'handled'
             ) {
@@ -1725,6 +1649,8 @@ export default class QuickChat extends Extension {
                 this._setBusy(false);
                 this._panel.setStatusIndicator('ready', this._idleStatus || '随问');
             }
+            return this._isSessionUnlockedAndAlive(lifeGen) &&
+                this._chatController?.activeTurnState?.turnId === turnId;
         } catch (error) {
             if (
                 !this._isSessionUnlockedAndAlive(lifeGen) ||
@@ -2517,7 +2443,7 @@ export default class QuickChat extends Extension {
         if (menu && !menu.isOpen) {
             menu.open(true);
         }
-        this._setTab('ai', true, true);
+        this._showChat();
 
         if (resolved.action === 'switch_session_and_focus' && resolved.sessionId) {
             await this._restoreSessionById(resolved.sessionId);
@@ -2672,8 +2598,12 @@ export default class QuickChat extends Extension {
     async _flushBeforeSessionTransition(actionLabel = '切换会话') {
         const client = this._chatController?.client;
         if (!client) return true;
+        const lifeGen = this._lifecycleGeneration;
+        const isCurrent = () => this._isSessionUnlockedAndAlive(lifeGen) &&
+            this._chatController?.client === client;
         try {
             const result = await client.request('flush_session');
+            if (!isCurrent()) return false;
             if (result?.ok && !result?.hasUnsavedChanges) return true;
             const reason = result?.error || '仍有未持久化的消息';
             this._panel?.setStatusIndicator('error', `⚠️ ${actionLabel}已暂停：历史未保存（${reason}）。请先重试保存或导出。`);
@@ -2683,6 +2613,7 @@ export default class QuickChat extends Extension {
             });
             return false;
         } catch (err) {
+            if (!isCurrent()) return false;
             this._panel?.setStatusIndicator('error', `⚠️ ${actionLabel}已暂停：无法确认历史已保存（${err?.message || err}）`);
             return false;
         }
@@ -2719,7 +2650,7 @@ export default class QuickChat extends Extension {
             this._rememberPreviousNonEmptySessionId(currentId);
             this._resetTransientComposerState(validTarget);
             this._chatController.stopClient();
-            this._settings.set_string('session-id', validTarget);
+            this._setSessionId(validTarget);
             this._panel?.setStatusIndicator('busy', '正在恢复会话…');
             this._scheduleIdle(() => {
                 if (this._isSessionUnlockedAndAlive(lifeGen) &&
@@ -2794,7 +2725,7 @@ export default class QuickChat extends Extension {
 
             const nextSessionId = GLib.uuid_string_random();
             this._resetTransientComposerState(nextSessionId);
-            this._settings.set_string('session-id', nextSessionId);
+            this._setSessionId(nextSessionId);
             this._panel?.setStatusIndicator('busy', '正在建立新会话…');
             this._scheduleIdle(() => {
                 if (this._isSessionUnlockedAndAlive(lifeGen) &&
@@ -2853,12 +2784,18 @@ export default class QuickChat extends Extension {
     }
 
     async _newSession() {
-        if (!this._chatController || this._isBusyOrMutating()) return;
+        if (!this._isSessionUnlockedAndAlive() || !this._chatController || this._isBusyOrMutating()) return;
         this._sessionMutationLock = true;
-        this._sessionSwitchInFlight = true;
+        const switchToken = {};
+        this._sessionSwitchInFlight = switchToken;
         let switchScheduled = false;
         this._attachments?.invalidatePendingReads();
         const lifeGen = this._lifecycleGeneration;
+        const controller = this._chatController;
+        const generation = controller.clientGeneration;
+        const finishSwitch = () => {
+            if (this._sessionSwitchInFlight === switchToken) this._sessionSwitchInFlight = false;
+        };
         const currentId = this._getSettingString('session-id', '');
 
         try {
@@ -2872,7 +2809,8 @@ export default class QuickChat extends Extension {
             }
             if (
                 !this._isSessionUnlockedAndAlive(lifeGen) ||
-                this._chatController.busy ||
+                this._sessionSwitchInFlight !== switchToken ||
+                controller.clientGeneration !== generation || controller.busy ||
                 this._getSettingString('session-id', '') !== currentId
             ) {
                 return;
@@ -2880,29 +2818,33 @@ export default class QuickChat extends Extension {
 
             const nextSessionId = GLib.uuid_string_random();
             this._rememberPreviousNonEmptySessionId(currentId);
+            this._setSessionId(nextSessionId);
             this._chatController.stopClient();
+            this._capsule?.reset();
             this._resetTransientComposerState(nextSessionId);
-            this._settings.set_string('session-id', nextSessionId);
             // Do not synchronously destroy/rebuild the complete Shell actor
             // tree on a button click. renderInitialHistory() is the sole owner
             // of the new message tree once the fresh client is ready.
             this._panel?.setStatusIndicator('busy', '正在建立新会话…');
-            switchScheduled = Boolean(this._scheduleIdle(() => {
+            switchScheduled = Boolean(this._scheduleTimeout(0, () => {
                 if (!this._isSessionUnlockedAndAlive(lifeGen) ||
+                    this._sessionSwitchInFlight !== switchToken ||
                     this._getSettingString('session-id', '') !== nextSessionId) {
-                    this._sessionSwitchInFlight = false;
+                    finishSwitch();
                     return;
                 }
-                this._ensureClient().finally(() => {
-                    this._sessionSwitchInFlight = false;
-                });
+                Promise.resolve().then(() => this._ensureClient()).then(finishSwitch, finishSwitch);
                 if (this._dateIntegration?.menu?.isOpen) {
                     this._panel?.entry?.grab_key_focus();
                 }
             }));
+        } catch (err) {
+            if (this._isSessionUnlockedAndAlive(lifeGen)) {
+                this._panel?.setStatusIndicator('error', err?.message || String(err));
+            }
         } finally {
-            this._sessionMutationLock = false;
-            if (!switchScheduled) this._sessionSwitchInFlight = false;
+            if (this._lifecycleGeneration === lifeGen) this._sessionMutationLock = false;
+            if (!switchScheduled) finishSwitch();
         }
     }
 
@@ -2943,16 +2885,6 @@ export default class QuickChat extends Extension {
             this._themeSig1 = this._themeSig2 = 0;
             this._interfaceSettings = null;
         }
-
-        for (const sig of this._traySignals || []) {
-            try { Main.messageTray?.disconnect(sig); } catch (_) {}
-        }
-        this._traySignals = [];
-
-        for (const [src, sig] of this._sourceSignals?.entries?.() || []) {
-            try { src.disconnect(sig); } catch (_) {}
-        }
-        this._sourceSignals?.clear();
 
         this._live = null;
         this._editingTurnInfo = null;

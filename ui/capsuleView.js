@@ -1,16 +1,10 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Pango from 'gi://Pango';
-import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-/**
- * Independent command capsule with a brief GNOME-managed keyboard grab
- * while typing. It always releases that grab on Send, Esc, Hide and Dispose;
- * the answer waterfall is non-modal and never covers the full screen.
- * Streaming updates are bounded and coalesced to protect the Shell loop.
- */
+/** Bounded, non-modal chrome with ordinary focus inside the capsule. */
 export class CapsuleView {
     constructor({onSubmit, onExpand} = {}) {
         this._onSubmit = onSubmit;
@@ -19,10 +13,12 @@ export class CapsuleView {
         this.entry = null;
         this._responseLabel = null;
         this._responseScroll = null;
+        this._answerViewport = null;
+        this._answerMaxHeight = 260;
         this._status = null;
         this._buffer = '';
         this._flushId = 0;
-        this._modalGrab = null;
+        this._request = null;
         this._pending = false;
         this._disposed = false;
     }
@@ -32,7 +28,15 @@ export class CapsuleView {
         const root = new St.BoxLayout({
             orientation: Clutter.Orientation.VERTICAL,
             style_class: 'qc-capsule-root',
-            width: 590, reactive: true, visible: false,
+            width: 590, reactive: false, visible: false,
+        });
+        this.actor = root;
+        root.connect('destroy', () => {
+            this._cancelFlush();
+            this.actor = this.entry = this._responseLabel = this._responseScroll = null;
+            this._answerViewport = this._status = this._request = null;
+            this._pending = false;
+            this._buffer = '';
         });
         const head = new St.BoxLayout({
             orientation: Clutter.Orientation.HORIZONTAL,
@@ -52,17 +56,18 @@ export class CapsuleView {
             if (this._pending) return;
             const text = entry.get_text().trim();
             if (!text) return;
-            this.beginAnswer();
-            try {
-                const p = this._onSubmit?.(text);
-                p?.catch?.(err => this.fail(err?.message || String(err)));
-            } catch (err) {
-                this.fail(err?.message || String(err));
-            }
-        });
-        entry.connect('button-press-event', () => {
-            if (!this._modalGrab) this._acquireKeyboard();
-            return Clutter.EVENT_PROPAGATE;
+            const request = this.beginAnswer();
+            entry.set_text('');
+            Promise.resolve().then(() => {
+                if (this._request !== request) return;
+                return this._onSubmit?.(text);
+            }).then(streaming => {
+                if (!streaming && this._request === request) {
+                    this.fail('请求已结束，请展开查看详情');
+                }
+            }, err => {
+                if (this._request === request) this.fail(err?.message || String(err));
+            });
         });
         entry.clutter_text.connect('key-press-event', (_text, event) => {
             if (event.get_key_symbol() === Clutter.KEY_Escape) {
@@ -102,7 +107,7 @@ export class CapsuleView {
             style_class: 'qc-capsule-answer-scroll',
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
-            overlay_scrollbars: true, x_expand: true,
+            overlay_scrollbars: true, x_expand: true, height: 44,
         });
         const answer = new St.Label({
             text: '', x_expand: true,
@@ -111,7 +116,12 @@ export class CapsuleView {
         });
         answer.clutter_text.line_wrap = true;
         answer.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
-        scroll.set_child(answer);
+        // St.ScrollView requires StScrollable; the label belongs inside a box.
+        const content = new St.BoxLayout({
+            orientation: Clutter.Orientation.VERTICAL, x_expand: true,
+        });
+        content.add_child(answer);
+        scroll.set_child(content);
         response.add_child(scroll);
         root.add_child(response);
 
@@ -119,10 +129,10 @@ export class CapsuleView {
             affectsStruts: false,
             trackFullscreen: false,
         });
-        this.actor = root;
         this.entry = entry;
         this._responseLabel = answer;
         this._responseScroll = response;
+        this._answerViewport = scroll;
         this._status = status;
     }
 
@@ -134,27 +144,9 @@ export class CapsuleView {
         return Boolean(this.actor?.visible);
     }
 
-    _acquireKeyboard() {
-        if (!this.actor || this._modalGrab) return;
-        try {
-            this._modalGrab = Main.pushModal(this.actor, {actionMode: Shell.ActionMode.NORMAL});
-            this.entry?.grab_key_focus();
-        } catch (err) {
-            console.warn('[Quick Chat] Capsule keyboard grab unavailable: ' + err.message);
-            // A partially acquired stage grab must never survive a failed
-            // focus operation, or the desktop can become unresponsive.
-            this._releaseKeyboard();
-            this.actor?.hide();
-        }
-    }
-
-    _releaseKeyboard() {
-        const grab = this._modalGrab;
-        this._modalGrab = null;
-        if (grab) {
-            try { Main.popModal(grab); }
-            catch (err) { console.warn('[Quick Chat] Capsule modal release: ' + err.message); }
-        }
+    _clearOwnedFocus() {
+        const focus = global.stage.get_key_focus();
+        if (focus && this.actor?.contains(focus)) global.stage.set_key_focus(null);
     }
 
     show() {
@@ -163,15 +155,17 @@ export class CapsuleView {
         // Clamp to the active monitor; no full-stage reactive surfaces.
         const monitor = Main.layoutManager.primaryMonitor;
         if (monitor) {
-            const width = Math.max(320, Math.min(590, monitor.width - 48));
+            const width = Math.max(1, Math.min(590, monitor.width - 48));
             this.actor.set_width(width);
+            this._answerMaxHeight = Math.max(44, Math.min(260, Math.floor(monitor.height / 3)));
             this.actor.set_position(
                 Math.round(monitor.x + (monitor.width - width) / 2),
                 Math.round(monitor.y + Math.max(56, monitor.height * 0.10))
             );
         }
+        this._flush();
         this.actor.show();
-        this._acquireKeyboard();
+        this.entry?.grab_key_focus();
     }
 
     toggle() {
@@ -180,27 +174,58 @@ export class CapsuleView {
     }
 
     hide() {
-        this._releaseKeyboard();
-        this.actor?.hide();
+        if (!this.actor) return;
+        this._clearOwnedFocus();
+        this.actor.hide();
+        this._cancelFlush();
     }
 
     beginAnswer() {
-        // The response can stream while the user works in other applications.
-        this._releaseKeyboard();
+        this._clearOwnedFocus();
+        const request = this._request = {turnId: null};
         this._pending = true;
         this._buffer = '';
-        if (this._responseLabel) this._responseLabel.text = '';
+        this._flush();
         if (this._status) this._status.text = '正在思考 · 实时回答';
-        if (this._responseScroll) this._responseScroll.show();
+        this._responseScroll?.show();
+        return request;
+    }
+
+    trackTurn(turnId) {
+        if (this._request) this._request.turnId = turnId;
+    }
+
+    _cancelFlush() {
+        if (!this._flushId) return;
+        GLib.source_remove(this._flushId);
+        this._flushId = 0;
+    }
+
+    reset() {
+        this.hide();
+        this._request = null;
+        this._pending = false;
+        this._buffer = '';
+        this.entry?.set_text('');
+        this._flush();
+        if (this._status) this._status.text = '';
+        this._responseScroll?.hide();
     }
 
     _flush() {
         if (!this._responseLabel || this._disposed) return;
-        this._responseLabel.text = this._buffer.slice(-10000);
+        const text = this._buffer.slice(-10000);
+        if (this._responseLabel.text !== text) this._responseLabel.text = text;
+        // Measure the single wrapped label at the capsule width. Layout is
+        // invalidated only when the bounded viewport changes height.
+        const width = Math.max(1, this.actor.width - 64);
+        const [, naturalHeight] = this._responseLabel.get_preferred_height(width);
+        const height = Math.min(this._answerMaxHeight, Math.max(44, Math.ceil(naturalHeight) + 12));
+        if (this._answerViewport.height !== height) this._answerViewport.set_height(height);
     }
 
     _scheduleFlush() {
-        if (this._flushId || this._disposed) return;
+        if (this._flushId || this._disposed || !this.visible) return;
         this._flushId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 90, () => {
             this._flushId = 0;
             this._flush();
@@ -209,7 +234,7 @@ export class CapsuleView {
     }
 
     recordEvent(event) {
-        if (!this._pending || !event) return;
+        if (!this._pending || !event?.turnId || this._request?.turnId !== event.turnId) return;
         if (event.type === 'message_update') {
             const delta = event.assistantMessageEvent;
             if (delta?.type === 'text_delta' && delta.delta) {
@@ -222,8 +247,10 @@ export class CapsuleView {
         }
         if (event.type === 'turn_settled' || event.type === 'agent_settled' ||
             (event.type === 'agent_end' && event.willRetry === undefined)) {
+            this._request = null;
             this._pending = false;
-            this._flush();
+            this._cancelFlush();
+            if (this.visible) this._flush();
             if (this._status) {
                 this._status.text = event.status === 'completed' ? '已完成 · Esc 收起'
                     : event.status === 'cancelled' ? '已停止'
@@ -231,12 +258,14 @@ export class CapsuleView {
             }
             if (!this._buffer && (event.errorMessage || event.message?.errorMessage)) {
                 this._buffer = String(event.errorMessage || event.message.errorMessage).slice(0, 600);
-                this._flush();
+                if (this.visible) this._flush();
             }
         }
     }
 
     fail(error) {
+        this._request = null;
+        this._cancelFlush();
         this._pending = false;
         this._buffer = String(error || '请求失败').slice(0, 600);
         this._flush();
@@ -245,15 +274,9 @@ export class CapsuleView {
     }
 
     dispose() {
-        this._releaseKeyboard();
+        this.reset();
         this._disposed = true;
-        if (this._flushId) {
-            try { GLib.source_remove(this._flushId); } catch (_) {}
-            this._flushId = 0;
-        }
-        try { this.actor?.destroy(); } catch (_) {}
-        this.actor = this.entry = this._responseLabel = this._responseScroll = this._status = null;
-        this._buffer = '';
-        this._pending = false;
+        // layoutManager drops chrome tracking when this actor is destroyed.
+        this.actor?.destroy();
     }
 }

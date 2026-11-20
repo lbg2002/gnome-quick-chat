@@ -2,7 +2,7 @@
 
 # ✦ Quick Chat · 随问 (`gnome-quick-chat`)
 
-**专为 Ubuntu 26.04 / GNOME Shell 50 打造的系统通知栏原生 AI 随问与轻量 Agent 助手**
+**专为 Ubuntu 26.04 / GNOME Shell 50 打造的顶栏 AI 随问与轻量 Agent 助手**
 
 [![GNOME Shell](https://img.shields.io/badge/GNOME_Shell-50-4a86cf?logo=gnome&logoColor=white)](https://www.gnome.org/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-26.04_LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
@@ -10,7 +10,7 @@
 [![Tests](https://img.shields.io/badge/Unit_&_State_Tests-Passed-success)](#8-模块化架构开发与测试)
 [![Interactive Demo](https://img.shields.io/badge/▶_在线交互式动画演示-1080p_60fps-f5a623)](https://lbg2002.github.io/gnome-quick-chat/)
 
-点击屏幕顶部中央的「时间 / 日期」（或按下全局快捷键 **`Super + Shift + Q`**），即可在通知栏左栏无缝切换 **「✦ 随问 | 通知」**，右侧原生日历与世界时钟保持原样。  
+点击顶栏 **「✦ 随问」** 或按 **`Super + Shift + Q`** 打开聊天。系统通知与日历仍从 GNOME 的日期菜单打开。
 纯原生 `GJS` / `St` / `Clutter` 构建，**零 WebView 内存开销**、**增量流式 Markdown 渲染不阻塞 GNOME Shell 主线程**，支持**面板内一键切换模型/思考强度**、**剪贴板随问 (`Super + Shift + Y`)**、**横向彩色小圆点轨迹**与**按命令/域名/文件范围隔离的分级工具审批**。
 
 <br/>
@@ -50,11 +50,11 @@
 
 * **⚡ 面向 GNOME Shell 进程级流畅性的增量流式渲染**
   * **冻结块增量 Markdown 引擎 (`ui/markdownRenderer.js`)**：流式输出时已完成段落与代码块固定不重建，仅原地刷新末尾活动块；长文多代码块回答零闪烁，流式中复制前序代码块的反馈状态不被打断。
-  * **脏标记按需刷新 + 隐藏态零重排**：区分 `dirty = {text, thinking, tools}` 与动态节流间隔；当通知栏关闭或处于「通知」标签时自动暂停 UI 排版，仅在 `✦ 随问` 标签上点亮状态圆点并在重新打开时一次性刷新。
+  * **脏标记按需刷新 + 隐藏态零重排**：区分 `dirty = {text, thinking, tools}` 与动态节流间隔；当随问面板关闭时自动暂停 UI 排版，仅在 `✦ 随问` 标签上点亮状态圆点并在重新打开时一次性刷新。
 * **⌨️ 随手即达的桌面级快捷体验**
-  * **全局唤醒 (`Super + Shift + Q`)**：在任意窗口一键呼出或收起通知栏随问面板并自动聚焦输入框。
-  * **胶囊快捷入口 (`Super + Shift + A`)**：独立的输入胶囊，按 Enter 后释放键盘抓取，使用透明瀑布区域流式展示回答；Esc 收起，↗ 进入完整对话。快捷键可在“设置 → 界面与权限”修改。
-  * **通知栏双标签**：随问与 GNOME 原生通知位于左栏，右侧日历保持原来的位置；嵌入失败时仍可在设置中切换为独立顶栏按钮。
+  * **全局唤醒 (`Super + Shift + Q`)**：在任意窗口一键呼出或收起独立的随问面板并自动聚焦输入框。
+  * **实验性胶囊 (`Super + Shift + A`)**：默认关闭。可在“设置 → 界面与权限”开启。Enter 发送，回答在半透明区域逐步显示。Esc 或关闭按钮收起，↗ 进入完整对话。
+  * **独立顶栏入口**：通过顶栏的「随问」打开聊天。GNOME 日期菜单继续管理系统通知和日历。
   * **会话切换保护**：新对话不再同时触发 GSettings 重连和重复消息树清理；后台只进行单次新会话连接。
   * **剪贴板 / 选中内容随问 (`Super + Shift + Y` 或面板 `📋` 按钮)**：自动读取系统剪贴板或主选区内容填入提问框，报错分析、翻译润色一步到位。
   * **面板内一键切换模型与思考强度**：点击随问状态栏模型名称（`▾`），无需打开设置窗口即可就地切换引擎、模型与思考强度（`默认 / 快 / 标准 / 深入`）。
@@ -260,7 +260,7 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 
 | 操作 / 快捷键 | 功能说明 |
 | :--- | :--- |
-| **`Super + Shift + Q`** | **全局呼出 / 收起**通知栏「✦ 随问」面板并自动聚焦输入框 |
+| **`Super + Shift + Q`** | **全局呼出 / 收起**独立「✦ 随问」面板并自动聚焦输入框 |
 | **`Super + Shift + Y` / `📎`** | **上下文附件引用**：将剪贴板长文本、终端报错日志或 Nautilus 复制的文件作为独立附件芯片挂载（不截断、不覆盖草稿，支持预览/切换仅路径/移除与云端发送范围提示） |
 | **输入 `/` 或按 `Ctrl + /`** | **快捷命令面板**：快速填入 `/explain`、`/translate`、`/polish`、`/summarize`、`/review`、`/error`、`/academic` 及自定义模板（默认仅填入输入框，不自动发送） |
 | **点击状态栏模型名 (`▾`)** | 展开面板内**快速切换栏**（支持搜索过滤、常用收藏及切换引擎/思考强度） |
