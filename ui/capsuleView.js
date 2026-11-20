@@ -141,7 +141,10 @@ export class CapsuleView {
             this.entry?.grab_key_focus();
         } catch (err) {
             console.warn('[Quick Chat] Capsule keyboard grab unavailable: ' + err.message);
-            this._modalGrab = null;
+            // A partially acquired stage grab must never survive a failed
+            // focus operation, or the desktop can become unresponsive.
+            this._releaseKeyboard();
+            this.actor?.hide();
         }
     }
 
