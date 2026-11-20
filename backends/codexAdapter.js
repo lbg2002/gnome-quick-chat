@@ -4,6 +4,7 @@
 
 import Gio from 'gi://Gio';
 import {BaseBackendAdapter} from './baseAdapter.js';
+import {resolveDesktopAssistantPrompt} from '../core/dshModelCatalog.js';
 import {
     augmentPromptWithDesktopContext,
     buildCodexArgs,
@@ -86,6 +87,7 @@ export class CodexAdapter extends BaseBackendAdapter {
             isFirstTurn: !remoteId,
             mode: effectiveMode,
             workspace,
+            assistantInstructions: resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
         });
         const effectiveCliPrompt = (!remoteId && historyBeforePrompt.length > 0)
             ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptWithDesktopEnv)
