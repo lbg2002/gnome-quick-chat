@@ -1,12 +1,16 @@
 # AGENTS.md — Quick Chat（随问）开发与复审指南
 
-> **2026-11-19 最新变更，版本 0.3.1：** 此前“只保留三后端”的指令已被用户新需求替代。**当前四后端为 ZCode、Codex、DeepSeek Harness (dsh) 和 OpenAI 兼容 API**；不得恢复 Pi。权限采用「只读 / 智能 / 完全权限」：ZCode 智能需真实 Bridge 审批；Codex exec 与 DSH headless 无可用的随问内审批回传时，智能必须安全降级为只读；绝不可将全文关键词判断当作系统权限边界。修复 ZCode --help 不完整引起的误判、GitHub Releases HTTP 415、用户级更新同目录写入；新增 DSH headless JSONL 适配。具体见 [README](README.md) 和 tests/dshAndPermissionModes.test.js。此处下面的早期三后端描述只保留作历史审计记录，**不再代表当前架构**。尚缺真实 ZCode/Codex/DSH 和 GNOME 50 Wayland 端到端人工验收，不能因自动化 CI 通过即声称实机通过。
+> **当前有效开发基线：v0.3.2 / 2026-11-20。优先于下方历史任务与旧版本说明。** 四个后端为 **ZCode、Codex、DeepSeek Harness（DSH）、OpenAI API**，不得恢复 Pi。保持 GNOME 50 原生 GJS/Clutter、轻量界面，无额外数据库或 Electron。
+>
+> **本轮用户报告已实证：** DSH Headless 可以启动，但在 GNOME 环境里失败时仅显示“error”；还需要桌面控制专用提示词、可选 DSH 模型，以及真实主机 Bash 权限而非一直只读。对应补丁已写入 `protocol.js`、`core/dshModelCatalog.js`、`backends/dshAdapter.js`、`core/backendDetect.js`、`core/backendRegistry.js`、`prefs.js`、`extension.js`、`tests/dshAndPermissionModes.test.js`。详细验收见 README 的 DSH 部分和 [专项报告](docs/reviews/2026-11-20-dsh-desktop-integration.md)。
+>
+> **权限边界不可变：** DSH 只读=`read-only`，完全权限=`danger-full-access`（本机 Bash，仍受 GNOME/用户权限约束）；智能默认只读，仅用户显式开启实验 Auto Review 且安装官方 DSH 插件后使用 `auto`（模型审核可能误判，无实时弹窗）。Codex `exec` 无审批回传，智能必须保持只读；ZCode 智能使用已验证的 Bridge 审批。不能通过 `--no-sandbox`、提权、自然语言关键词推断的方式绕过权限。桌面程序启动需有用户明确授权，删除、改写配置和系统服务操作不得静默提权。
+>
+> **模型/配置行为：** DSH Headless 没有完整 models-list API；从官方内置 `deepseek-flash` / `deepseek-v4-pro` 与 `dsh --profile headless --dump-config` 的已选模型组成建议列表（不是保证可用的在线模型）。用户选择模型与桌面 persona 使用私有临时 `--patch`，不修改 DSH 全局 profile 或凭据；ZCode/Codex 首轮注入桌面指引。故障显示 Headless `final.reason.error.code/message`，不得再吞掉具体错误。
+>
+> **验证要求：** 优先从最新 `main` 核对代码、Node 与无头 GJS 测试、GitHub Actions DEB+ZIP 产物。它们不能证明真实 Ubuntu 26.04 GNOME 50/Wayland、真实 Chrome、真实 CLI API Key/沙箱/权限已通过。每个未做的实机步骤应明确记为 blocked。发行前确保 `metadata.json` / `package.json` 版本一致，提交完整回归证据，保留会话和本机配置。
 
-
-> **2026-11-19 QA-01–QA-11 已进入实现与验收阶段。** 先读 [原始缺陷清单](docs/reviews/2026-11-19-runtime-audit.md)，再读 [最新实施与验收状态](docs/reviews/2026-11-19-implementation-status.md)。P0 原生 Gio.Cancellable / 控制器全链路连接修复、P1 会话保存/删除/上下文预算/按需探测/安装回滚等已提交并进入 CI 检查。**不要把历史任务的勾选、模拟 CLI 或无头 GJS 通过解释成 GNOME 50 / 真实 ZCode、Codex 已验收。** 尚未实机验证的 QA-05 UI、QA-07–11 保持 blocked/partial；以后每轮从最新 HEAD 校验源码与 CI，再确认实机环境。只保留 ZCode、Codex、OpenAI 三后端，不引入 Pi，也不擅自修改外部 CLI 配置或用户历史。
-
-
-> 当前执行基线：main @ e4e27f53b29803a1bbdfd9c95555c8323b33e1c9（2026-11-15 UTC）。2026-11-16 复审。优先执行本页新增的 R1–R12，不要重新执行下方已经完成的 A–F 大重构。发现最新源码已修复时，补回归验证并说明依据。只保留 ZCode、Codex、OpenAI 三后端；Pi 只允许历史迁移。保持原生 GJS/St/Clutter、中文紧凑界面和彩色轨迹，不新增数据库、Electron、WebView 或常驻服务。
+## 历史审计任务（仅供参考，不覆盖上述当前基线）
 
 ## 最新复审：R 系列任务（待实施）
 
