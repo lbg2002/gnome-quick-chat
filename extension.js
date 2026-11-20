@@ -917,8 +917,14 @@ export default class QuickChat extends Extension {
             }
         };
 
-        watch('panel-width', () => this._panel?.applyDimensions(() => this._dateIntegration?.nudgeLayout()));
-        watch('panel-height', () => this._panel?.applyDimensions(() => this._dateIntegration?.nudgeLayout()));
+        watch('panel-width', () => this._panel?.applyDimensions(
+            () => this._dateIntegration?.nudgeLayout(),
+            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu-safe'}
+        ));
+        watch('panel-height', () => this._panel?.applyDimensions(
+            () => this._dateIntegration?.nudgeLayout(),
+            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu-safe'}
+        ));
         watch('render-markdown', () => this._panel?.rerenderAllMessages());
         watch('toggle-shortcut', () => this._registerGlobalKeybindings());
         watch('clipboard-shortcut', () => this._registerGlobalKeybindings());
