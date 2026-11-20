@@ -119,6 +119,10 @@ export class CapsuleView {
         this._status = status;
     }
 
+    get isPending() {
+        return this._pending;
+    }
+
     get visible() {
         return Boolean(this.actor?.visible);
     }
