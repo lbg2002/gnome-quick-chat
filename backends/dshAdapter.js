@@ -17,6 +17,7 @@ import {
     buildDshProfileOverlay,
     cleanDshModelId,
     extractDshPiAiProviders,
+    normalizeDshProviderId,
     resolveDesktopAssistantPrompt,
 } from '../core/dshModelCatalog.js';
 import {validateCliPromptLength} from '../runtime/cliProcessRunner.js';
@@ -85,7 +86,7 @@ export class DshAdapter extends BaseBackendAdapter {
             validateCliPromptLength(cliPrompt, {viaArgv: false});
             const persona = resolveDesktopAssistantPrompt(this._config?.assistantInstructions);
             const model = String(this._config?.model || '').trim();
-            const provider = String(this._config?.provider || '').trim();
+            const provider = normalizeDshProviderId(this._config?.provider);
             // DSH Web providers are profile-scoped. Bridge only the
             // selected route for this headless turn, without altering ~/.dsh.
             let piAiPatch = '';
