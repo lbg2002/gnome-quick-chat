@@ -95,7 +95,7 @@ export function extractDshPiAiProviders(profileText) {
         }
         if (indent === routeIndent && scalar) {
             const id = cleanDshModelId(yamlScalarValue(scalar[1]));
-            route = id ? {id, name: id + '（DSH 自定义配置）', models: []} : null;
+            route = id ? {id: 'llm-pi-ai:' + id, name: id + '（DSH 自定义配置）', models: []} : null;
             if (route) providers.push(route);
             modelsIndent = -1;
             continue;
