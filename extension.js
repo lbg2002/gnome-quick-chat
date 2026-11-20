@@ -102,6 +102,7 @@ export default class QuickChat extends Extension {
         this._idleStatus = '随问';
         this._tab = 'ai';
         this._capsule = null;
+        this._sessionSwitchInFlight = false;
 
         this._attachments = new AttachmentManager();
         this._notifGate = new BackgroundNotificationGate();
@@ -1335,7 +1336,7 @@ export default class QuickChat extends Extension {
     }
 
     _isBusyOrMutating() {
-        return Boolean(this._chatController?.busy || this._sessionMutationLock);
+        return Boolean(this._chatController?.busy || this._sessionMutationLock || this._sessionSwitchInFlight);
     }
 
     _retryForAssistantCard(assistantCard) {
@@ -2854,6 +2855,8 @@ export default class QuickChat extends Extension {
     async _newSession() {
         if (!this._chatController || this._isBusyOrMutating()) return;
         this._sessionMutationLock = true;
+        this._sessionSwitchInFlight = true;
+        let switchScheduled = false;
         this._attachments?.invalidatePendingReads();
         const lifeGen = this._lifecycleGeneration;
         const currentId = this._getSettingString('session-id', '');
@@ -2884,16 +2887,22 @@ export default class QuickChat extends Extension {
             // tree on a button click. renderInitialHistory() is the sole owner
             // of the new message tree once the fresh client is ready.
             this._panel?.setStatusIndicator('busy', '正在建立新会话…');
-            this._scheduleIdle(() => {
+            switchScheduled = Boolean(this._scheduleIdle(() => {
                 if (!this._isSessionUnlockedAndAlive(lifeGen) ||
-                    this._getSettingString('session-id', '') !== nextSessionId) return;
-                this._ensureClient();
+                    this._getSettingString('session-id', '') !== nextSessionId) {
+                    this._sessionSwitchInFlight = false;
+                    return;
+                }
+                this._ensureClient().finally(() => {
+                    this._sessionSwitchInFlight = false;
+                });
                 if (this._dateIntegration?.menu?.isOpen) {
                     this._panel?.entry?.grab_key_focus();
                 }
-            });
+            }));
         } finally {
             this._sessionMutationLock = false;
+            if (!switchScheduled) this._sessionSwitchInFlight = false;
         }
     }
 
@@ -2902,6 +2911,7 @@ export default class QuickChat extends Extension {
         this._lifecycleGeneration = 0;
         this._enabled = false;
         this._sessionMutationLock = false;
+        this._sessionSwitchInFlight = false;
 
         this._unregisterGlobalKeybindings();
         this._capsule?.dispose();
