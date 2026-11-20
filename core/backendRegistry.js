@@ -3,6 +3,7 @@
 // Zero GNOME/GJS imports so Node.js unit tests validate real production logic directly.
 
 import {makeModelEntryKey, recordRecentModelKey} from './modelCatalogCache.js';
+import {normalizeDshProviderId} from './dshModelCatalog.js';
 
 export const REGISTERED_BACKENDS = Object.freeze(['zcode', 'codex', 'dsh', 'openai']);
 
@@ -316,7 +317,7 @@ export class BackendRegistry {
             return {
                 backend: 'dsh',
                 executablePath: readString(this._settings, 'dsh-path', '').trim(),
-                provider: readString(this._settings, 'dsh-provider', '').trim(),
+                provider: normalizeDshProviderId(readString(this._settings, 'dsh-provider', '')),
                 model: readString(this._settings, 'dsh-model', '').trim(),
                 reasoningEffort: 'default',
                 autoReview: readBoolean(this._settings, 'dsh-auto-review', false),
@@ -394,7 +395,7 @@ export class BackendRegistry {
                 }
             } else if (clean === 'dsh') {
                 if ('executablePath' in patch) writeString(this._settings, 'dsh-path', patch.executablePath);
-                if ('provider' in patch) writeString(this._settings, 'dsh-provider', patch.provider);
+                if ('provider' in patch) writeString(this._settings, 'dsh-provider', normalizeDshProviderId(patch.provider));
                 if ('model' in patch) writeString(this._settings, 'dsh-model', patch.model);
                 if ('workspace' in patch) writeString(this._settings, 'dsh-workspace', patch.workspace);
                 if ('mode' in patch && VALID_MODES.has(patch.mode)) {
@@ -455,6 +456,9 @@ export class BackendRegistry {
                 (effectiveBackend === 'openai' ? profile.model : ''),
             systemPrompt: readString(this._settings, 'system-prompt', '').trim(),
             reasoningEffort: profile.reasoningEffort || 'default',
+            assistantInstructions: readString(this._settings, 'desktop-assistant-prompt', '').trim(),
+            dshAutoReview: effectiveBackend === 'dsh'
+                ? readBoolean(this._settings, 'dsh-auto-review', false) : false,
             mode: profile.mode || 'readonly',
             workspace: profile.workspace || '',
             configGeneration: this._generation,
