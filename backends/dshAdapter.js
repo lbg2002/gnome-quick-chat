@@ -10,7 +10,14 @@ import {
     normalizeEffectiveAgentMode,
     preparePromptWithinBudget,
 } from '../protocol.js';
-import {removeFileQuietly} from '../core/paths.js';
+import GLib from 'gi://GLib';
+import {getPrivateRuntimeDir, removeFileQuietly, writePrivateFileAsync} from '../core/paths.js';
+import {loadLocalBackendCatalogAsync} from '../core/backendDetect.js';
+import {
+    buildDshProfileOverlay,
+    cleanDshModelId,
+    resolveDesktopAssistantPrompt,
+} from '../core/dshModelCatalog.js';
 import {validateCliPromptLength} from '../runtime/cliProcessRunner.js';
 import {spawnManagedCliTurn, terminateTurnProcess} from '../runtime/processManager.js';
 
@@ -22,12 +29,15 @@ export class DshAdapter extends BaseBackendAdapter {
         this._getSessionContextConfig = getSessionContextConfig || (() => ({}));
     }
 
-    async getModels() {
-        // dsh's model is selected by the user's profile, not by an invented CLI --model flag.
+    async getModels({forceRefresh = false, cancellable = null} = {}) {
+        const catalog = await loadLocalBackendCatalogAsync('dsh', {
+            dshPath: this._runtime?.executable || this._config?.dshPath || '',
+            forceRefresh, cancellable,
+        });
         return {
             backend: 'dsh',
-            catalog: {backendLabel: 'DeepSeek Harness', providers: []},
-            models: [],
+            catalog,
+            models: catalog.providers.flatMap(p => p.models),
         };
     }
 
@@ -50,7 +60,10 @@ export class DshAdapter extends BaseBackendAdapter {
             deferTempCleanupUntilProcessExit: true,
         });
 
-        const modeInfo = normalizeEffectiveAgentMode('dsh', this._config?.mode || 'readonly');
+        const modeInfo = normalizeEffectiveAgentMode(
+            'dsh', this._config?.mode || 'readonly',
+            {enableAutoReview: this._config?.dshAutoReview === true}
+        );
         const effectiveMode = modeInfo.effectiveMode;
         const ctxCfg = this._getSessionContextConfig();
         const historyBeforePrompt = this._store ? [...this._store.messages] : [];
@@ -69,10 +82,36 @@ export class DshAdapter extends BaseBackendAdapter {
         let rawArgv;
         try {
             validateCliPromptLength(cliPrompt, {viaArgv: false});
+            const persona = resolveDesktopAssistantPrompt(this._config?.assistantInstructions);
+            const model = String(this._config?.model || '').trim();
+            const provider = String(this._config?.provider || '').trim();
+            const profileOverlay = buildDshProfileOverlay({
+                provider: model ? (provider || 'deepseek-official') : '',
+                model, persona,
+            });
+            let overlayPath = '';
+            if (profileOverlay) {
+                overlayPath = GLib.build_filenamev([
+                    getPrivateRuntimeDir(),
+                    `dsh-overlay-${GLib.uuid_string_random()}.yml`,
+                ]);
+                await writePrivateFileAsync(overlayPath, new TextEncoder().encode(profileOverlay), turn.cancellable);
+                turn.tempFiles.push(overlayPath);
+            }
+            if (!this._turns.isCurrent(turn)) {
+                turn.tempFiles.splice(0).forEach(removeFileQuietly);
+                return {disposition: 'cancelled', turnId: turn.id};
+            }
             rawArgv = buildDshArgs({
-                ...this._config, executable: this._runtime.executable, mode: effectiveMode,
-            }, remoteId);
+                ...this._config,
+                executable: this._runtime.executable,
+                mode: effectiveMode,
+            }, remoteId, {overlayPath});
+            if (model && cleanDshModelId(model)) {
+                turn.modelId = model;
+            }
         } catch (err) {
+            turn.tempFiles.splice(0).forEach(removeFileQuietly);
             this._store?.clearRemoteSessionId('prep_failed');
             if (this._turns.isCurrent(turn)) {
                 this._turns.finalizeTurn(turn, {
