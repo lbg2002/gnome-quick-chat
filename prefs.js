@@ -426,14 +426,14 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const getActiveProvider = eff => registry.getBackendProfile(eff).provider || '';
         const setActiveProvider = (eff, val) => {
-            if (eff === 'zcode' || eff === 'codex') {
+            if (eff === 'zcode' || eff === 'codex' || eff === 'dsh') {
                 registry.updateBackendProfile(eff, {provider: val});
             }
         };
 
         const getActiveModel = eff => registry.getBackendProfile(eff).model || '';
         const setActiveModel = (eff, val, {recordRecent = false} = {}) => {
-            if (eff === 'zcode' || eff === 'codex' || eff === 'openai') {
+            if (eff === 'zcode' || eff === 'codex' || eff === 'dsh' || eff === 'openai') {
                 registry.updateBackendProfile(eff, {model: val}, {recordRecent});
             }
         };
@@ -1574,6 +1574,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const modeNameMap = {
                 zcode: 'ZCode CLI',
                 codex: 'Codex CLI',
+                dsh: 'DeepSeek Harness',
                 openai: '自定义 OpenAI API',
                 unconfigured: '未配置可用引擎',
             };
@@ -1596,7 +1597,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             currentCatalog = cached;
             if (!isOpenAI && !isUnconfigured && (!cached.fromCache || cached.stale) && !skipAsyncRefresh) {
                 const bgGen = ++catalogBgGen;
-                loadLocalBackendCatalogAsync(eff).then(loaded => {
+                loadLocalBackendCatalogAsync(eff, {
+                    dshPath: getStr('dsh-path', ''),
+                }).then(loaded => {
                     if (bgGen === catalogBgGen && getEffectiveBackend() === eff && loaded) {
                         currentCatalog = loaded;
                         rebuildProviderAndModelUi(statusNote, true);
@@ -1646,7 +1649,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     ? `自定义 API：已缓存 / 拉取 ${onlineOpenAIModels.length} 个可选模型。`
                     : '自定义 API：点击右上角「查询 / 刷新模型」可从 /v1/models 拉取在线模型列表。';
             } else {
-                catalogGroup.description = `${currentCatalog.backendLabel}：已只读扫描到 ${currentCatalog.providers.length} 个 Provider、${totalModels} 个预设模型。`;
+                catalogGroup.description = eff === 'dsh'
+                    ? `DSH：展示官方内置模型和配置档选择（${totalModels} 项）；不是远端完整 /models 清单。可填写其他已配置模型 ID。`
+                    : `${currentCatalog.backendLabel}：已只读扫描到 ${currentCatalog.providers.length} 个 Provider、${totalModels} 个预设模型。`;
             }
         };
 
@@ -1714,8 +1719,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     }
                 }
             }
-            if (eff === 'zcode' || eff === 'codex') {
-                registry.updateBackendProfile(eff, {provider: nextProv, model: val}, {recordRecent: Boolean(val)});
+            if (eff === 'zcode' || eff === 'codex' || eff === 'dsh') {
+                registry.updateBackendProfile(eff, {provider: nextProv || (val ? currentCatalog.defaultProviderId : ''), model: val}, {recordRecent: Boolean(val)});
             } else {
                 setActiveModel(eff, val, {recordRecent: Boolean(val)});
             }
@@ -1751,7 +1756,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
             invalidateBackendDetectionCaches();
             const eff = getEffectiveBackend();
-            currentCatalog = await loadLocalBackendCatalogAsync(eff, {forceRefresh: true});
+            currentCatalog = await loadLocalBackendCatalogAsync(eff, {
+                    forceRefresh: true, dshPath: getStr('dsh-path', ''), cancellable: reqCancellable,
+                });
 
             let targetBaseUrl = '';
             let targetApiKey = '';
