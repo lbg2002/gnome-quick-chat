@@ -345,7 +345,10 @@ export default class QuickChat extends Extension {
             this._connectNotificationSignals();
             this._registerGlobalKeybindings();
             this._panel.syncThemeStyle(this._interfaceSettings);
-            this._panel.applyDimensions(() => this._dateIntegration?.nudgeLayout());
+            this._panel.applyDimensions(
+                () => this._dateIntegration?.nudgeLayout(),
+                {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu-safe'}
+            );
             this._refreshAvailableBackendsAsync();
         } catch (err) {
             console.error('[Quick Chat] enable() failed, rolling back cleanly:', err);
