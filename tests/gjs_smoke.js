@@ -478,6 +478,13 @@ let mockHttpProc = null;
             "process.stdin.setEncoding('utf8');",
             "process.stdin.on('data', chunk => { prompt += chunk; });",
             "process.stdin.on('end', () => {",
+            "  const fs = require('node:fs');",
+            "  const args = process.argv.slice(2);",
+            "  const idx = args.indexOf('--patch');",
+            "  if (idx < 0 || !args[idx+1]) { console.log(JSON.stringify({type:'error',message:'missing overlay'})); process.exit(1); }",
+            "  const overlay = fs.readFileSync(args[idx+1], 'utf8');",
+            "  if (!overlay.includes('deepseek-v4-pro') || !overlay.includes('桌面助手请打开浏览器')) { console.log(JSON.stringify({type:'error',message:'overlay content missing'})); process.exit(1); }",
+            "  if (args[args.indexOf('--permission-mode') + 1] !== 'read-only') { process.exit(1); }",
             "  console.log(JSON.stringify({type:'session',sessionId:'session-gjs-dsh'}));",
             "  console.log(JSON.stringify({type:'text',text:'DSH 接收:' + prompt.trim()}));",
             "  console.log(JSON.stringify({type:'final',reason:{kind:'completed'},sessionId:'session-gjs-dsh',text:'DSH 完成:' + prompt.trim()}));",
@@ -495,7 +502,8 @@ let mockHttpProc = null;
             executable: fakeDshScript,
             pathEnv: GLib.getenv('PATH') || '/usr/local/bin:/usr/bin:/bin',
             setsidPath: null,
-        }, {mode:'readonly'});
+        }, {mode:'readonly',provider:'deepseek-official',model:'deepseek-v4-pro',
+            assistantInstructions:'桌面助手请打开浏览器'});
         await dshAdapter.sendMessage({
             promptText:'测试 DSH',
             turnMeta:{turnId:'gjs_dsh_turn_1',messageId:'gjs_dsh_msg_1',userMessageId:'gjs_dsh_u_1'},
