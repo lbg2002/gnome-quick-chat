@@ -123,7 +123,7 @@ test('production avoids GNOME private layout mutations and visibility signal int
     assert.ok(!integration.includes('notify::visible'));
     assert.match(integration, /mountChatAsLeftColumn/);
     // Internal session-id settings changes must not schedule a redundant reconnect.
-    assert.match(extension, /keyName === 'session-id' && this\\._sessionMutationLock/);
+    assert.match(extension, /keyName === 'session-id' && this\._sessionMutationLock/);
     const newSession = extension.slice(extension.indexOf('async _newSession()'), extension.indexOf('disable() {', extension.indexOf('async _newSession()')));
     assert.ok(!newSession.includes('clearMessages()'));
     assert.match(newSession, /_scheduleIdle/);
