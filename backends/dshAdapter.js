@@ -12,10 +12,11 @@ import {
 } from '../protocol.js';
 import GLib from 'gi://GLib';
 import {getPrivateRuntimeDir, removeFileQuietly, writePrivateFileAsync} from '../core/paths.js';
-import {loadLocalBackendCatalogAsync} from '../core/backendDetect.js';
+import {loadLocalBackendCatalogAsync, readDshWebProfilePatchAsync} from '../core/backendDetect.js';
 import {
     buildDshProfileOverlay,
     cleanDshModelId,
+    extractDshPiAiProviders,
     resolveDesktopAssistantPrompt,
 } from '../core/dshModelCatalog.js';
 import {validateCliPromptLength} from '../runtime/cliProcessRunner.js';
@@ -85,9 +86,18 @@ export class DshAdapter extends BaseBackendAdapter {
             const persona = resolveDesktopAssistantPrompt(this._config?.assistantInstructions);
             const model = String(this._config?.model || '').trim();
             const provider = String(this._config?.provider || '').trim();
+            // DSH Web providers are profile-scoped. Bridge only the
+            // selected route for this headless turn, without altering ~/.dsh.
+            let piAiPatch = '';
+            if (model && provider && provider !== 'deepseek-official') {
+                const webPatch = await readDshWebProfilePatchAsync(turn.cancellable);
+                if (extractDshPiAiProviders(webPatch).some(p => p.id === provider)) {
+                    piAiPatch = webPatch;
+                }
+            }
             const profileOverlay = buildDshProfileOverlay({
                 provider: model ? (provider || 'deepseek-official') : '',
-                model, persona,
+                model, persona, piAiPatch,
             });
             let overlayPath = '';
             if (profileOverlay) {

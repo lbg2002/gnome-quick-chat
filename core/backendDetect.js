@@ -22,7 +22,10 @@ import {
     sanitizeProviderCatalogSecrets,
 } from './modelCatalogCache.js';
 import {readFileBytesBoundedAsync} from './paths.js';
-import {extractDshConfiguredModel, makeDshModelCatalog} from './dshModelCatalog.js';
+import {
+    extractDshConfiguredModel, makeDshModelCatalog,
+    extractDshPiAiPatch, extractDshPiAiProviders,
+} from './dshModelCatalog.js';
 import {
     buildProcessGroupKillArgv,
     isSafeProcessGroupId,
@@ -1286,6 +1289,21 @@ export function peekCachedBackendCatalog(effectiveBackend) {
  * Asynchronous Gio I/O loader for ZCode / Codex local model catalogs (Stage D4).
  * Strips all secret fields before caching in memory.
  */
+
+function dshProfilePatchPath(profile) {
+    const envHome = String(GLib.getenv('DSH_HOME') || '').trim();
+    const home = envHome.startsWith('~/')
+        ? GLib.build_filenamev([GLib.get_home_dir(), envHome.slice(2)])
+        : (envHome && GLib.path_is_absolute(envHome)
+            ? envHome : GLib.build_filenamev([GLib.get_home_dir(), '.dsh']));
+    return GLib.build_filenamev([home, 'profiles', profile, 'cordis.patch.yml']);
+}
+
+export async function readDshWebProfilePatchAsync(cancellable = null) {
+    const content = await readTextFileAsync(dshProfilePatchPath('web'), 256 * 1024, cancellable);
+    return extractDshPiAiPatch(content);
+}
+
 export async function loadLocalBackendCatalogAsync(effectiveBackend, {
     forceRefresh = false, dshPath = '', cancellable = null,
 } = {}) {
@@ -1311,12 +1329,20 @@ export async function loadLocalBackendCatalogAsync(effectiveBackend, {
             }
 
             if (effectiveBackend === 'dsh') {
+                const [webPatch, headlessPatch] = await Promise.all([
+                    readTextFileAsync(dshProfilePatchPath('web'), 256 * 1024, cancellable),
+                    readTextFileAsync(dshProfilePatchPath('headless'), 256 * 1024, cancellable),
+                ]);
+                const profileProviders = [
+                    ...extractDshPiAiProviders(headlessPatch),
+                    ...extractDshPiAiProviders(webPatch),
+                ];
                 const pathDirs = await buildSearchPathAsync(dshPath, {forceRefresh});
                 const env = createGioCliEnv(dshPath, pathDirs);
                 const executable = dshPath ? env.resolveCandidate(dshPath)
                     : findExecutableInDirs('dsh', pathDirs);
                 if (!executable || !env.isExecutable(executable)) {
-                    return makeDshModelCatalog();
+                    return makeDshModelCatalog({}, profileProviders);
                 }
                 // DSH headless deliberately exposes no "list models" command.
                 // Dump layered config without starting an Agent and retain only
@@ -1332,7 +1358,8 @@ export async function loadLocalBackendCatalogAsync(effectiveBackend, {
                 }
                 return sanitizeProviderCatalogSecrets(
                     makeDshModelCatalog(
-                        probe.ok ? extractDshConfiguredModel(probe.output) : {}
+                        probe.ok ? extractDshConfiguredModel(probe.output) : {},
+                        profileProviders
                     )
                 );
             }

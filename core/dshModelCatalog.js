@@ -50,7 +50,77 @@ export function extractDshConfiguredModel(configDump) {
     return last;
 }
 
-export function makeDshModelCatalog(configured = {}) {
+
+/**
+ * Read only the llm-pi-ai route block saved by the DSH Web profile. The
+ * headless profile does not automatically inherit the Web model settings.
+ */
+export function extractDshPiAiPatch(profileText) {
+    const lines = String(profileText || '').slice(0, 256 * 1024).split(/\r?\n/);
+    const start = lines.findIndex(line => /^-\s+id:\s*['"]?llm-pi-ai['"]?\s*(?:#.*)?$/.test(line));
+    if (start < 0) return '';
+    let end = start + 1;
+    while (end < lines.length && !/^-\s/.test(lines[end])) end++;
+    const row = lines.slice(start, end).join('\n').trimEnd();
+    return row.length <= 128 * 1024 ? row + '\n' : '';
+}
+
+/** Parse only route/model identifiers; never return URLs or credentials. */
+export function extractDshPiAiProviders(profileText) {
+    const patch = extractDshPiAiPatch(profileText);
+    if (!patch) return [];
+    const providers = [];
+    let configIndent = -1;
+    let providersIndent = -1;
+    let routeIndent = -1;
+    let route = null;
+    let modelsIndent = -1;
+    for (const line of patch.split(/\r?\n/).slice(1)) {
+        if (!line.trim() || /^\s*#/.test(line)) continue;
+        const indent = line.search(/\S/);
+        const scalar = /^\s*([^\s:#][^:]*):\s*(.*)$/.exec(line);
+        if (configIndent < 0) {
+            if (scalar && scalar[1].trim() === 'config') configIndent = indent;
+            continue;
+        }
+        if (indent <= configIndent) break;
+        if (providersIndent < 0) {
+            if (scalar && scalar[1].trim() === 'providers') providersIndent = indent;
+            continue;
+        }
+        if (indent <= providersIndent) break;
+        if (routeIndent < 0) {
+            if (!scalar) continue;
+            routeIndent = indent;
+        }
+        if (indent === routeIndent && scalar) {
+            const id = cleanDshModelId(yamlScalarValue(scalar[1]));
+            route = id ? {id, name: id + '（DSH 自定义配置）', models: []} : null;
+            if (route) providers.push(route);
+            modelsIndent = -1;
+            continue;
+        }
+        if (!route || indent <= routeIndent) continue;
+        if (scalar && scalar[1].trim() === 'models' && modelsIndent < 0) {
+            modelsIndent = indent;
+            continue;
+        }
+        if (modelsIndent >= 0) {
+            if (indent <= modelsIndent) {
+                modelsIndent = -1;
+                continue;
+            }
+            const modelMatch = /^\s*-\s+id:\s*(.+?)\s*$/.exec(line);
+            if (modelMatch) {
+                const model = cleanDshModelId(yamlScalarValue(modelMatch[1]));
+                if (model && !route.models.includes(model)) route.models.push(model);
+            }
+        }
+    }
+    return providers.slice(0, 64).map(p => ({...p, models: p.models.slice(0, 128)}));
+}
+
+export function makeDshModelCatalog(configured = {}, profileProviders = []) {
     const provider = cleanDshModelId(configured.provider);
     const model = cleanDshModelId(configured.model);
     const providers = [{
@@ -58,10 +128,26 @@ export function makeDshModelCatalog(configured = {}) {
         name: 'DeepSeek 官方（随 DSH 安装提供，实际可用取决于账号）',
         models: [...DSH_OFFICIAL_MODELS],
     }];
+    for (const item of profileProviders) {
+        const id = cleanDshModelId(item?.id);
+        if (!id) continue;
+        const existing = providers.find(p => p.id === id);
+        const target = existing || {id, name: id + '（DSH 自定义配置）', models: []};
+        if (!existing) providers.push(target);
+        for (const candidate of item.models || []) {
+            const clean = cleanDshModelId(candidate);
+            if (clean && !target.models.includes(clean)) target.models.push(clean);
+        }
+    }
     if (provider && model && provider !== 'deepseek-official') {
         // A parsed profile route is a configured choice, not an invented listing
         // of all the provider's models.
-        providers.push({id: provider, name: `${provider}（当前配置）`, models: [model]});
+        const existing = providers.find(p => p.id === provider);
+        if (existing) {
+            if (!existing.models.includes(model)) existing.models.push(model);
+        } else {
+            providers.push({id: provider, name: provider + '（当前配置）', models: [model]});
+        }
     } else if (model && !providers[0].models.includes(model)) {
         providers[0].models.push(model);
     }
@@ -73,7 +159,7 @@ export function makeDshModelCatalog(configured = {}) {
     };
 }
 
-export function buildDshProfileOverlay({provider = '', model = '', persona = ''} = {}) {
+export function buildDshProfileOverlay({provider = '', model = '', persona = '', piAiPatch = ''} = {}) {
     const cleanProvider = cleanDshModelId(provider);
     const cleanModel = cleanDshModelId(model);
     if (Boolean(provider) !== Boolean(model) || (provider && (!cleanProvider || !cleanModel))) {
@@ -82,6 +168,8 @@ export function buildDshProfileOverlay({provider = '', model = '', persona = ''}
     const cleanPersona = String(persona || '').trim();
     if (cleanPersona.length > 8192) throw new Error('桌面助手提示词最多 8192 字');
     const patches = [];
+    const routePatch = extractDshPiAiPatch(piAiPatch);
+    if (routePatch) patches.push(routePatch.trimEnd());
     if (cleanProvider && cleanModel) {
         patches.push(`- id: agent-default-model\n  config:\n    provider: ${JSON.stringify(cleanProvider)}\n    model: ${JSON.stringify(cleanModel)}`);
     }
