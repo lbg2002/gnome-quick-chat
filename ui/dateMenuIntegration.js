@@ -50,6 +50,13 @@ export class DateMenuIntegration {
     mount(wrapperActor, shouldForceHideNativeFn, {fallbackMode = 'auto'} = {}) {
         this.lastMountError = '';
 
+        // GNOME 50 safety: never reparent private native DateMenu actors.
+        // In particular, replacing _messageList can cause Shell layout loops
+        // that freeze the entire Wayland desktop. Keep the original calendar
+        // and notifications untouched and render Quick Chat in its own popup.
+        return this._mountFallbackPanelButton(wrapperActor);
+
+        /* Disabled legacy reparenting logic (kept for historical reference):
         if (fallbackMode === 'panel-button') {
             return this._mountFallbackPanelButton(wrapperActor);
         }
@@ -81,6 +88,7 @@ export class DateMenuIntegration {
             return this._mountFallbackPanelButton(wrapperActor);
         }
         return false;
+        */
     }
 
     _mountFallbackPanelButton(wrapperActor) {
