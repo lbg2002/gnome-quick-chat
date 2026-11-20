@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
     mountChatAsDateMenuSibling,
     unmountChatDateMenuSibling,
+    mountChatAsLeftColumn,
+    restoreChatLeftColumn,
 } from '../core/safeDateMenuMount.js';
 
 function actor(label, {rejectInsert = false} = {}) {
@@ -71,14 +73,58 @@ test('safe DateMenu rejects invalid or already parented actors without touching 
     assert.equal(wrapper.get_parent(), null);
 });
 
-test('production integration has no native _messageList ownership or layout-manager changes', async () => {
+test('safe left column keeps right calendar untouched and restores original native layout', () => {
+    const hbox = actor('native horizontal DateMenu');
+    const native = actor('native notification list');
+    const right = actor('native calendar');
+    hbox.add_child(native);
+    hbox.add_child(right);
+    const wrapper = actor('Quick Chat left');
+    const tabs = actor('tabs');
+    const body = actor('AI body');
+    wrapper.add_child(tabs);
+    wrapper.add_child(body);
+    native.visible = true;
+    const mounted = mountChatAsLeftColumn({_messageList: native}, wrapper);
+    assert.equal(mounted.ok, true);
+    assert.deepEqual(hbox.get_children(), [wrapper, right]);
+    assert.deepEqual(wrapper.get_children(), [tabs, body, native]);
+    assert.equal(right.get_parent(), hbox);
+    native.visible = false;
+    assert.equal(restoreChatLeftColumn(mounted, wrapper), true);
+    assert.deepEqual(hbox.get_children(), [native, right]);
+    assert.equal(native.visible, true);
+});
+
+test('left column mount rollback leaves native notifications in DateMenu after insert failure', () => {
+    const hbox = actor('hbox', {rejectInsert: true});
+    const native = actor('native');
+    const calendar = actor('calendar');
+    hbox.add_child(native);
+    hbox.add_child(calendar);
+    const wrapper = actor('AI');
+    wrapper.add_child(actor('tabs'));
+    const result = mountChatAsLeftColumn({_messageList: native}, wrapper);
+    assert.equal(result.ok, false);
+    assert.equal(native.get_parent(), hbox);
+    assert.equal(calendar.get_parent(), hbox);
+    assert.equal(wrapper.get_parent(), null);
+});
+
+test('production avoids GNOME private layout mutations and visibility signal interception', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
     const {fileURLToPath} = await import('node:url');
-    const file = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../ui/dateMenuIntegration.js');
-    const source = fs.readFileSync(file,'utf8');
-    assert.ok(!source.includes('executeDateMenuMountTransaction('));
-    assert.ok(!source.includes('._messageList'));
-    assert.ok(!source.includes('layout_changed('));
-    assert.match(source, /mountChatAsDateMenuSibling/);
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const integration = fs.readFileSync(path.join(root,'ui/dateMenuIntegration.js'),'utf8');
+    const extension = fs.readFileSync(path.join(root,'extension.js'),'utf8');
+    assert.ok(!integration.includes('executeDateMenuMountTransaction('));
+    assert.ok(!integration.includes('layout_changed('));
+    assert.ok(!integration.includes('notify::visible'));
+    assert.match(integration, /mountChatAsLeftColumn/);
+    // Internal session-id settings changes must not schedule a redundant reconnect.
+    assert.match(extension, /keyName === 'session-id' && this\\._sessionMutationLock/);
+    const newSession = extension.slice(extension.indexOf('async _newSession()'), extension.indexOf('disable() {', extension.indexOf('async _newSession()')));
+    assert.ok(!newSession.includes('clearMessages()'));
+    assert.match(newSession, /_scheduleIdle/);
 });
