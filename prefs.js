@@ -86,7 +86,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const s = this.getSettings();
         migrateGSettingsIfNeeded(s);
         const registry = new BackendRegistry(s);
-        window.set_default_size(650, 720);
+        window.set_default_size(820, 760);
 
         const hasKey = k => Boolean(s.settings_schema?.has_key?.(k));
         const getStr = (k, fb = '') => (hasKey(k) ? s.get_string(k) : fb);
@@ -692,7 +692,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const tabs = ['ai', 'notifications'];
         const tabRow = new Adw.ComboRow({
             title: '默认打开标签',
-            subtitle: '进入桌面时通知栏左侧默认展示的页面',
+            subtitle: '系统通知仍由 GNOME 原生日期菜单负责',
             model: Gtk.StringList.new(['✦ 随问 (AI 助手)', '通知 (系统消息)']),
         });
         tabRow.selected = Math.max(0, tabs.indexOf(getStr('default-tab', 'ai')));
@@ -704,7 +704,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const fallbackModes = ['auto', 'datemenu', 'panel-button'];
         const fallbackRow = new Adw.ComboRow({
             title: '面板挂载方式与兼容回退',
-            subtitle: '默认优先嵌入原生日期菜单；若未来桌面环境定制导致嵌入失败可自动回退为顶栏独立按钮',
+            subtitle: '为避免 GNOME Shell 冻结，当前版本只使用独立顶栏按钮',
             model: Gtk.StringList.new([
                 '自动嵌入日期菜单（失败时回退独立顶栏按钮）',
                 '仅嵌入原生日期菜单（不显示独立按钮）',
@@ -713,15 +713,14 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         if (hasKey('panel-fallback-mode')) {
             fallbackRow.selected = Math.max(0, fallbackModes.indexOf(getStr('panel-fallback-mode', 'auto')));
-            fallbackRow.connect('notify::selected', () => {
-                setStr('panel-fallback-mode', fallbackModes[fallbackRow.selected] || 'auto');
-            });
+            fallbackRow.selected = 2;
+            fallbackRow.sensitive = false;
             uiGroup.add(fallbackRow);
         }
 
         const widthRow = new Adw.SpinRow({
             title: '面板宽度 (px)',
-            subtitle: '同时固定随问与通知栏宽度，防止切换标签时日历抖动',
+            subtitle: '设置随问独立弹窗的宽度',
             adjustment: new Gtk.Adjustment({
                 lower: 340,
                 upper: 680,
@@ -1332,8 +1331,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             diagModelRow.subtitle = `模型: ${snap.activeModel} · Provider: ${snap.activeProvider}`;
             diagCapsRow.subtitle = snap.capabilitySummary;
             diagBridgeRow.subtitle = snap.bridgeHandshake;
-            diagConnRow.subtitle = `挂载: ${snap.mountMode} · 连接错误: ${snap.lastConnectionError}`
-                + (snap.endpointSecurityNote ? ` · ⚠️ ${snap.endpointSecurityNote}` : '');
+            diagConnRow.subtitle = `挂载: ${snap.mountMode} · 连接: ${String(snap.lastConnectionError || '').slice(0, 100)}`
+                + (snap.endpointSecurityNote ? ' · 安全提示见脱敏诊断' : '');
             diagSessionRow.subtitle = `${snap.sessionSaveStatus}（更新于 ${snap.updatedAt}）`;
         };
 
@@ -1698,8 +1697,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             for (const p of currentCatalog.providers) {
                 const hostHint = p.baseUrl ? ` · ${p.baseUrl.replace(/^https?:\/\//, '').replace(/\/v1.*$/, '')}` : '';
                 const label = p.name && p.name !== p.id
-                    ? `${p.name} (${p.id}${hostHint})`
-                    : `${p.id}${hostHint}`;
+                    ? `${p.name} (${p.id})`
+                    : p.id;
                 provLabels.push(label);
                 providerValues.push(p.id);
             }
@@ -1730,7 +1729,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     : '自定义 API：点击右上角「查询 / 刷新模型」可从 /v1/models 拉取在线模型列表。';
             } else {
                 catalogGroup.description = eff === 'dsh'
-                    ? `DSH：展示官方内置模型和配置档选择（${totalModels} 项）；不是远端完整 /models 清单。可填写其他已配置模型 ID。`
+                    ? `DSH：已发现 ${totalModels} 个官方或本地配置模型。`
                     : `${currentCatalog.backendLabel}：已只读扫描到 ${currentCatalog.providers.length} 个 Provider、${totalModels} 个预设模型。`;
             }
         };
