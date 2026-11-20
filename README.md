@@ -173,8 +173,24 @@ bash scripts/diagnose-local.sh
 | 档位 | ZCode | Codex 非交互执行 | DSH Headless |
 | --- | --- | --- | --- |
 | **只读** | Plan：可读取文件，禁止修改 | `read-only` 沙箱 | `read-only` 权限预设 |
-| **智能** | Build：允许低风险操作，修改/删除需由 ZCode 权限桥接确认 | **安全保持只读**（缺少随问内审批回传） | **安全保持只读**（Headless 无实时审批） |
+| **智能** | Build：允许低风险操作，修改/删除需由 ZCode 权限桥接确认 | **安全保持只读**（缺少随问内审批回传） | 默认只读；开启官方实验性 Auto Review 后模型审查工具动作（有误判风险） |
 | **完全权限** | YOLO：不再逐次审批 | `danger-full-access`，无审批 | `danger-full-access`，无审批 |
+
+**DSH 真实桌面执行与实验性智能审核**
+
+DSH headless 的 `read-only` 是文件沙箱，启动程序可能被限制；`danger-full-access` 允许调用真实主机 Bash，但仍受当前普通用户权限、Wayland 会话、D-Bus 和 Chrome 自身沙箱规则约束。随问不会向 Chrome 注入 `--no-sandbox`，也不会自动提权。推荐先使用 **只读** 验证问答和文件读取，再在可信任务中显式切换到 **完全权限** 测试 `gio open`、`gtk-launch` 和系统设置查询。
+
+若希望低风险工具调用经模型审核后自动运行，而高风险操作被拒绝，可在自己的 DSH profile 中安装官方实验性插件：
+
+```bash
+dsh plugin --profile headless add @deepseek-ai/dsh-experimental-auto-review
+```
+
+然后在随问的「界面与权限」中开启 **DSH 智能操作 · 实验性 Auto Review** 并选择 **智能**。此模式会使用 `--permission-mode auto --approval-policy never`。请注意：模型审核可能误判高风险；Headless 无法向随问弹出实时审批，遇到被拒绝的动作需要人工重新授权或切换模式；随问绝不自动执行重新尝试或放宽权限。不开启此实验功能时，DSH 智能档安全降级为只读。
+
+**模型列表与提示词：** DSH Headless 未提供可直接调用的完整模型列表命令。随问现在展示 DSH 官方内置的 `deepseek-flash`、`deepseek-v4-pro`，并通过异步 `dsh --profile headless --dump-config` 解析当前配置档选中的 Provider/Model；其他 Provider 可手动填写正确 ID。模型选择使用随问临时私有 YAML `--patch`，不会改写你的 `$DSH_HOME`、凭据、插件或 profile。设置中还增加了可以编辑、恢复默认的**多行桌面助手提示词**：ZCode/Codex 在新会话提示中使用，DSH 原生覆盖 `system-prompt.personaPrefix`；所有后端的真实权限仍由其 CLI 严格控制。
+
+**DSH 报错排查：** 新版随问不再只显示 `DSH 未正常完成本次任务：error`，而是读取官方 `final.reason.error.code/message` 并结合 CLI stderr 展示失败原因。纯问答失败时优先核查 Headless API Key 是否可见；只有读文件受限时才考虑只读沙箱权限；Chrome 打开失败时先区分已运行浏览器接管、图形会话不可用和 Shell 沙箱错误。
 
 **注意**：智能档不是凭自然语言关键词自动放权；删除与修改均需要可验证的后端审批通道，否则退回只读。这意味着 Codex/DSH 的智能档不能自动帮你写文件；要安全支持可审批写操作，后续需对接 Codex App Server / DSH ACP 等具有真实审批响应通道的协议。完全权限会有较大安全风险，请仅对信任任务手动启用。
 
