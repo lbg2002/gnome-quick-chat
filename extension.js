@@ -347,7 +347,7 @@ export default class QuickChat extends Extension {
             this._panel.syncThemeStyle(this._interfaceSettings);
             this._panel.applyDimensions(
                 () => this._dateIntegration?.nudgeLayout(),
-                {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu-safe'}
+                {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu'}
             );
             this._refreshAvailableBackendsAsync();
         } catch (err) {
@@ -919,11 +919,11 @@ export default class QuickChat extends Extension {
 
         watch('panel-width', () => this._panel?.applyDimensions(
             () => this._dateIntegration?.nudgeLayout(),
-            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu-safe'}
+            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu'}
         ));
         watch('panel-height', () => this._panel?.applyDimensions(
             () => this._dateIntegration?.nudgeLayout(),
-            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu-safe'}
+            {embeddedInDateMenu: this._dateIntegration?.mountMode === 'datemenu'}
         ));
         watch('render-markdown', () => this._panel?.rerenderAllMessages());
         watch('toggle-shortcut', () => this._registerGlobalKeybindings());
@@ -971,6 +971,10 @@ export default class QuickChat extends Extension {
 
         const onBackendConfigChanged = keyName => {
             if (!this._enabled) return;
+            // Internal session transitions explicitly stop and restart the client.
+            // Scheduling a *second* reconnect from changed::session-id used to
+            // tear down the new client while its history was being rendered.
+            if (keyName === 'session-id' && this._sessionMutationLock) return;
             this._registry?.bumpGeneration();
             if (cacheInvalidateKeys.has(keyName)) {
                 invalidateBackendDetectionCaches();
@@ -2671,8 +2675,13 @@ export default class QuickChat extends Extension {
             this._resetTransientComposerState(validTarget);
             this._chatController.stopClient();
             this._settings.set_string('session-id', validTarget);
-            this._ensureClient();
-            this._panel?.entry?.grab_key_focus();
+            this._panel?.setStatusIndicator('busy', '正在恢复会话…');
+            this._scheduleIdle(() => {
+                if (this._isSessionUnlockedAndAlive(lifeGen) &&
+                    this._getSettingString('session-id', '') === validTarget) {
+                    this._ensureClient();
+                }
+            });
         } finally {
             this._sessionMutationLock = false;
         }
@@ -2741,9 +2750,13 @@ export default class QuickChat extends Extension {
             const nextSessionId = GLib.uuid_string_random();
             this._resetTransientComposerState(nextSessionId);
             this._settings.set_string('session-id', nextSessionId);
-            this._panel?.clearMessages();
-            this._ensureClient();
-            this._panel?.entry?.grab_key_focus();
+            this._panel?.setStatusIndicator('busy', '正在建立新会话…');
+            this._scheduleIdle(() => {
+                if (this._isSessionUnlockedAndAlive(lifeGen) &&
+                    this._getSettingString('session-id', '') === nextSessionId) {
+                    this._ensureClient();
+                }
+            });
         } finally {
             this._sessionMutationLock = false;
         }
@@ -2823,9 +2836,18 @@ export default class QuickChat extends Extension {
             this._chatController.stopClient();
             this._resetTransientComposerState(nextSessionId);
             this._settings.set_string('session-id', nextSessionId);
-            this._panel?.clearMessages();
-            this._ensureClient();
-            this._panel?.entry?.grab_key_focus();
+            // Do not synchronously destroy/rebuild the complete Shell actor
+            // tree on a button click. renderInitialHistory() is the sole owner
+            // of the new message tree once the fresh client is ready.
+            this._panel?.setStatusIndicator('busy', '正在建立新会话…');
+            this._scheduleIdle(() => {
+                if (!this._isSessionUnlockedAndAlive(lifeGen) ||
+                    this._getSettingString('session-id', '') !== nextSessionId) return;
+                this._ensureClient();
+                if (this._dateIntegration?.menu?.isOpen) {
+                    this._panel?.entry?.grab_key_focus();
+                }
+            });
         } finally {
             this._sessionMutationLock = false;
         }
