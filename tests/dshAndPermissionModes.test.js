@@ -10,6 +10,7 @@ import {resolveBackendSelection, matchesDshHeadlessHelp} from '../core/configMig
 import {BackendRegistry, MemorySettingsStore} from '../core/backendRegistry.js';
 import {
     buildDshProfileOverlay, extractDshConfiguredModel, makeDshModelCatalog,
+    extractDshPiAiProviders, extractDshPiAiPatch,
     resolveDesktopAssistantPrompt, DEFAULT_DESKTOP_ASSISTANT_PROMPT,
 } from '../core/dshModelCatalog.js';
 
@@ -162,4 +163,37 @@ test('DSH: config is selected explicitly and isolated from Codex/ZCode profiles'
     assert.equal(settings.get_string('dsh-workspace'),'/tmp');
     assert.equal(registry.buildRuntimeConfig('dsh').dshPath,'/usr/bin/dsh');
     assert.equal(registry.buildRuntimeConfig('dsh').model,'deepseek-v4-pro');
+});
+
+test('DSH: web profile custom model catalog is secret-free and headless patch is scoped', () => {
+    const yaml = [
+        '- id: llm-pi-ai',
+        '  config:',
+        '    providers:',
+        '      personal-api:',
+        '        api: openai-completions',
+        '        baseURL: https://gateway.private.example/v1',
+        '        apiKeyEnv: PRIVATE_SECRET',
+        '        models:',
+        '          - id: alpha-1',
+        '          - id: beta-2',
+        '- id: system-prompt',
+        '  config:',
+        '    personaPrefix: web-only',
+    ].join('\\n');
+    const providers = extractDshPiAiProviders(yaml);
+    assert.deepEqual(providers.map(p => ({id:p.id,models:p.models})), [
+        {id:'llm-pi-ai:personal-api',models:['alpha-1','beta-2']},
+    ]);
+    const catalog = makeDshModelCatalog({}, providers);
+    assert.ok(catalog.providers.some(p => p.id === 'llm-pi-ai:personal-api'));
+    assert.ok(!JSON.stringify(catalog).includes('PRIVATE_SECRET'));
+    assert.ok(!JSON.stringify(catalog).includes('gateway.private'));
+    assert.ok(!extractDshPiAiPatch(yaml).includes('web-only'));
+    const overlay = buildDshProfileOverlay({
+        provider:'llm-pi-ai:personal-api', model:'alpha-1', piAiPatch:yaml,
+    });
+    assert.ok(overlay.includes('provider: "llm-pi-ai:personal-api"'));
+    assert.ok(overlay.includes('baseURL: https://gateway.private.example/v1'));
+    assert.ok(!overlay.includes('web-only'));
 });
