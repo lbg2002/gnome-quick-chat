@@ -135,7 +135,9 @@ export class ModelPickerController {
                 }
                 return;
             }
-            await loadLocalBackendCatalogAsync(effectiveBackend, {forceRefresh});
+            await loadLocalBackendCatalogAsync(effectiveBackend, {
+                forceRefresh, dshPath: this._getString('dsh-path', ''),
+            });
         };
 
         runRefresh()
