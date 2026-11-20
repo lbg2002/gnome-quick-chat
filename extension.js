@@ -325,6 +325,9 @@ export default class QuickChat extends Extension {
                 if (!this._enabled || this._lifecycleGeneration !== lifeGen) return;
                 // Never expose transcript, pending attachments, or approved session scopes across lock screen / greeter.
                 if (Main.sessionMode.isLocked || Main.sessionMode.isGreeter) {
+                    // Release any capsule keyboard grab and hide private
+                    // streaming output before GNOME changes session mode.
+                    this._capsule?.hide();
                     this._notifGate?.onLockScreenEntered?.();
                     if (this._modelPicker?.isOpen) this._modelPicker.toggle(false);
                     this._panel?.toggleSessionMenu(false);
