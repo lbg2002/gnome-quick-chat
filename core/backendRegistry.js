@@ -39,6 +39,11 @@ function writeString(settings, key, value) {
     return false;
 }
 
+function readBoolean(settings, key, fallback = false) {
+    return settings && hasSchemaKey(settings, key) && typeof settings.get_boolean === 'function'
+        ? Boolean(settings.get_boolean(key)) : fallback;
+}
+
 function readStrv(settings, key) {
     if (!settings || !hasSchemaKey(settings, key)) return [];
     if (typeof settings.get_strv === 'function') {
@@ -154,6 +159,23 @@ export class MemorySettingsStore {
         this.signalEvents.push(key);
         for (const cb of this._listeners.get(key) || []) cb(this, key);
         for (const cb of this._listeners.get('*') || []) cb(this, key);
+    }
+
+    get_boolean(key) {
+        if (this._staged?.has(key)) return Boolean(this._staged.get(key));
+        return Boolean(this._values.get(key));
+    }
+
+    set_boolean(key, val) {
+        const next = Boolean(val);
+        if (this._staged) {
+            this._staged.set(key, next);
+            return;
+        }
+        if (this.get_boolean(key) === next) return;
+        this._values.set(key, next);
+        this.signalEvents.push(key);
+        for (const cb of this._listeners.get(key) || []) cb(this, key);
     }
 
     get_strv(key) {
@@ -294,10 +316,10 @@ export class BackendRegistry {
             return {
                 backend: 'dsh',
                 executablePath: readString(this._settings, 'dsh-path', '').trim(),
-                provider: 'deepseek-harness',
-                // dsh uses its own profile default, not an invented --model option.
-                model: '',
+                provider: readString(this._settings, 'dsh-provider', '').trim(),
+                model: readString(this._settings, 'dsh-model', '').trim(),
                 reasoningEffort: 'default',
+                autoReview: readBoolean(this._settings, 'dsh-auto-review', false),
                 workspace: readString(this._settings, 'dsh-workspace', '').trim() || sharedWorkspace,
                 mode: VALID_MODES.has(modeRaw) ? modeRaw : 'readonly',
             };
@@ -318,6 +340,8 @@ export class BackendRegistry {
                     ? effortRaw
                     : sharedEffort,
                 systemPrompt: readString(this._settings, 'system-prompt', '').trim(),
+            assistantInstructions: readString(this._settings, 'desktop-assistant-prompt', '').trim(),
+            dshAutoReview: readBoolean(this._settings, 'dsh-auto-review', false),
                 workspace: sharedWorkspace,
                 mode: 'chat',
             };
@@ -370,6 +394,8 @@ export class BackendRegistry {
                 }
             } else if (clean === 'dsh') {
                 if ('executablePath' in patch) writeString(this._settings, 'dsh-path', patch.executablePath);
+                if ('provider' in patch) writeString(this._settings, 'dsh-provider', patch.provider);
+                if ('model' in patch) writeString(this._settings, 'dsh-model', patch.model);
                 if ('workspace' in patch) writeString(this._settings, 'dsh-workspace', patch.workspace);
                 if ('mode' in patch && VALID_MODES.has(patch.mode)) {
                     const safeMode = patch.mode === 'chat' ? 'readonly' : patch.mode;
