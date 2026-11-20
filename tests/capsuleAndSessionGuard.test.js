@@ -170,6 +170,22 @@ test('external session changes still reconnect, while lock, logout and relogin r
     next.ext.disable();
 });
 
+test('native panel destruction cancels a queued new session before touching stale actors', async () => {
+    const f = sessionFixture();
+    await f.ext._ensureClient();
+    await f.ext._newSession();
+    assert.equal(f.time.tasks.size, 1);
+    f.ext._onPanelDestroyed(42);
+    f.time.run();
+    await tick();
+    assert.equal(await f.ext._ensureClient(), null);
+    assert.equal(f.ext._sessionSwitchInFlight, false);
+    assert.equal(f.controller.client, null);
+    assert.equal(f.time.tasks.size, 0);
+    assert.deepEqual(f.render, ['initial']);
+    f.ext.disable();
+});
+
 function actorFixture() {
     const time = clock();
     const chrome = new Set();

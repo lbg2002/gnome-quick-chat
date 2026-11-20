@@ -29,6 +29,11 @@ export class DateMenuIntegration {
             Main.panel.addToStatusArea('quick-chat', button);
             this._button = button;
             this.mountMode = 'panel-button';
+            button.connect('destroy', () => {
+                if (this._button !== button) return;
+                this._button = null;
+                this.mountMode = 'unmounted';
+            });
             return true;
         } catch (err) {
             this.lastMountError = err?.message || String(err);

@@ -88,6 +88,7 @@ export default class QuickChat extends Extension {
         this._registeredKeybindings = new Set();
         this._menuSignal = 0;
         this._sessionSignal = 0;
+        this._panelDestroyed = false;
         this._themeSig1 = 0;
         this._themeSig2 = 0;
         this._interfaceSettings = null;
@@ -245,6 +246,7 @@ export default class QuickChat extends Extension {
             });
 
             const wrapper = this._panel.build();
+            wrapper.connect('destroy', () => this._onPanelDestroyed(lifeGen));
             if (!this._dateIntegration.mount(wrapper)) {
                 console.warn('[Quick Chat] Panel mount unavailable: ' + this._dateIntegration.lastMountError);
                 this.disable();
@@ -295,7 +297,6 @@ export default class QuickChat extends Extension {
             }
 
             this._sessionSignal = Main.sessionMode.connect('updated', () => this._onSessionModeUpdated(lifeGen));
-
             this._connectSettingsSignals();
             this._registerGlobalKeybindings();
             this._panel.syncThemeStyle(this._interfaceSettings);
@@ -305,6 +306,19 @@ export default class QuickChat extends Extension {
             console.error('[Quick Chat] enable() failed, rolling back cleanly:', err);
             this.disable();
         }
+    }
+
+    _onPanelDestroyed(lifeGen) {
+        if (!this._enabled || this._lifecycleGeneration !== lifeGen) return;
+        // Shell may destroy its actor tree before dispatching pending sources
+        // in the nested main loop used to finish shutdown.
+        this._panelDestroyed = true;
+        this._panel = null;
+        this._live = null;
+        this._sessionSwitchInFlight = false;
+        this._cancelScheduledWork();
+        this._chatController?.stopClient();
+        this._modelPicker?.dispose();
     }
 
     _onSessionModeUpdated(lifeGen) {
@@ -336,6 +350,7 @@ export default class QuickChat extends Extension {
     _isSessionUnlockedAndAlive(expectedLifeGen = this._lifecycleGeneration) {
         return Boolean(
             this._enabled &&
+            !this._panelDestroyed &&
             this._lifecycleGeneration === expectedLifeGen &&
             !Main.sessionMode.isLocked &&
             !Main.sessionMode.isGreeter
@@ -396,7 +411,7 @@ export default class QuickChat extends Extension {
     }
 
     _scheduleTimeout(ms, fn) {
-        if (!this._enabled || !this._timers) return 0;
+        if (!this._enabled || this._panelDestroyed || !this._timers) return 0;
         const lifeGen = this._lifecycleGeneration;
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
             this._timers?.delete(id);
@@ -410,7 +425,7 @@ export default class QuickChat extends Extension {
     }
 
     _scheduleIdle(fn) {
-        if (!this._enabled || !this._timers) return 0;
+        if (!this._enabled || this._panelDestroyed || !this._timers) return 0;
         const lifeGen = this._lifecycleGeneration;
         const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             this._timers?.delete(id);
@@ -421,6 +436,13 @@ export default class QuickChat extends Extension {
         });
         this._timers.add(id);
         return id;
+    }
+
+    _cancelScheduledWork() {
+        for (const timerId of this._timers || []) {
+            try { GLib.source_remove(timerId); } catch (_) {}
+        }
+        this._timers?.clear();
     }
 
     _clearTimer(id) {
@@ -2855,6 +2877,8 @@ export default class QuickChat extends Extension {
         this._sessionMutationLock = false;
         this._sessionSwitchInFlight = false;
 
+        this._cancelScheduledWork();
+
         this._unregisterGlobalKeybindings();
         this._capsule?.dispose();
         this._capsule = null;
@@ -2909,11 +2933,6 @@ export default class QuickChat extends Extension {
         this._panel = null;
         this._cardFactory = null;
         this._tracePanel = null;
-
-        for (const timerId of this._timers || []) {
-            try { GLib.source_remove(timerId); } catch (_) {}
-        }
-        this._timers?.clear();
 
         if (this._dateIntegration) {
             this._dateIntegration.unmount(wrapper);
