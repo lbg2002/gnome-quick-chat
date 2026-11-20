@@ -86,7 +86,38 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const s = this.getSettings();
         migrateGSettingsIfNeeded(s);
         const registry = new BackendRegistry(s);
-        window.set_default_size(820, 760);
+        window.set_default_size(800, 750);
+        window.add_css_class('qc-prefs');
+        // Preferences are a separate GTK process, not the Shell renderer.
+        // Scope typography to this window and use bounded two-line subtitles
+        // rather than allowing verbose descriptions to widen the entire view.
+        try {
+            const provider = new Gtk.CssProvider();
+            provider.load_from_data(new TextEncoder().encode(
+                'window.qc-prefs .subtitle { font-size: 0.82em; } ' +
+                'window.qc-prefs .title { font-size: 0.94em; } ' +
+                'window.qc-prefs row { min-width: 0; }'
+            ));
+            const display = Gdk.Display.get_default();
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            );
+            window.connect('close-request', () => {
+                Gtk.StyleContext.remove_provider_for_display(display, provider);
+                return false;
+            });
+        } catch (err) { console.warn('[Quick Chat] GTK typography fallback: ' + err.message); }
+
+        const tuneRows = widget => {
+            if (widget instanceof Adw.ActionRow) {
+                widget.set_subtitle_lines?.(2);
+                widget.set_title_lines?.(1);
+            }
+            for (let child = widget.get_first_child?.(); child; child = child.get_next_sibling?.()) {
+                tuneRows(child);
+            }
+        };
+        window.connect('map', () => tuneRows(window));
 
         const hasKey = k => Boolean(s.settings_schema?.has_key?.(k));
         const getStr = (k, fb = '') => (hasKey(k) ? s.get_string(k) : fb);
@@ -501,7 +532,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         uiPage.add(shortcutGroup);
 
         const toggleShortcutRow = new Adw.EntryRow({
-            title: '呼出 / 收起随问面板快捷键 (如 <Super><Shift>q)',
+            title: '主面板快捷键',
         });
         toggleShortcutRow.text = (s.get_strv('toggle-shortcut') || [])[0] || '';
         toggleShortcutRow.connect('notify::text', () => {
@@ -514,7 +545,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         shortcutGroup.add(toggleShortcutRow);
 
         const clipShortcutRow = new Adw.EntryRow({
-            title: '剪贴板 / 选中内容随问快捷键 (如 <Super><Shift>y)',
+            title: '剪贴板随问快捷键',
         });
         clipShortcutRow.text = (s.get_strv('clipboard-shortcut') || [])[0] || '';
         clipShortcutRow.connect('notify::text', () => {
@@ -525,6 +556,21 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             clipShortcutRow.text = '<Super><Shift>y';
         }));
         shortcutGroup.add(clipShortcutRow);
+
+        const capsuleShortcutRow = new Adw.EntryRow({
+            title: '胶囊快捷键',
+        });
+        if (hasKey('capsule-shortcut')) {
+            capsuleShortcutRow.text = (s.get_strv('capsule-shortcut') || [])[0] || '';
+            capsuleShortcutRow.connect('notify::text', () => {
+                const shortcut = capsuleShortcutRow.text.trim();
+                s.set_strv('capsule-shortcut', shortcut ? [shortcut] : []);
+            });
+            capsuleShortcutRow.add_suffix(makeResetButton('恢复默认 Super+Shift+A', () => {
+                capsuleShortcutRow.text = '<Super><Shift>a';
+            }));
+            shortcutGroup.add(capsuleShortcutRow);
+        }
 
         const notifyApprovalRow = new Adw.SwitchRow({
             title: '等待审批或提问时弹出桌面通知',
@@ -692,7 +738,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const tabs = ['ai', 'notifications'];
         const tabRow = new Adw.ComboRow({
             title: '默认打开标签',
-            subtitle: '安全嵌入模式会同时保留系统通知，不接管原生通知树',
+            subtitle: '默认左侧切换通知与随问，右侧保留日历',
             model: Gtk.StringList.new(['✦ 随问 (AI 助手)', '通知 (系统消息)']),
         });
         tabRow.selected = Math.max(0, tabs.indexOf(getStr('default-tab', 'ai')));
@@ -704,10 +750,10 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const fallbackModes = ['auto', 'datemenu', 'panel-button'];
         const fallbackRow = new Adw.ComboRow({
             title: '面板挂载方式与兼容回退',
-            subtitle: '默认安全嵌入日期与通知弹窗，保留 GNOME 原生通知；失败时可回退独立按钮',
+            subtitle: '日期菜单左侧双标签，右侧日历不变',
             model: Gtk.StringList.new([
-                '自动嵌入通知中心（失败时回退顶栏按钮）',
-                '仅嵌入原生通知中心（安全并列挂载）',
+                '自动（失败时使用独立顶栏按钮）',
+                '左侧标签嵌入日期菜单',
                 '独立顶栏按钮模式',
             ]),
         });
