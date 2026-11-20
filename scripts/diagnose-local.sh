@@ -14,6 +14,14 @@ else
   echo '未检测到 gnome-shell 命令'
 fi
 printf '桌面类型: %s\n' "${XDG_SESSION_TYPE:-unknown}"
+echo '桌面会话环境（仅显示是否存在，不显示敏感变量值）:'
+for name in DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR; do
+  if [[ -n "${!name:-}" ]]; then
+    printf '  %-28s 可用\n' "$name"
+  else
+    printf '  %-28s 未设置\n' "$name"
+  fi
+done
 if command -v gnome-extensions >/dev/null 2>&1; then
   echo '扩展状态:'
   gnome-extensions info "$uuid" 2>/dev/null |
