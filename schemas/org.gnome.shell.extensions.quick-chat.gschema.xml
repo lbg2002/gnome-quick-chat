@@ -33,6 +33,22 @@
       <default>'readonly'</default>
       <summary>DeepSeek Harness permission mode (readonly, smart, full)</summary>
     </key>
+    <key name="dsh-provider" type="s">
+      <default>''</default>
+      <summary>Optional DSH provider id override (empty uses headless profile)</summary>
+    </key>
+    <key name="dsh-model" type="s">
+      <default>''</default>
+      <summary>Optional DSH model id override (empty uses headless profile)</summary>
+    </key>
+    <key name="desktop-assistant-prompt" type="s">
+      <default>''</default>
+      <summary>Editable desktop agent persona for CLI backends (empty uses built-in)</summary>
+    </key>
+    <key name="dsh-auto-review" type="b">
+      <default>false</default>
+      <summary>Explicit opt-in to experimental headless auto reviewer when installed</summary>
+    </key>
     <key name="provider" type="s">
       <default>''</default>
       <summary>Model provider override</summary>
