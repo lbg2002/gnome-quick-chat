@@ -235,10 +235,16 @@ export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly',
     if (backend === 'openai') {
         return {effectiveMode: 'chat', downgradedFromChat: false, notice: ''};
     }
+    if (backend === 'dsh' && mode === 'smart' && cliCaps?.enableAutoReview === true) {
+        return {
+            effectiveMode: 'smart', downgradedFromChat: false,
+            notice: '已使用 DSH 实验性 Auto Review（独立模型审核工具调用）。低风险操作可能直接在主机执行，高风险会被拒绝而非弹窗；请确保已在 DSH headless profile 安装 auto-review 插件。',
+        };
+    }
     if (backend === 'dsh' && (mode === 'smart' || mode === 'chat')) {
         return {
             effectiveMode: 'readonly', downgradedFromChat: mode === 'chat',
-            notice: 'DeepSeek Harness headless 没有随问可用的交互审批回传通道，已安全降级为只读；不会自动执行修改或删除。',
+            notice: 'DSH Headless 无随问弹窗审批。未启用实验 Auto Review 时，智能模式保持只读；桌面操作需明确选择授权模式。',
         };
     }
     if (backend === 'codex' && mode === 'smart') {
@@ -617,13 +623,22 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
  * Prompt is read verbatim from stdin, cwd is supplied by Gio.SubprocessLauncher.
  * No interactive approval transport exists in headless, so smart must stay read-only.
  */
-export function buildDshArgs(config, resumeSessionId = '') {
+export function buildDshArgs(config, resumeSessionId = '', {overlayPath = ''} = {}) {
     const executable = String(config?.executable || 'dsh').trim() || 'dsh';
-    const {effectiveMode} = normalizeEffectiveAgentMode('dsh', config?.mode || 'readonly');
-    const preset = effectiveMode === 'full' ? 'danger-full-access' : 'read-only';
+    const {effectiveMode} = normalizeEffectiveAgentMode(
+        'dsh', config?.mode || 'readonly',
+        {enableAutoReview: config?.dshAutoReview === true}
+    );
+    const preset = effectiveMode === 'full' ? 'danger-full-access'
+        : effectiveMode === 'smart' ? 'auto' : 'read-only';
+    if (overlayPath && (!overlayPath.startsWith('/') ||
+        overlayPath.includes('\u0000') || overlayPath.includes('\n'))) {
+        throw new Error('DSH 临时配置补丁路径无效');
+    }
     return [
-        executable, '--profile', 'headless', '--json',
-        '--permission-mode', preset,
+        executable, '--profile', 'headless',
+        ...(overlayPath ? ['--patch', overlayPath] : []),
+        '--json', '--permission-mode', preset,
         '--approval-policy', 'never',
         ...(resumeSessionId ? ['--session-id', String(resumeSessionId)] : []),
         '-',
