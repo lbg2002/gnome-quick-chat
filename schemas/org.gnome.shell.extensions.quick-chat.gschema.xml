@@ -130,6 +130,10 @@
       <default>['&lt;Super&gt;&lt;Shift&gt;y']</default>
       <summary>Global shortcut to open Quick Chat with clipboard content</summary>
     </key>
+    <key name="capsule-shortcut" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;a']</default>
+      <summary>Non-modal floating Quick Chat capsule global shortcut</summary>
+    </key>
     <key name="notify-on-complete" type="b">
       <default>false</default>
       <summary>Send subtle desktop notification when background generation completes while panel is closed</summary>
