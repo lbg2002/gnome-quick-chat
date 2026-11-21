@@ -417,6 +417,7 @@ export function spawnManagedCliTurn({
     effectiveMode = 'readonly',
     timeouts = null,
     streamLimits = null,
+    conversationTransport = null,
 }) {
     const launcher = new Gio.SubprocessLauncher({
         flags:
@@ -492,7 +493,7 @@ export function spawnManagedCliTurn({
     }
 
     const stdinPipe = proc.get_stdin_pipe();
-    if (keepStdinOpenForApproval) {
+    if (keepStdinOpenForApproval || conversationTransport) {
         turn.stdin = stdinPipe;
     } else if (stdinPromptText && stdinPipe) {
         const promptBytes = Encoder.encode(stdinPromptText);
@@ -521,6 +522,7 @@ export function spawnManagedCliTurn({
         backend,
         requireBridgeHandshake,
         limits: streamLimits || {},
+        decodeRecord: conversationTransport ? frame => conversationTransport.read(frame) : null,
     });
     const pipeChunkBytes = Math.max(
         1024,
@@ -645,7 +647,8 @@ export function spawnManagedCliTurn({
             onBeforeSettle: finalStatus => {
                 // R3: Advance remoteSyncedRevision ONLY when the backend protocol confirms clean completion!
                 if (finalStatus === 'completed') {
-                    const confirmedRemoteId = turn.boundRemoteSessionId || store?.remoteSessionId || remoteId;
+                    const confirmedRemoteId = conversationTransport
+                        ? '' : (turn.boundRemoteSessionId || store?.remoteSessionId || remoteId);
                     if (confirmedRemoteId) {
                         store?.confirmRemoteTurnSynced?.(confirmedRemoteId, backend, persistCfg);
                     }
@@ -981,14 +984,31 @@ export function spawnManagedCliTurn({
                 }
                 readStdoutLoop();
             } catch (err) {
-                stdoutDone = true;
-                if (!turn.aborted && !turn.timedOut && !turn.error) {
-                    turn.error = err.message;
-                }
-                trySettleWhenComplete();
+                if (turn.aborted || turn.timedOut) return;
+                monitor.fatalError = err.message;
+                abortTurnForFatalMonitorError();
             }
         });
     };
+
+    if (conversationTransport) {
+        let chain = Promise.resolve();
+        const send = frame => {
+            const write = chain.then(() => {
+                if (!turns.isCurrent(turn) || !turn.stdin) throw new Error('后端交互已结束');
+                return writeAllBytesAsync(turn.stdin, Encoder.encode(JSON.stringify(frame) + '\n'),
+                    GLib.PRIORITY_DEFAULT, turn.cancellable);
+            });
+            chain = write.catch(err => {
+                if (!turns.isCurrent(turn) || turn.aborted || !turn.stdin) return;
+                turn.error = '后端交互管道写入失败：' + err.message;
+                terminateTurnProcess(turn, proc);
+            });
+            return write;
+        };
+        turn.applyInteractionResolution = event => applyCheckedStdoutResults([{normalized: event}]);
+        conversationTransport.start(send).catch(() => {});
+    }
 
     readStderrLoop();
     readStdoutLoop();

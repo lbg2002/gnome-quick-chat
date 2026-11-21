@@ -1734,14 +1734,27 @@ export default class QuickChat extends Extension {
         }
 
         const skipAll = action === 'skip';
+        const isDsh = this._getEffectiveBackend() === 'dsh';
+        if (isDsh && !skipAll && target.questions.some(question => {
+            const draft = target.questionDrafts?.[question.question];
+            return !question.multiSelect && draft?.selectedLabels?.length && draft.customText?.trim();
+        })) {
+            target.validationHint = '单选题请在选项与自定义回答中选一种';
+            this._tracePanel.syncQuestionFormState(card, target);
+            return;
+        }
         const modifiedInput = buildAskUserModifiedInput(
             target.rawInput || {questions: target.questions},
             target.questionDrafts || {},
             {skipAll}
         );
 
-        if (!skipAll && Object.keys(modifiedInput.answers || {}).length === 0) {
-            target.validationHint = '请至少选择一项或输入自定义回答；若无需指定可点击「交由 AI 判断」';
+        const hasAnswer = isDsh
+            ? Object.values(target.questionDrafts || {}).some(draft => draft.selectedLabels?.length || draft.customText?.trim())
+            : Object.keys(modifiedInput.answers || {}).length > 0;
+        if (!skipAll && !hasAnswer) {
+            target.validationHint = isDsh ? '请至少选择一项或输入自定义回答'
+                : '请至少选择一项或输入自定义回答；若无需指定可点击「交由 AI 判断」';
             this._tracePanel.syncQuestionFormState(card, target);
             return;
         }
@@ -1775,6 +1788,7 @@ export default class QuickChat extends Extension {
                 scopeKey: '',
                 toolName: target.toolName,
                 modifiedInput: skipAll ? undefined : modifiedInput,
+                ...(isDsh ? {questionDrafts: target.questionDrafts} : {}),
                 reason: skipAll ? '用户选择交由 AI 自行判断' : '用户在随问中提交了问题回答',
             });
             sent = Boolean(res?.sent);

@@ -171,7 +171,7 @@ export function makeDshModelCatalog(configured = {}, profileProviders = []) {
     };
 }
 
-export function buildDshProfileOverlay({provider = '', model = '', persona = '', piAiPatch = ''} = {}) {
+export function buildDshProfileOverlay({provider = '', model = '', persona = '', piAiPatch = '', mountCredentials = false, sdkMode = ''} = {}) {
     const cleanProvider = normalizeDshProviderId(provider);
     const cleanModel = cleanDshModelId(model);
     if (Boolean(provider) !== Boolean(model) || (provider && (!cleanProvider || !cleanModel))) {
@@ -180,6 +180,16 @@ export function buildDshProfileOverlay({provider = '', model = '', persona = '',
     const cleanPersona = String(persona || '').trim();
     if (cleanPersona.length > 8192) throw new Error('桌面助手提示词最多 8192 字');
     const patches = [];
+    if (mountCredentials) patches.push('- id: credentials\n  disabled: false');
+    if (sdkMode) {
+        const sandbox = sdkMode === 'full' ? 'danger-full-access' : 'read-only';
+        const policy = sdkMode === 'smart' ? 'ask' : 'never';
+        patches.push(
+            `- id: sandbox-policy\n  config:\n    mode: ${sandbox}`,
+            `- id: approval\n  config:\n    policy: ${policy}`,
+            `- id: permission\n  config:\n    defaultPreset: ${sandbox}\n    presets:\n      ${sandbox}:\n        sandbox: ${sandbox}\n        approval: ${policy}`
+        );
+    }
     const routePatch = extractDshPiAiPatch(piAiPatch);
     if (routePatch) patches.push(routePatch.trimEnd());
     if (cleanProvider && cleanModel) {

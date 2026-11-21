@@ -1028,8 +1028,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // reliable sandbox or Quick Chat interactive approval. Leave off by
         // default and require the user to install the experimental bundle.
         const dshReviewRow = new Adw.SwitchRow({
-            title: 'DSH 智能操作 · 实验性 Auto Review',
-            subtitle: '仅智能模式生效，模型审核可能误判',
+            title: '旧版 DSH · 实验性 Auto Review',
+            subtitle: '仅旧版 Headless 生效，模型审核可能误判',
             tooltip_text: '需要在 DSH Headless 配置档安装 auto-review 插件。高风险操作会被拒绝，不弹出确认。',
         });
         if (hasKey('dsh-auto-review')) {
