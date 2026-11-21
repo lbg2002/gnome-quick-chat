@@ -68,7 +68,6 @@ export class DshAdapter extends BaseBackendAdapter {
         const effectiveMode = modeInfo.effectiveMode;
         const {remoteId, prompt: cliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
             workspace, specialDirs, mode: effectiveMode,
-            allowResume: !sdk,
         });
 
         let rawArgv;
@@ -114,7 +113,8 @@ export class DshAdapter extends BaseBackendAdapter {
             }
             if (sdk) {
                 turn.dshSdk = new DshSdkTurn({
-                    sessionId: GLib.uuid_string_random(), workspace,
+                    sessionId: remoteId || GLib.uuid_string_random(), workspace,
+                    resume: Boolean(remoteId),
                     provider: provider || 'deepseek-official',
                     model,
                     prompt: cliPrompt, approvalRequests: effectiveMode === 'smart',
@@ -144,7 +144,6 @@ export class DshAdapter extends BaseBackendAdapter {
             throw err;
         }
 
-        if (sdk) this._store?.clearRemoteSessionId('dsh_sdk_portable_context');
         this._store?.appendMessage({
             id: turnMeta.userMessageId,
             turnId: turn.id,

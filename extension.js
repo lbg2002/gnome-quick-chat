@@ -11,6 +11,7 @@ import {BackendClient} from './backendClient.js';
 import {
     buildAskUserModifiedInput,
     detailedMessages,
+    isDefaultBrowserLaunchRequest,
     expandHomePath,
     formatAskUserAnswerSummary,
     getBackendCapabilities,
@@ -1444,6 +1445,11 @@ export default class QuickChat extends Extension {
         const hasEditAttachments = Boolean(!hasAttachments && editTarget?.hasPreservedAttachments);
         if (!rawDraft && !hasAttachments && !hasEditAttachments) return;
 
+        if (!hasAttachments && !editTarget && isDefaultBrowserLaunchRequest(rawDraft)) {
+            await this._launchDefaultBrowser(rawDraft);
+            return;
+        }
+
         const effectiveBackend = this._getEffectiveBackend();
         const attachmentSnapshot = this._attachments
             ? this._attachments.createSnapshot(rawDraft)
@@ -1484,6 +1490,43 @@ export default class QuickChat extends Extension {
             recordHistoryText: rawDraft,
             restoreDraftOnEarlyError: rawDraft,
         });
+    }
+
+    async _launchDefaultBrowser(draft) {
+        if (this._browserLaunch || !this._isSessionUnlockedAndAlive()) return;
+        const lifeGen = this._lifecycleGeneration;
+        const sessionId = this._getSettingString('session-id', '');
+        const token = this._browserLaunch = {};
+        const draftIsCurrent = () => this._isSessionUnlockedAndAlive(lifeGen) &&
+            this._getSettingString('session-id', '') === sessionId &&
+            this._panel?.entry?.get_text().trim() === draft;
+        try {
+            const app = await new Promise((resolve, reject) => {
+                Gio.AppInfo.get_default_for_uri_scheme_async('https', null, (_, result) => {
+                    try { resolve(Gio.AppInfo.get_default_for_uri_scheme_finish(result)); }
+                    catch (err) { reject(err); }
+                });
+            });
+            if (!draftIsCurrent()) return;
+            if (!app) throw new Error('系统未设置默认浏览器');
+            const launchContext = global.create_app_launch_context(global.get_current_time(), -1);
+            await new Promise((resolve, reject) => {
+                app.launch_uris_async([], launchContext, null, (source, result) => {
+                    try {
+                        if (!source.launch_uris_finish(result)) throw new Error('桌面拒绝了浏览器启动请求');
+                        resolve();
+                    } catch (err) { reject(err); }
+                });
+            });
+            if (!draftIsCurrent()) return;
+            this._panel.setEntryTextProgrammatically('', {focus: false});
+            this._panel.setStatusIndicator('ready', '已向桌面提交默认浏览器启动请求');
+            this._dateIntegration?.menu?.close();
+        } catch (err) {
+            if (draftIsCurrent()) this._panel.setStatusIndicator('error', `无法启动默认浏览器：${err.message}`);
+        } finally {
+            if (this._browserLaunch === token) this._browserLaunch = null;
+        }
     }
 
     async _executePromptTurn({
@@ -2890,6 +2933,7 @@ export default class QuickChat extends Extension {
         this._enabled = false;
         this._sessionMutationLock = false;
         this._sessionSwitchInFlight = false;
+        this._browserLaunch = null;
 
         this._cancelScheduledWork();
 

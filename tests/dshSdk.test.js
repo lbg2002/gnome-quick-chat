@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {isDefaultBrowserLaunchRequest} from '../protocol.js';
 import {DshSdkTurn, supportsDshSdk} from '../runtime/dshSdk.js';
 import {buildDshProfileOverlay} from '../core/dshModelCatalog.js';
 import {BaseBackendAdapter} from '../backends/baseAdapter.js';
@@ -113,5 +114,42 @@ test('shared backend context is rebuilt from the current local conversation afte
         const replay = adapter.prepareCliContext('new prompt', {...options, allowResume: false});
         assert.match(replay.prompt, /edited shared memory/);
         assert.doesNotMatch(replay.prompt, /before edit/);
+    }
+});
+
+test('DSH restores a bound native session before sending the next prompt', () => {
+    const makeTurn = () => new DshSdkTurn({sessionId: 'local-turn', workspace: '/tmp', provider: 'codex',
+        model: 'example', prompt: 'next question', approvalRequests: true, resume: true});
+    const sent = [];
+    const sdk = makeTurn();
+    sdk.start(async message => sent.push(message));
+    sdk.read(frame({id: 'qc-init', result: {serverInfo: {name: 'deepseek-harness-sdk-runtime'}}}));
+    assert.deepEqual(sent.map(message => message.method), ['initialize', 'session/resume']);
+    assert.deepEqual(sent.at(-1).params, {sessionId: 'local-turn'});
+    sdk.read(frame({id: 'qc-resume', result: {}}));
+    assert.deepEqual(sent.at(-1).params, {
+        sessionId: 'local-turn', contentBlocks: [{type: 'text', text: 'next question'}],
+    });
+    sdk.read(frame({id: 'qc-prompt', result: {messageId: 'accepted'}}));
+    sdk.read(event('turn/end', {reason: {kind: 'completed'}}));
+    assert.equal(sdk.read(frame({id: 'qc-wait', result: {}})).sessionId, 'local-turn');
+
+    const missing = makeTurn();
+    const second = [];
+    missing.start(async message => second.push(message));
+    missing.read(frame({id: 'qc-init', result: {serverInfo: {name: 'deepseek-harness-sdk-runtime'}}}));
+    const result = missing.read(frame({id: 'qc-resume', error: {message: 'missing session'}}));
+    assert.equal(result.isError, true);
+    assert.equal(result.sessionId, '');
+    assert.deepEqual(second.map(message => message.method), ['initialize', 'session/resume', 'shutdown']);
+});
+
+test('browser action accepts only a direct instruction with no arbitrary command or URL', () => {
+    for (const phrase of ['打开我的默认浏览器', '请帮我打开默认浏览器。', 'Open my default browser!']) {
+        assert.equal(isDefaultBrowserLaunchRequest(phrase), true, phrase);
+    }
+    for (const phrase of ['如何打开我的默认浏览器？', '打开浏览器并删除文件', '请打开浏览器 https://example.test',
+        'echo 打开我的默认浏览器', '“打开我的默认浏览器”', '不要打开浏览器']) {
+        assert.equal(isDefaultBrowserLaunchRequest(phrase), false, phrase);
     }
 });

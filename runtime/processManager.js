@@ -647,8 +647,7 @@ export function spawnManagedCliTurn({
             onBeforeSettle: finalStatus => {
                 // R3: Advance remoteSyncedRevision ONLY when the backend protocol confirms clean completion!
                 if (finalStatus === 'completed') {
-                    const confirmedRemoteId = conversationTransport
-                        ? '' : (turn.boundRemoteSessionId || store?.remoteSessionId || remoteId);
+                    const confirmedRemoteId = turn.boundRemoteSessionId || store?.remoteSessionId || remoteId;
                     if (confirmedRemoteId) {
                         store?.confirmRemoteTurnSynced?.(confirmedRemoteId, backend, persistCfg);
                     }

@@ -54,13 +54,14 @@ function answerQuestions(questions, drafts) {
 
 /** Translates one DSH SDK process into the shared CLI turn and interaction contract. */
 export class DshSdkTurn {
-    constructor({sessionId, workspace, provider, model, prompt, approvalRequests, fullAccess = false}) {
+    constructor({sessionId, workspace, provider, model, prompt, approvalRequests, fullAccess = false, resume = false}) {
         this.sessionId = sessionId;
         this.initialize = {
             cwd: workspace, provider, model, approvalRequests,
             capabilities: {userQuestions: true},
         };
         this.prompt = prompt;
+        this.resume = resume;
         this.expectedSandbox = fullAccess ? 'danger-full-access' : 'read-only';
         this.expectedApprovalPolicy = approvalRequests ? 'ask' : 'never';
         this.phase = 'initialize';
@@ -129,7 +130,7 @@ export class DshSdkTurn {
                 }
             }
         }
-        if (frame.method !== 'session.event' || this.phase !== 'running') return null;
+        if (frame.method !== 'session.event' || !['running', 'resuming'].includes(this.phase)) return null;
         const event = frame.params.event;
         const data = event?.data;
         if (!data) return null;
@@ -140,6 +141,11 @@ export class DshSdkTurn {
             case 'approval/policy':
                 if (data.policy !== this.expectedApprovalPolicy) throw new Error('DSH SDK 审批策略与随问所选权限不符');
                 return null;
+            default:
+                break;
+        }
+        if (this.phase !== 'running') return null;
+        switch (event.type) {
             case 'assistant/message': {
                 const blocks = data.message?.content;
                 if (!Array.isArray(blocks)) return null;
@@ -194,10 +200,17 @@ export class DshSdkTurn {
             if (frame.result?.serverInfo?.name !== 'deepseek-harness-sdk-runtime') {
                 return this._finish({kind: 'error', error: {message: safeText(frame.error?.message) || 'DSH SDK 握手失败'}});
             }
-            this.phase = 'running';
-            this._request('qc-prompt', 'session/prompt', {
-                sessionId: this.sessionId, contentBlocks: [{type: 'text', text: this.prompt}],
-            });
+            if (this.resume) {
+                this.phase = 'resuming';
+                this._request('qc-resume', 'session/resume', {sessionId: this.sessionId});
+            } else {
+                this._sendPrompt();
+            }
+        } else if (frame.id === 'qc-resume' && this.phase === 'resuming') {
+            if (frame.error || !frame.result) {
+                return this._finish({kind: 'error', error: {message: safeText(frame.error?.message) || 'DSH 未恢复既有会话'}});
+            }
+            this._sendPrompt();
         } else if (frame.id === 'qc-prompt' && this.phase === 'running') {
             if (frame.error || !frame.result?.messageId) {
                 return this._finish({kind: 'error', error: {message: safeText(frame.error?.message) || 'DSH 未接收提问'}});
@@ -211,10 +224,18 @@ export class DshSdkTurn {
         return null;
     }
 
+    _sendPrompt() {
+        this.phase = 'running';
+        this._request('qc-prompt', 'session/prompt', {
+            sessionId: this.sessionId, contentBlocks: [{type: 'text', text: this.prompt}],
+        });
+    }
+
     _finish(reason) {
         this.phase = 'shutdown';
         this._request('qc-shutdown', 'shutdown', undefined);
-        const result = normalizeEvent('dsh', {type: 'final', reason});
+        const sessionId = reason?.kind === 'completed' ? this.sessionId : '';
+        const result = normalizeEvent('dsh', {type: 'final', reason, sessionId});
         return {...result, authoritative: false};
     }
 

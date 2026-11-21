@@ -639,6 +639,7 @@ export class BackendClient {
             resolvedProvider: this._runtime?.resolvedProvider || '',
             resolvedModel: this._runtime?.resolvedModel || '',
             resolvedWorkspace: this._workspace || '',
+            dshSdk: this._runtime?.cliCapabilities?.dshSdk === true,
             effectiveMode: this._runtime?.effectiveModeInfo?.effectiveMode || (this._config?.mode || 'readonly'),
         };
     }

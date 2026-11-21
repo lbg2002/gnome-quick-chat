@@ -494,6 +494,13 @@ export function buildModelSignature(backend, config = {}) {
     return `${backend}:${String(config.provider || '').trim()}:${String(config.model || '').trim()}`;
 }
 
+// Only an explicit command typed directly in the composer can invoke this action.
+export function isDefaultBrowserLaunchRequest(text) {
+    const request = String(text ?? '').trim();
+    return /^(?:请(?:帮我)?|帮我|给我)?打开\s*(?:我(?:的)?\s*)?(?:默认\s*)?浏览器[。！!.]?$/.test(request) ||
+        /^(?:please\s+)?(?:open|launch)\s+(?:(?:my|the)\s+)?(?:default\s+)?browser[.!]?$/i.test(request);
+}
+
 const USER_DIR_MENTION_RE = /(?:桌面|下载|文档|图片|视频|音乐|主目录|家目录|\bdesktop\b|\bdownloads?\b|\bdocuments?\b|\bpictures?\b)/i;
 
 export function expandHomePath(rawPath, homeDir = '') {

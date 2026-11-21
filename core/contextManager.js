@@ -114,7 +114,8 @@ export function buildRuntimeContextSignature(backend, config = {}) {
 
     const provider = String(config?.resolvedProvider || config?.provider || '').trim();
     const model = String(config?.resolvedModel || config?.model || '').trim();
-    return `${cleanBackend}|prov=${provider}|model=${model}|ws=${workspace}|mode=${mode}`;
+    const transport = cleanBackend === 'dsh' && config.dshSdk ? '|transport=sdk' : '';
+    return `${cleanBackend}|prov=${provider}|model=${model}|ws=${workspace}|mode=${mode}${transport}`;
 }
 
 const EMBEDDED_ATTACHMENT_MARKER_RE = /(?:<<<BEGIN_QC_UNTRUSTED_ATTACHMENT_|\[不可信引用数据边界说明\s*\/\s*UNTRUSTED_ATTACHMENT_BOUNDARY\]|\[随问引用上下文（共\s*\d+\s*个本地片段）\])/;
