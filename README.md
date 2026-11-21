@@ -194,6 +194,8 @@ ZCode 最新 CLI 即使帮助文本未罗列所有可用选项，也不会仅据
 
 ### 发布版安装包（无需克隆源码）
 
+从旧版本升级时，先关闭随问再安装。若当前 GNOME Shell 会话已经加载过旧版，安装后请注销并重新登录一次，再开启随问。重新登录后可在「扩展」应用确认已加载的版本。
+
 GitHub Actions 每次提交到 `main` 都会构建可下载的安装包（在 Actions → **Build install packages and GitHub Release** → Artifacts 中）；推送与项目版本一致的 `vX.Y.Z` 标签会自动创建 GitHub Release，上传：
 
 - **`gnome-shell-extension-quick-chat_X.Y.Z_all.deb`**：Ubuntu 26.04 / GNOME Shell 50 的系统级安装包，依赖由 APT 管理，可用 `sudo apt install ./gnome-shell-extension-quick-chat_X.Y.Z_all.deb` 安装和升级；

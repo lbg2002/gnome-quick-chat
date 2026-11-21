@@ -82,8 +82,8 @@ Maintainer: Quick Chat Contributors <lbg2002@users.noreply.github.com>
 Depends: gnome-shell (>= 50), gjs, gir1.2-soup-3.0, libglib2.0-bin
 Homepage: https://github.com/lbg2002/gnome-quick-chat
 Description: Quick Chat GNOME 50 native AI assistant
- A GNOME Shell date-menu assistant with ZCode, Codex, and
- OpenAI-compatible API backends.
+ A GNOME Shell top-bar assistant with ZCode, DeepSeek Harness (DSH),
+ Codex, and OpenAI-compatible API backends.
 EOF
 
 deb="$out_dir/gnome-shell-extension-quick-chat_${version}_all.deb"
