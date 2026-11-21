@@ -439,7 +439,7 @@ export class TracePanelController {
 
     _ensureQuestionFormRendered(card, node) {
         if (!card?.questionFormBox || !node?.questions?.length) return;
-        if (!node.questionDrafts) node.questionDrafts = {};
+        if (!node.questionDrafts) node.questionDrafts = Object.create(null);
 
         if (card.renderedQuestionNodeId === node.id && Array.isArray(card.renderedQuestionWidgets)) {
             this.syncQuestionFormState(card, node);
@@ -779,6 +779,7 @@ export class TracePanelController {
                 card.drawerActions.visible = false;
                 card.questionFormBox.visible = true;
                 card.questionActions.visible = true;
+                card.skipAnswerBtn.visible = node.allowSkip !== false;
                 this._ensureQuestionFormRendered(card, node);
                 return;
             }

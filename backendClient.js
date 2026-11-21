@@ -20,7 +20,9 @@ import {
     peekCachedBackendCatalog,
     probeCliCapabilities,
     probeCliCapabilitiesAsync,
+    runShortProbeCommandWithMetaAsync,
 } from './core/backendDetect.js';
+import {supportsDshSdk} from './runtime/dshSdk.js';
 import {UNCONFIGURED_BACKEND_MESSAGE} from './core/configMigration.js';
 import {
     cleanupStaleRuntimeFiles,
@@ -467,8 +469,15 @@ export async function resolveBackendRuntimeAsync(config = {}, {
         if (!executable || !env.isExecutable(executable)) {
             throw new Error('DSH 检测结果已失效：已验证的 dsh 可执行文件不存在或不可执行，请重新连接');
         }
+        const probe = await runShortProbeCommandWithMetaAsync([executable, '--version'],
+            {PATH: pathDirs.join(':')}, 512, {timeoutMs: 2500, cancellable});
+        const cliCapabilities = {
+            version: probe.ok ? probe.output.trim() : '',
+            dshSdk: probe.ok && supportsDshSdk(probe.output),
+        };
         const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode, {
             enableAutoReview: config.dshAutoReview === true,
+            ...cliCapabilities,
         });
         return {
             backend: 'dsh', available: true,
@@ -478,9 +487,9 @@ export async function resolveBackendRuntimeAsync(config = {}, {
             resolvedProvider: String(config.provider || '').trim() || 'deepseek-official',
             resolvedModel: String(config.model || '').trim(),
             label: String(config.model || '').trim() || 'DeepSeek Harness（使用 DSH profile 默认模型）',
-            cliCapabilities: null,
+            cliCapabilities,
             effectiveModeInfo,
-            capabilities: getBackendCapabilities('dsh'),
+            capabilities: getBackendCapabilities('dsh', cliCapabilities),
         };
     }
 
@@ -630,6 +639,7 @@ export class BackendClient {
             resolvedProvider: this._runtime?.resolvedProvider || '',
             resolvedModel: this._runtime?.resolvedModel || '',
             resolvedWorkspace: this._workspace || '',
+            dshSdk: this._runtime?.cliCapabilities?.dshSdk === true,
             effectiveMode: this._runtime?.effectiveModeInfo?.effectiveMode || (this._config?.mode || 'readonly'),
         };
     }

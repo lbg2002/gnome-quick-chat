@@ -40,6 +40,7 @@ import {OpenAIAdapter, readSoupResponseBytesBoundedAsync} from '../backends/open
 import {ZCodeAdapter} from '../backends/zcodeAdapter.js';
 import {CodexAdapter} from '../backends/codexAdapter.js';
 import {DshAdapter} from '../backends/dshAdapter.js';
+import {IncrementalBoundedLineReader} from "../runtime/cliProcessRunner.js";
 import {spawnManagedCliTurn} from '../runtime/processManager.js';
 import {BackendClient} from '../backendClient.js';
 import {ChatController} from '../core/chatController.js';
@@ -193,6 +194,13 @@ let asyncError = null;
 let mockHttpProc = null;
 
 (async () => {
+    // SDK JSON-RPC notifications span multiple reads in GJS. Its TextDecoder
+    // lacks streaming mode, so verify splitting inside a UTF-8 code point.
+    const reader = new IncrementalBoundedLineReader();
+    const frame = new TextEncoder().encode('随问\n');
+    assert(reader.pushChunk(frame.subarray(0, 2)).lines.length === 0, 'partial JSONL was emitted');
+    assert(reader.pushChunk(frame.subarray(2)).lines[0] === '随问', 'chunk split corrupted UTF-8');
+
     try {
         // 5A. Real Gio async SessionStore write + reload + unix mode 0600/0700
         const store = new SessionStore('gjs_smoke_sess', {sessionsRootDir: tmpRoot});

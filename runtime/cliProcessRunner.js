@@ -26,10 +26,8 @@ export const DEFAULT_STREAM_LIMITS = Object.freeze({
  * Incremental UTF-8 line assembler with strict in-stream byte ceiling (`maxLineBytes`).
  *
  * - Reads fixed `Uint8Array` chunks (`8–32 KiB`) from `read_bytes_async`.
- * - Decodes UTF-8 incrementally with `{stream: true}` so multi-byte sequences split across
- *   chunk boundaries are preserved without corruption.
- * - Accumulates decoded fragments in an array (`_pendingParts`) and joins ONLY once per `\n`
- *   line completion, avoiding O(N^2) string re-concatenation across chunks.
+ * - Buffers bounded byte slices and decodes once per complete line, preserving UTF-8
+ *   split across reads even on GJS runtimes without streaming TextDecoder.
  * - Enforces `maxLineBytes` BEFORE buffering an unbounded newline-less payload into RAM!
  */
 export class IncrementalBoundedLineReader {
@@ -80,11 +78,7 @@ export class IncrementalBoundedLineReader {
                     this._pendingBytes = 0;
                     return {lines, overflowed: true, overflowBytes: this.overflowBytes};
                 }
-                const slice = chunk.subarray(cursor, len);
-                const decoded = this._decoder.decode(slice, {stream: true});
-                if (decoded) {
-                    this._pendingParts.push(decoded);
-                }
+                this._pendingParts.push(chunk.subarray(cursor, len));
                 this._pendingBytes = nextBytes;
                 break;
             }
@@ -99,20 +93,8 @@ export class IncrementalBoundedLineReader {
                 return {lines, overflowed: true, overflowBytes: this.overflowBytes};
             }
 
-            const slice = chunk.subarray(cursor, nlIdx);
-            const tailDecoded = this._decoder.decode(slice, {stream: false});
-            if (tailDecoded) {
-                this._pendingParts.push(tailDecoded);
-            }
-            let fullLine = this._pendingParts.length === 1
-                ? this._pendingParts[0]
-                : this._pendingParts.join('');
-            if (fullLine.endsWith('\r')) {
-                fullLine = fullLine.slice(0, -1);
-            }
-            lines.push(fullLine);
-            this._pendingParts = [];
-            this._pendingBytes = 0;
+            this._pendingParts.push(chunk.subarray(cursor, nlIdx));
+            lines.push(this._takeLine(nextBytes));
             cursor = nlIdx + 1;
         }
 
@@ -123,29 +105,28 @@ export class IncrementalBoundedLineReader {
         if (this.overflowed) {
             return {lines: [], overflowed: true, overflowBytes: this.overflowBytes};
         }
-        const tail = this._decoder.decode();
-        if (tail) {
-            this._pendingParts.push(tail);
-        }
-        if (this._pendingParts.length === 0 && this._pendingBytes === 0) {
-            return {lines: [], overflowed: false, overflowBytes: 0};
-        }
-        let fullLine = this._pendingParts.length === 1
-            ? this._pendingParts[0]
-            : this._pendingParts.join('');
-        if (fullLine.endsWith('\r')) {
-            fullLine = fullLine.slice(0, -1);
-        }
-        this._pendingParts = [];
-        this._pendingBytes = 0;
-        return {lines: fullLine ? [fullLine] : [], overflowed: false, overflowBytes: 0};
+        const line = this._takeLine(this._pendingBytes);
+        return {lines: line ? [line] : [], overflowed: false, overflowBytes: 0};
     }
 
     takePendingPrefix(maxChars = 256) {
-        const prefix = this._pendingParts.join('').slice(0, maxChars);
+        return this._takeLine(this._pendingBytes).slice(0, maxChars);
+    }
+
+    _takeLine(length) {
+        let bytes = this._pendingParts[0] || new Uint8Array(0);
+        if (this._pendingParts.length > 1) {
+            bytes = new Uint8Array(length);
+            let offset = 0;
+            for (const part of this._pendingParts) {
+                bytes.set(part, offset);
+                offset += part.byteLength;
+            }
+        }
         this._pendingParts = [];
         this._pendingBytes = 0;
-        return prefix;
+        const line = this._decoder.decode(bytes);
+        return line.endsWith('\r') ? line.slice(0, -1) : line;
     }
 }
 
@@ -296,7 +277,9 @@ export class CliTurnMonitor {
         requireBridgeHandshake = false,
         expectedBridgeVersion = BRIDGE_EXPECTED_PROTOCOL_VERSION,
         limits = {},
+        decodeRecord = null,
     }) {
+        this.decodeRecord = decodeRecord;
         this.turnId = String(turnId || '');
         this.backend = String(backend || '');
         this.requireBridgeHandshake = Boolean(requireBridgeHandshake);
@@ -489,7 +472,7 @@ export class CliTurnMonitor {
             return {ignore: false, normalized: null, fatalError: ''};
         }
 
-        const norm = normalizeEvent(this.backend, record);
+        const norm = this.decodeRecord ? this.decodeRecord(record) : normalizeEvent(this.backend, record);
         if (!norm) {
             return {ignore: false, normalized: null, fatalError: ''};
         }

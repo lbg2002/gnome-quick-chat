@@ -7,8 +7,6 @@ import GLib from 'gi://GLib';
 import {BaseBackendAdapter} from './baseAdapter.js';
 import {resolveDesktopAssistantPrompt} from '../core/dshModelCatalog.js';
 import {
-    augmentPromptWithDesktopContext,
-    buildCrossBackendPromptWithContext,
     buildZCodeArgs,
     normalizeEffectiveAgentMode,
     preparePromptWithinBudget,
@@ -145,22 +143,10 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         const modeInfo = normalizeEffectiveAgentMode('zcode', this._config?.mode || 'readonly', cliCaps);
         const effectiveMode = modeInfo.effectiveMode;
 
-        const ctxCfg = this._getSessionContextConfig();
-        const historyBeforePrompt = this._store ? [...this._store.messages] : [];
-        const remoteId = this._store
-            ? (typeof this._store.resolveRemoteSessionForTurn === 'function'
-                ? this._store.resolveRemoteSessionForTurn('zcode', ctxCfg)
-                : (this._store.remoteSessionId || ''))
-            : '';
-        const promptWithDesktopEnv = augmentPromptWithDesktopContext(budgetCheck.promptText, specialDirs, {
-            isFirstTurn: !remoteId,
-            mode: effectiveMode,
-            workspace,
+        const {remoteId, prompt: effectiveCliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
+            workspace, specialDirs, mode: effectiveMode,
             assistantInstructions: resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
         });
-        const effectiveCliPrompt = (!remoteId && historyBeforePrompt.length > 0)
-            ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptWithDesktopEnv)
-            : promptWithDesktopEnv;
 
         const requireBridgeHandshake = effectiveMode === 'smart';
         if (requireBridgeHandshake && !this._runtime?.bridgePath) {

@@ -2,7 +2,7 @@
 
 # ✦ Quick Chat · 随问 (`gnome-quick-chat`)
 
-**专为 Ubuntu 26.04 / GNOME Shell 50 打造的系统通知栏原生 AI 随问与轻量 Agent 助手**
+**专为 Ubuntu 26.04 / GNOME Shell 50 打造的顶栏 AI 随问与轻量 Agent 助手**
 
 [![GNOME Shell](https://img.shields.io/badge/GNOME_Shell-50-4a86cf?logo=gnome&logoColor=white)](https://www.gnome.org/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-26.04_LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
@@ -10,7 +10,7 @@
 [![Tests](https://img.shields.io/badge/Unit_&_State_Tests-Passed-success)](#8-模块化架构开发与测试)
 [![Interactive Demo](https://img.shields.io/badge/▶_在线交互式动画演示-1080p_60fps-f5a623)](https://lbg2002.github.io/gnome-quick-chat/)
 
-点击屏幕顶部中央的「时间 / 日期」（或按下全局快捷键 **`Super + Shift + Q`**），即可在通知栏左栏无缝切换 **「✦ 随问 | 通知」**，右侧原生日历与世界时钟保持原样。  
+点击顶栏 **「✦ 随问」** 或按 **`Super + Shift + Q`** 打开聊天。系统通知与日历仍从 GNOME 的日期菜单打开。
 纯原生 `GJS` / `St` / `Clutter` 构建，**零 WebView 内存开销**、**增量流式 Markdown 渲染不阻塞 GNOME Shell 主线程**，支持**面板内一键切换模型/思考强度**、**剪贴板随问 (`Super + Shift + Y`)**、**横向彩色小圆点轨迹**与**按命令/域名/文件范围隔离的分级工具审批**。
 
 <br/>
@@ -50,11 +50,11 @@
 
 * **⚡ 面向 GNOME Shell 进程级流畅性的增量流式渲染**
   * **冻结块增量 Markdown 引擎 (`ui/markdownRenderer.js`)**：流式输出时已完成段落与代码块固定不重建，仅原地刷新末尾活动块；长文多代码块回答零闪烁，流式中复制前序代码块的反馈状态不被打断。
-  * **脏标记按需刷新 + 隐藏态零重排**：区分 `dirty = {text, thinking, tools}` 与动态节流间隔；当通知栏关闭或处于「通知」标签时自动暂停 UI 排版，仅在 `✦ 随问` 标签上点亮状态圆点并在重新打开时一次性刷新。
+  * **脏标记按需刷新 + 隐藏态零重排**：区分 `dirty = {text, thinking, tools}` 与动态节流间隔；当随问面板关闭时自动暂停 UI 排版，仅在 `✦ 随问` 标签上点亮状态圆点并在重新打开时一次性刷新。
 * **⌨️ 随手即达的桌面级快捷体验**
-  * **全局唤醒 (`Super + Shift + Q`)**：在任意窗口一键呼出或收起通知栏随问面板并自动聚焦输入框。
-  * **胶囊快捷入口 (`Super + Shift + A`)**：独立的输入胶囊，按 Enter 后释放键盘抓取，使用透明瀑布区域流式展示回答；Esc 收起，↗ 进入完整对话。快捷键可在“设置 → 界面与权限”修改。
-  * **通知栏双标签**：随问与 GNOME 原生通知位于左栏，右侧日历保持原来的位置；嵌入失败时仍可在设置中切换为独立顶栏按钮。
+  * **全局唤醒 (`Super + Shift + Q`)**：在任意窗口一键呼出或收起独立的随问面板并自动聚焦输入框。
+  * **实验性胶囊 (`Super + Shift + A`)**：默认关闭。可在“设置 → 界面与权限”开启。Enter 发送，回答在半透明区域逐步显示。Esc 或关闭按钮收起，↗ 进入完整对话。
+  * **独立顶栏入口**：通过顶栏的「随问」打开聊天。GNOME 日期菜单继续管理系统通知和日历。
   * **会话切换保护**：新对话不再同时触发 GSettings 重连和重复消息树清理；后台只进行单次新会话连接。
   * **剪贴板 / 选中内容随问 (`Super + Shift + Y` 或面板 `📋` 按钮)**：自动读取系统剪贴板或主选区内容填入提问框，报错分析、翻译润色一步到位。
   * **面板内一键切换模型与思考强度**：点击随问状态栏模型名称（`▾`），无需打开设置窗口即可就地切换引擎、模型与思考强度（`默认 / 快 / 标准 / 深入`）。
@@ -95,7 +95,7 @@
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **ZCode CLI** (`zcode`) | ✓ | ✓ (桥接权威校验) | ✓ (`--resume`) | ✓ | `zcodeBridge.cjs` 版本握手校验 + `setsid` 进程组回收 + `0600` 临时配置 |
 | **Codex CLI** (`codex`) | ✓ | — (CLI 沙箱策略) | ✓ (`exec resume`) | ✓ | 原生 `read-only` / `danger-full-access` 沙箱，支持并发 `item.id` 与退出码追踪 |
-| **DeepSeek Harness** (`dsh`) | ✓ | 不支持 Headless 实时回传审批 | ✓ (`--session-id`) | ✓（提交后的 JSONL 事件） | `dsh --profile headless --json`，默认只读，完全权限需用户明确开启 |
+| **DeepSeek Harness** (`dsh`) | ✓ | ✓（SDK 审批与选择题） | ✓（随问本地记忆） | ✓（原生会话事件） | DSH SDK，旧版回退 Headless |
 | **OpenAI API** (`openai`) | — | — | ✓ (整轮预算裁剪) | ✓ (`reasoning_content`) | `Soup 3.0` 事件级 SSE 解析器（兼容 CRLF/分片/中断检测）+ 按端点 Keyring 隔离 |
 
 > **跨后端无缝续接与诚实回退**：当在同一对话中途切换模型/引擎，或执行原地重新生成/编辑提问回退历史时，`SessionStore` 会自动失效过期的远端会话标识，并在下一轮按整轮预算精确重建本地上下文。
@@ -168,34 +168,21 @@ bash scripts/diagnose-local.sh
 
 随问会核对 `headless --help` 是否提供 `--json`、`--session-id`、`--permission-mode`、`--approval-policy`；**自定义启动脚本可以不叫 dsh**，但必须真正转发以上接口。自动选择后端按 ZCode → Codex → DSH → OpenAI 的顺序检查。DSH 的模型、插件、权限预设由自身的 Headless profile 配置控制，随问不会擅自覆盖 `$DSH_HOME`。
 
-**常见连接成功却无法回答的原因：** DSH 官方默认 Headless profile 不使用 Web/GUI 保存的登录凭据。模型 API Key 会按启动环境 → 工作目录下 `.env` → `$DSH_HOME/.env` 读取。GNOME Shell 的启动环境未必继承终端的变量；如果终端可以运行而随问无法回答，先检查 Headless 配置与环境可见性。请勿将密钥粘贴到公开诊断或 GitHub Issue。仅有 `dsh --version` 成功并不能证明已经配置可用的模型。Headless 任务一轮执行后退出，通过 `--session-id` 在同一工作目录续接；在运行过程中无法交互式审批。
+随问通过 DSH 自带的凭据服务使用模型页保存的凭据引用。对于 `MISSING_CREDENTIAL`，请核对所选 Provider 和 DSH 模型页中的对应条目。随问的诊断只报告缺失的引用名称。新版 DSH 使用 SDK Profile，旧版保留 Headless，临时配置补丁与现有 DSH 用户配置分开。
 
-
-权限改为三档：
-
-| 档位 | ZCode | Codex 非交互执行 | DSH Headless |
+| 档位 | ZCode | Codex CLI | DSH SDK |
 | --- | --- | --- | --- |
-| **只读** | Plan：可读取文件，禁止修改 | `read-only` 沙箱 | `read-only` 权限预设 |
-| **智能** | Build：允许低风险操作，修改/删除需由 ZCode 权限桥接确认 | **安全保持只读**（缺少随问内审批回传） | 默认只读；开启官方实验性 Auto Review 后模型审查工具动作（有误判风险） |
-| **完全权限** | YOLO：不再逐次审批 | `danger-full-access`，无审批 | `danger-full-access`，无审批 |
+| **只读** | Plan | 只读沙箱 | 只读沙箱，拒绝越权请求，可回答选择题 |
+| **智能** | ZCode 权限桥接 | 只读沙箱 | 默认以只读沙箱运行，DSH 发出原生请求时在随问确认一次 |
+| **完全权限** | 无逐次审批 | 无逐次审批 | 无逐次审批 |
 
-**DSH 真实桌面执行与实验性智能审核**
+DSH 0.2.2-rc.5 及受支持的新版本使用原生 SDK 审批和选择题接口。ZCode 与 DSH 的互动请求显示在随问的同一操作面板，后台请求通过桌面通知返回。DSH 审批只作用于当前请求，选择题按原生问题 ID 传回单选、多选或自定义答案。旧版 Headless 智能档保持只读，已显式启用的旧版实验 Auto Review 继续沿用原有设置。
 
-DSH headless 的 `read-only` 是文件沙箱，启动程序可能被限制；`danger-full-access` 允许调用真实主机 Bash，但仍受当前普通用户权限、Wayland 会话、D-Bus 和 Chrome 自身沙箱规则约束。随问不会向 Chrome 注入 `--no-sandbox`，也不会自动提权。推荐先使用 **只读** 验证问答和文件读取，再在可信任务中显式切换到 **完全权限** 测试 `gio open`、`gtk-launch` 和系统设置查询。
+**共用会话记忆**。随问本地保存聊天、编辑分支和可恢复历史。切换 ZCode 与 DSH、修改问题或重做回答时，适配层使用当前本地会话重建有预算的上下文。ZCode 与 DSH SDK 在本地历史版本、后端和运行配置仍匹配时续用原生会话。
 
-若希望低风险工具调用经模型审核后自动运行，而高风险操作被拒绝，可在自己的 DSH profile 中安装官方实验性插件：
+在主面板直接输入「打开我的默认浏览器」即可请求桌面打开默认浏览器。通过模型发起的 Bash 命令仍按后端的权限设置处理。
 
-```bash
-dsh plugin --profile headless add @deepseek-ai/dsh-experimental-auto-review
-```
-
-然后在随问的「界面与权限」中开启 **DSH 智能操作 · 实验性 Auto Review** 并选择 **智能**。此模式会使用 `--permission-mode auto --approval-policy never`。请注意：模型审核可能误判高风险；Headless 无法向随问弹出实时审批，遇到被拒绝的动作需要人工重新授权或切换模式；随问绝不自动执行重新尝试或放宽权限。不开启此实验功能时，DSH 智能档安全降级为只读。
-
-**模型列表与提示词：** DSH Headless 未提供可直接调用的完整模型列表命令。随问现在展示 DSH 官方内置的 `deepseek-flash`、`deepseek-v4-pro`，并通过异步 `dsh --profile headless --dump-config` 解析当前配置档选中的 Provider/Model；其他 Provider 可手动填写正确 ID。模型选择使用随问临时私有 YAML `--patch`，不会改写你的 `$DSH_HOME`、凭据、插件或 profile。设置中还增加了可以编辑、恢复默认的**多行桌面助手提示词**：ZCode/Codex 在新会话提示中使用，DSH 原生覆盖 `system-prompt.personaPrefix`；所有后端的真实权限仍由其 CLI 严格控制。
-
-**DSH 报错排查：** 新版随问不再只显示 `DSH 未正常完成本次任务：error`，而是读取官方 `final.reason.error.code/message` 并结合 CLI stderr 展示失败原因。纯问答失败时优先核查 Headless API Key 是否可见；只有读文件受限时才考虑只读沙箱权限；Chrome 打开失败时先区分已运行浏览器接管、图形会话不可用和 Shell 沙箱错误。
-
-**注意**：智能档不是凭自然语言关键词自动放权；删除与修改均需要可验证的后端审批通道，否则退回只读。这意味着 Codex/DSH 的智能档不能自动帮你写文件；要安全支持可审批写操作，后续需对接 Codex App Server / DSH ACP 等具有真实审批响应通道的协议。完全权限会有较大安全风险，请仅对信任任务手动启用。
+模型列表来自官方默认项和本机 DSH 配置。桌面助手提示词在设置中统一编辑，ZCode / Codex 通过首轮上下文注入，DSH 通过临时配置补丁应用。
 
 ZCode 最新 CLI 即使帮助文本未罗列所有可用选项，也不会仅据此被错误判断为“版本过旧”；程序会使用显式 `--mode` 交由 CLI 实际检验。GitHub 更新检查采用正确的 JSON Accept 请求；若代理错误返回 HTTP 415，会对同一安全 GET 请求使用普通 JSON Accept 重试。用户级更新仍写入原来的 `~/.local/share/gnome-shell/extensions/quick-chat@lbg2002.github.io`，系统 DEB 安装不会被用户级更新越权覆盖。
 
@@ -208,6 +195,8 @@ ZCode 最新 CLI 即使帮助文本未罗列所有可用选项，也不会仅据
 * **智能后端（四选一即可）**：`ZCode CLI`、`Codex CLI`、`DeepSeek Harness (dsh)`，或任意 **OpenAI 兼容 API 地址**
 
 ### 发布版安装包（无需克隆源码）
+
+从旧版本升级时，先关闭随问再安装。若当前 GNOME Shell 会话已经加载过旧版，安装后请注销并重新登录一次，再开启随问。重新登录后可在「扩展」应用确认已加载的版本。
 
 GitHub Actions 每次提交到 `main` 都会构建可下载的安装包（在 Actions → **Build install packages and GitHub Release** → Artifacts 中）；推送与项目版本一致的 `vX.Y.Z` 标签会自动创建 GitHub Release，上传：
 
@@ -260,7 +249,7 @@ gnome-extensions prefs quick-chat@lbg2002.github.io
 
 | 操作 / 快捷键 | 功能说明 |
 | :--- | :--- |
-| **`Super + Shift + Q`** | **全局呼出 / 收起**通知栏「✦ 随问」面板并自动聚焦输入框 |
+| **`Super + Shift + Q`** | **全局呼出 / 收起**独立「✦ 随问」面板并自动聚焦输入框 |
 | **`Super + Shift + Y` / `📎`** | **上下文附件引用**：将剪贴板长文本、终端报错日志或 Nautilus 复制的文件作为独立附件芯片挂载（不截断、不覆盖草稿，支持预览/切换仅路径/移除与云端发送范围提示） |
 | **输入 `/` 或按 `Ctrl + /`** | **快捷命令面板**：快速填入 `/explain`、`/translate`、`/polish`、`/summarize`、`/review`、`/error`、`/academic` 及自定义模板（默认仅填入输入框，不自动发送） |
 | **点击状态栏模型名 (`▾`)** | 展开面板内**快速切换栏**（支持搜索过滤、常用收藏及切换引擎/思考强度） |

@@ -170,13 +170,13 @@ export function getBackendCapabilities(backend, cliCaps = null) {
         case 'dsh':
             return {
                 pureChat: false, readOnlyFiles: true, fileWrite: true, shellExec: true,
-                supportsTools: true, supportsApproval: false, networkAccess: true,
-                interactiveQuestions: false, supportsCancel: true, supportsResume: true,
+                supportsTools: true, supportsApproval: cliCaps?.dshSdk === true, networkAccess: true,
+                interactiveQuestions: cliCaps?.dshSdk === true, supportsCancel: true, supportsResume: true,
                 supportsThinking: true, supportsSkills: true, supportsMcp: true,
                 supportedModes: ['readonly', 'smart', 'full'],
                 modeLabels: [
-                    '只读（DeepSeek Harness headless · 不修改文件）',
-                    '智能（headless 无回传审批，安全降级为只读）',
+                    '只读（拒绝越权操作）',
+                    '智能（支持 SDK 时弹窗审批）',
                     '完全权限（危险：显式解锁 DSH 的高权限预设）',
                 ],
                 modeBadges: {chat: '只读', readonly: '只读', smart: '智能（只读限制）', full: '完全权限'},
@@ -234,6 +234,9 @@ export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly',
     const mode = ['chat', 'readonly', 'smart', 'full'].includes(requestedMode) ? requestedMode : 'readonly';
     if (backend === 'openai') {
         return {effectiveMode: 'chat', downgradedFromChat: false, notice: ''};
+    }
+    if (backend === 'dsh' && mode === 'smart' && cliCaps?.dshSdk === true) {
+        return {effectiveMode: 'smart', downgradedFromChat: false, notice: 'DSH SDK：只读沙箱，按原生请求弹窗授权单次操作。'};
     }
     if (backend === 'dsh' && mode === 'smart' && cliCaps?.enableAutoReview === true) {
         return {
@@ -489,6 +492,13 @@ export function buildModelSignature(backend, config = {}) {
         return `openai:${url}:${mod}`;
     }
     return `${backend}:${String(config.provider || '').trim()}:${String(config.model || '').trim()}`;
+}
+
+// Only an explicit command typed directly in the composer can invoke this action.
+export function isDefaultBrowserLaunchRequest(text) {
+    const request = String(text ?? '').trim();
+    return /^(?:请(?:帮我)?|帮我|给我)?打开\s*(?:我(?:的)?\s*)?(?:默认\s*)?浏览器[。！!.]?$/.test(request) ||
+        /^(?:please\s+)?(?:open|launch)\s+(?:(?:my|the)\s+)?(?:default\s+)?browser[.!]?$/i.test(request);
 }
 
 const USER_DIR_MENTION_RE = /(?:桌面|下载|文档|图片|视频|音乐|主目录|家目录|\bdesktop\b|\bdownloads?\b|\bdocuments?\b|\bpictures?\b)/i;

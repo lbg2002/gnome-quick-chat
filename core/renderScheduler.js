@@ -394,6 +394,7 @@ export function applyToolTraceEventToCard(card, event, {
             if (node.status !== 'done' && node.status !== 'error' && node.status !== 'denied') {
                 node.status = 'pending_approval';
             }
+            node.allowSkip = event.allowSkip !== false;
             node.approvalState = 'pending';
             markDirty(node);
             if (!hadPendingBefore || !card.selectedNodeId) {

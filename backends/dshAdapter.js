@@ -1,11 +1,8 @@
 // DeepSeek Harness (dsh) official headless JSONL adapter.
-// One CLI process per turn; no WebView, no persistent agent daemon.
-// Headless approval has no Quick Chat callback transport, so never claim it.
+// The SDK profile supplies native callbacks on supported releases.
 import Gio from 'gi://Gio';
 import {BaseBackendAdapter} from './baseAdapter.js';
 import {
-    augmentPromptWithDesktopContext,
-    buildCrossBackendPromptWithContext,
     buildDshArgs,
     normalizeEffectiveAgentMode,
     preparePromptWithinBudget,
@@ -20,6 +17,7 @@ import {
     normalizeDshProviderId,
     resolveDesktopAssistantPrompt,
 } from '../core/dshModelCatalog.js';
+import {DshSdkTurn} from '../runtime/dshSdk.js';
 import {validateCliPromptLength} from '../runtime/cliProcessRunner.js';
 import {spawnManagedCliTurn, terminateTurnProcess} from '../runtime/processManager.js';
 
@@ -62,33 +60,31 @@ export class DshAdapter extends BaseBackendAdapter {
             deferTempCleanupUntilProcessExit: true,
         });
 
+        const sdk = this._runtime?.cliCapabilities?.dshSdk === true;
         const modeInfo = normalizeEffectiveAgentMode(
             'dsh', this._config?.mode || 'readonly',
-            {enableAutoReview: this._config?.dshAutoReview === true}
+            {enableAutoReview: this._config?.dshAutoReview === true, dshSdk: sdk}
         );
         const effectiveMode = modeInfo.effectiveMode;
-        const ctxCfg = this._getSessionContextConfig();
-        const historyBeforePrompt = this._store ? [...this._store.messages] : [];
-        const remoteId = this._store
-            ? (typeof this._store.resolveRemoteSessionForTurn === 'function'
-                ? this._store.resolveRemoteSessionForTurn('dsh', ctxCfg)
-                : this._store.remoteSessionId || '')
-            : '';
-        const desktopPrompt = augmentPromptWithDesktopContext(budgetCheck.promptText, specialDirs, {
-            isFirstTurn: !remoteId, mode: effectiveMode, workspace,
+        const {remoteId, prompt: cliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
+            workspace, specialDirs, mode: effectiveMode,
         });
-        const cliPrompt = (!remoteId && historyBeforePrompt.length)
-            ? buildCrossBackendPromptWithContext(historyBeforePrompt, desktopPrompt)
-            : desktopPrompt;
 
         let rawArgv;
         try {
             validateCliPromptLength(cliPrompt, {viaArgv: false});
             const persona = resolveDesktopAssistantPrompt(this._config?.assistantInstructions);
-            const model = String(this._config?.model || '').trim();
-            const provider = normalizeDshProviderId(this._config?.provider);
+            const configuredModel = String(this._config?.model || '').trim();
+            const configuredProvider = normalizeDshProviderId(this._config?.provider);
+            const catalog = sdk && !configuredModel
+                ? (await this.getModels({cancellable: turn.cancellable})).catalog : null;
+            const provider = configuredProvider || catalog?.defaultProviderId || '';
+            const model = configuredModel || (provider === catalog?.defaultProviderId
+                ? catalog?.defaultModelId : catalog?.providers.find(item => item.id === provider)?.models[0]) || '';
+            if (sdk && !model) throw new Error('请选择该 DSH Provider 可用的模型');
+
             // DSH Web providers are profile-scoped. Bridge only the
-            // selected route for this headless turn, without altering ~/.dsh.
+            // selected route for this turn, without altering ~/.dsh.
             let piAiPatch = '';
             if (model && provider && provider !== 'deepseek-official') {
                 const webPatch = await readDshWebProfilePatchAsync(turn.cancellable);
@@ -99,6 +95,8 @@ export class DshAdapter extends BaseBackendAdapter {
             const profileOverlay = buildDshProfileOverlay({
                 provider: model ? (provider || 'deepseek-official') : '',
                 model, persona, piAiPatch,
+                mountCredentials: true,
+                sdkMode: sdk ? effectiveMode : '',
             });
             let overlayPath = '';
             if (profileOverlay) {
@@ -113,11 +111,23 @@ export class DshAdapter extends BaseBackendAdapter {
                 turn.tempFiles.splice(0).forEach(removeFileQuietly);
                 return {disposition: 'cancelled', turnId: turn.id};
             }
-            rawArgv = buildDshArgs({
-                ...this._config,
-                executable: this._runtime.executable,
-                mode: effectiveMode,
-            }, remoteId, {overlayPath});
+            if (sdk) {
+                turn.dshSdk = new DshSdkTurn({
+                    sessionId: remoteId || GLib.uuid_string_random(), workspace,
+                    resume: Boolean(remoteId),
+                    provider: provider || 'deepseek-official',
+                    model,
+                    prompt: cliPrompt, approvalRequests: effectiveMode === 'smart',
+                    fullAccess: effectiveMode === 'full',
+                });
+                rawArgv = [this._runtime.executable, '--profile', 'sdk', '--patch', overlayPath];
+            } else {
+                rawArgv = buildDshArgs({
+                    ...this._config,
+                    executable: this._runtime.executable,
+                    mode: effectiveMode,
+                }, remoteId, {overlayPath});
+            }
             if (model && cleanDshModelId(model)) {
                 turn.modelId = model;
             }
@@ -158,6 +168,8 @@ export class DshAdapter extends BaseBackendAdapter {
             isDisposedFn: () => this._disposed,
             rawArgv,
             stdinPromptText: cliPrompt,
+            conversationTransport: turn.dshSdk,
+            turnExtraEnv: sdk ? {DSH_PERMISSION_MODE: effectiveMode === 'full' ? 'danger-full-access' : 'read-only'} : {},
             keepStdinOpenForApproval: false,
             requireBridgeHandshake: false,
             remoteId,
@@ -165,6 +177,16 @@ export class DshAdapter extends BaseBackendAdapter {
             effectiveMode,
             timeouts,
         });
+    }
+
+    async respondPermission(request = {}) {
+        const turn = this._turns.activeTurn;
+        if (!turn?.dshSdk || !this._turns.isCurrent(turn) || request.turnId !== turn.id) {
+            return {sent: false};
+        }
+        const response = await turn.dshSdk.respond(request);
+        if (response.event && this._turns.isCurrent(turn)) turn.applyInteractionResolution?.(response.event);
+        return {sent: response.sent, phase: response.event ? 'delivered' : 'awaiting_ack'};
     }
 
     async cancel(turnId = '') {

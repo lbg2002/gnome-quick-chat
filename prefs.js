@@ -18,6 +18,7 @@ import {
     peekCachedBackendCatalog,
 } from './core/backendDetect.js';
 import {BackendRegistry} from './core/backendRegistry.js';
+import {compactNameCombo, compactPreferenceRow} from './ui/preferencesLayout.js';
 import {DEFAULT_DESKTOP_ASSISTANT_PROMPT} from './core/dshModelCatalog.js';
 import {
     attachCrossOriginRedirectGuard,
@@ -93,11 +94,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // rather than allowing verbose descriptions to widen the entire view.
         try {
             const provider = new Gtk.CssProvider();
-            provider.load_from_data(new TextEncoder().encode(
+            provider.load_from_string(
                 'window.qc-prefs .subtitle { font-size: 0.82em; } ' +
                 'window.qc-prefs .title { font-size: 0.94em; } ' +
                 'window.qc-prefs row { min-width: 0; }'
-            ));
+            );
             const display = Gdk.Display.get_default();
             Gtk.StyleContext.add_provider_for_display(
                 display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
@@ -109,15 +110,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         } catch (err) { console.warn('[Quick Chat] GTK typography fallback: ' + err.message); }
 
         const tuneRows = widget => {
-            if (widget instanceof Adw.ActionRow) {
-                widget.set_subtitle_lines?.(2);
-                widget.set_title_lines?.(1);
-            }
+            compactPreferenceRow(widget);
             for (let child = widget.get_first_child?.(); child; child = child.get_next_sibling?.()) {
                 tuneRows(child);
             }
         };
-        window.connect('map', () => tuneRows(window));
 
         const hasKey = k => Boolean(s.settings_schema?.has_key?.(k));
         const getStr = (k, fb = '') => (hasKey(k) ? s.get_string(k) : fb);
@@ -223,7 +220,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const allowPlaintextRow = new Adw.SwitchRow({
             title: '密钥环不可用时允许本地兼容存储',
-            subtitle: '默认关闭（拒绝静默回退明文；未开启时若系统密钥环不可用，密钥仅保留在本次运行内存中）',
+            subtitle: '密钥环不可用时，允许在磁盘明文保存密钥',
         });
         if (hasKey('allow-plaintext-key-fallback')) {
             s.bind('allow-plaintext-key-fallback', allowPlaintextRow, 'active', Gio.SettingsBindFlags.DEFAULT);
@@ -434,17 +431,19 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const providerComboModel = Gtk.StringList.new(['默认 (由后端自动决定)']);
         const providerComboRow = new Adw.ComboRow({
             title: '选择 Provider',
-            subtitle: '切换服务提供商后，下方模型列表会自动筛选',
+            subtitle: '切换后筛选模型列表',
             model: providerComboModel,
         });
+        compactNameCombo(providerComboRow);
         catalogGroup.add(providerComboRow);
 
         const modelComboModel = Gtk.StringList.new(['默认 (由后端自动决定)']);
         const modelComboRow = new Adw.ComboRow({
             title: '选择模型',
-            subtitle: '从已发现的模型中直接选择，或在下方手动填写',
+            subtitle: '也可在下方手动填写',
             model: modelComboModel,
         });
+        compactNameCombo(modelComboRow);
         catalogGroup.add(modelComboRow);
 
         const getSelection = () => peekBackendSelection({
@@ -500,7 +499,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const efforts = ['default', 'fast', 'standard', 'deep'];
         const effortRow = new Adw.ComboRow({
             title: '思考强度 (Reasoning Effort)',
-            subtitle: '日常问答建议使用默认或快速模式以获得更低的首字延迟',
+            subtitle: '日常问答可选默认或快速',
             model: Gtk.StringList.new([
                 '默认 (保持后端原有推理设置)',
                 '快速 · 日常简短问答 (Low)',
@@ -557,6 +556,14 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         }));
         shortcutGroup.add(clipShortcutRow);
 
+        if (hasKey('enable-experimental-capsule')) {
+            const capsuleEnabledRow = new Adw.SwitchRow({
+                title: '实验性胶囊',
+                subtitle: '在屏幕顶部快速提问',
+            });
+            s.bind('enable-experimental-capsule', capsuleEnabledRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+            shortcutGroup.add(capsuleEnabledRow);
+        }
         const capsuleShortcutRow = new Adw.EntryRow({
             title: '胶囊快捷键',
         });
@@ -573,8 +580,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         }
 
         const notifyApprovalRow = new Adw.SwitchRow({
-            title: '等待审批或提问时弹出桌面通知',
-            subtitle: '后台 Agent 需要安全审批或补充信息时提醒处理，点击直接返回任务（锁屏不暴露正文）',
+            title: '审批提醒',
+            subtitle: '点击通知返回待处理任务',
         });
         if (hasKey('notify-on-approval')) {
             s.bind('notify-on-approval', notifyApprovalRow, 'active', Gio.SettingsBindFlags.DEFAULT);
@@ -583,7 +590,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const notifyErrorRow = new Adw.SwitchRow({
             title: '后台任务失败或超时弹出桌面通知',
-            subtitle: '收起面板期间若任务失败、中断或超时，发送脱敏状态提醒',
+            subtitle: '面板关闭时提示失败或超时',
         });
         if (hasKey('notify-on-error')) {
             s.bind('notify-on-error', notifyErrorRow, 'active', Gio.SettingsBindFlags.DEFAULT);
@@ -592,7 +599,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const notifyCompleteRow = new Adw.SwitchRow({
             title: '后台生成完成时弹出桌面通知',
-            subtitle: '当收起顶部通知栏等待长回答时，生成结束后发送轻量提醒（不抢占焦点）',
+            subtitle: '面板关闭时提示回答完成',
         });
         s.bind('notify-on-complete', notifyCompleteRow, 'active', Gio.SettingsBindFlags.DEFAULT);
         shortcutGroup.add(notifyCompleteRow);
@@ -650,6 +657,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     subtitle: formatQuickRowSubtitle(item),
                 });
 
+                compactPreferenceRow(expRow);
                 const deleteBtn = new Gtk.Button({
                     icon_name: 'user-trash-symbolic',
                     tooltip_text: '删除此快捷动作',
@@ -735,39 +743,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         uiPage.add(uiGroup);
 
-        const tabs = ['ai', 'notifications'];
-        const tabRow = new Adw.ComboRow({
-            title: '默认打开标签',
-            subtitle: '默认左侧切换通知与随问，右侧保留日历',
-            model: Gtk.StringList.new(['✦ 随问 (AI 助手)', '通知 (系统消息)']),
-        });
-        tabRow.selected = Math.max(0, tabs.indexOf(getStr('default-tab', 'ai')));
-        tabRow.connect('notify::selected', () => {
-            setStr('default-tab', tabs[tabRow.selected] || 'ai');
-        });
-        uiGroup.add(tabRow);
-
-        const fallbackModes = ['auto', 'datemenu', 'panel-button'];
-        const fallbackRow = new Adw.ComboRow({
-            title: '面板挂载方式与兼容回退',
-            subtitle: '日期菜单左侧双标签，右侧日历不变',
-            model: Gtk.StringList.new([
-                '自动（失败时使用独立顶栏按钮）',
-                '左侧标签嵌入日期菜单',
-                '独立顶栏按钮模式',
-            ]),
-        });
-        if (hasKey('panel-fallback-mode')) {
-            fallbackRow.selected = Math.max(0, fallbackModes.indexOf(getStr('panel-fallback-mode', 'auto')));
-            fallbackRow.connect('notify::selected', () => {
-                setStr('panel-fallback-mode', fallbackModes[fallbackRow.selected] || 'auto');
-            });
-            uiGroup.add(fallbackRow);
-        }
-
         const widthRow = new Adw.SpinRow({
             title: '面板宽度 (px)',
-            subtitle: '随问聊天区宽度（嵌入模式不改变原生通知组件）',
+            subtitle: '独立随问面板的宽度',
             adjustment: new Gtk.Adjustment({
                 lower: 340,
                 upper: 680,
@@ -911,7 +889,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const modelRoutingRow = new Adw.SwitchRow({
             title: '本地规则智能模型推荐 (可选)',
-            subtitle: '按简单问答/读文件/复杂代码/深度推理本地推荐已配置后端与模型；零额外模型请求，绝不自动开启全自动高权限',
+            subtitle: '按问题类型推荐已配置的模型',
         });
         if (hasKey('enable-model-routing')) {
             s.bind('enable-model-routing', modelRoutingRow, 'active', Gio.SettingsBindFlags.DEFAULT);
@@ -1050,8 +1028,9 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         // reliable sandbox or Quick Chat interactive approval. Leave off by
         // default and require the user to install the experimental bundle.
         const dshReviewRow = new Adw.SwitchRow({
-            title: 'DSH 智能操作 · 实验性 Auto Review',
-            subtitle: '默认关闭；仅智能模式生效。开启后原生模型审查可能允许低风险主机操作，也可能误放行；高风险拒绝而非弹窗。须自行在 DSH Headless 配置档安装 auto-review 插件。',
+            title: '旧版 DSH · 实验性 Auto Review',
+            subtitle: '仅旧版 Headless 生效，模型审核可能误判',
+            tooltip_text: '需要在 DSH Headless 配置档安装 auto-review 插件。高风险操作会被拒绝，不弹出确认。',
         });
         if (hasKey('dsh-auto-review')) {
             s.bind('dsh-auto-review', dshReviewRow, 'active', Gio.SettingsBindFlags.DEFAULT);
@@ -1068,7 +1047,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const resetSessionRow = new Adw.ActionRow({
             title: '新建空白当前会话',
-            subtitle: '立即切换至全新会话并撤销当前会话内的已授权工具范围（已有历史文件保留在磁盘中）',
+            subtitle: '开始新会话并撤销本次工具授权',
         });
         const resetSessionBtn = new Gtk.Button({
             label: '新建会话',
@@ -1088,7 +1067,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const restorePrevRow = new Adw.ActionRow({
             title: '恢复上一个会话',
-            subtitle: '轻量切回最近使用的上一条历史对话，无需展开复杂多会话侧栏',
+            subtitle: '切回最近使用的历史会话',
         });
         const restorePrevBtn = new Gtk.Button({
             label: '恢复上一会话',
@@ -1202,7 +1181,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const cleanupSessionsRow = new Adw.ActionRow({
             title: '扫描并清理超期旧会话',
-            subtitle: '按上述数量与天数上限扫描本地会话目录，列出超期项并经您确认后删除',
+            subtitle: '列出超期会话，确认后清理',
         });
         const cleanupSessionsBtn = new Gtk.Button({
             label: '扫描清理',
@@ -1360,7 +1339,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 bridgeHandshake: eff === 'zcode'
                     ? (storedMatchesBackend ? stored.bridgeHandshake : '待任务启动时验证握手')
                     : '不适用（当前非 ZCode 后端）',
-                mountMode: stored?.mountMode || getStr('panel-fallback-mode', 'auto'),
+                mountMode: stored?.mountMode || 'panel-button',
                 lastConnectionError: !sel.available
                     ? sel.reason
                     : (storedMatchesBackend ? stored.lastConnectionError : '无'),
@@ -1462,7 +1441,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const updateInstallRow = new Adw.ActionRow({
             title: '下载安装',
-            subtitle: '用户目录版本支持验证 SHA-256 后一键安装；系统 DEB 请从发布页面更新。',
+            subtitle: '用户版可在此更新，系统版请使用 DEB',
         });
         updateGroup.add(updateInstallRow);
         const installBtn = new Gtk.Button({
@@ -2018,5 +1997,6 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
 
         rebuildProviderAndModelUi();
+        tuneRows(window);
     }
 }

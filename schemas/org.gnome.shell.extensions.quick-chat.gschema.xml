@@ -130,6 +130,10 @@
       <default>['&lt;Super&gt;&lt;Shift&gt;y']</default>
       <summary>Global shortcut to open Quick Chat with clipboard content</summary>
     </key>
+    <key name="enable-experimental-capsule" type="b">
+      <default>false</default>
+      <summary>Enable the experimental non-modal quick input capsule</summary>
+    </key>
     <key name="capsule-shortcut" type="as">
       <default>['&lt;Super&gt;&lt;Shift&gt;a']</default>
       <summary>Non-modal floating Quick Chat capsule global shortcut</summary>
@@ -197,8 +201,8 @@
       <summary>Per-backend permission mode preference for Codex CLI</summary>
     </key>
     <key name="panel-fallback-mode" type="s">
-      <default>'auto'</default>
-      <summary>DateMenu integration mode (auto, datemenu, panel-button)</summary>
+      <default>'panel-button'</default>
+      <summary>Legacy panel mount preference; only the standalone button is available</summary>
     </key>
     <key name="quick-prompts-json" type="s">
       <default>''</default>

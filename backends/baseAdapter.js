@@ -1,8 +1,12 @@
 // Unified Backend Adapter Contract (Stage E).
-// Shared across ZCodeAdapter, CodexAdapter, and OpenAIAdapter.
+// Shared across the backend adapters.
 // Pure JS so adapter contract, capability guards, and mock adapters run directly in Node tests.
 
-import {getBackendCapabilities} from '../protocol.js';
+import {
+    augmentPromptWithDesktopContext,
+    buildCrossBackendPromptWithContext,
+    getBackendCapabilities,
+} from '../protocol.js';
 
 export class BaseBackendAdapter {
     constructor(backendId, {emitEvent = () => {}} = {}) {
@@ -60,6 +64,23 @@ export class BaseBackendAdapter {
         return {
             messages: [...sessionStore.messages],
             remoteSessionId: sessionStore.remoteSessionId || '',
+        };
+    }
+
+    prepareCliContext(prompt, {workspace, specialDirs, mode, assistantInstructions, allowResume = true}) {
+        const store = this._store;
+        const context = this._getSessionContextConfig();
+        // A native session ID is a cache tied to the local history revision.
+        // The local store owns edits, branches and backend-independent replay.
+        const remoteId = allowResume
+            ? store?.resolveRemoteSessionForTurn?.(this.backendId, context) ?? store?.remoteSessionId ?? ''
+            : '';
+        const desktopPrompt = augmentPromptWithDesktopContext(prompt, specialDirs, {
+            workspace, mode, assistantInstructions, isFirstTurn: !remoteId,
+        });
+        return {
+            remoteId,
+            prompt: remoteId ? desktopPrompt : buildCrossBackendPromptWithContext(store?.messages || [], desktopPrompt),
         };
     }
 

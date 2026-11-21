@@ -150,7 +150,10 @@ export class ChatController {
     }
 
     async reconnectNow({canConnect = () => true} = {}) {
-        if (this._disposed || this._busy) return null;
+        if (this._disposed || this._busy || !canConnect()) return null;
+        const generation = this._clientGeneration;
+        const isCurrent = () => !this._disposed && !this._busy &&
+            generation === this._clientGeneration && canConnect();
         if (this._cancelReconnectTimer) {
             this._cancelReconnectTimer();
             this._cancelReconnectTimer = null;
@@ -159,6 +162,7 @@ export class ChatController {
         if (prevClient) {
             try {
                 const flushed = await prevClient.request('flush_session');
+                if (!isCurrent()) return null;
                 if (!flushed?.ok || flushed?.hasUnsavedChanges) {
                     this._onConnectionError(new Error(
                         `切换后端已暂停：当前会话历史尚未保存。请先重试保存或导出（${flushed?.error || '写入未完成'}）`
@@ -166,13 +170,14 @@ export class ChatController {
                     return null;
                 }
             } catch (err) {
+                if (!isCurrent()) return null;
                 this._onConnectionError(new Error(
                     `切换后端已暂停：无法确认会话已保存（${err?.message || err}）`
                 ));
                 return null;
             }
         }
-        if (this._disposed || this._busy || this._client !== prevClient) return null;
+        if (!isCurrent() || this._client !== prevClient) return null;
         this.stopClient();
         if (!canConnect()) return null;
         return this.ensureConnected({canConnect});
@@ -313,6 +318,9 @@ export class ChatController {
 
     stopClient() {
         ++this._clientGeneration;
+        this._cancelReconnectTimer?.();
+        this._cancelReconnectTimer = null;
+        this._needsReconnect = false;
         try { this._connectCancellable?.cancel?.(); } catch (_) {}
         this._connectCancellable = null;
         this._ensurePromise = null;
@@ -327,10 +335,6 @@ export class ChatController {
     dispose() {
         this._disposed = true;
         ++this._lifecycleGeneration;
-        if (this._cancelReconnectTimer) {
-            this._cancelReconnectTimer();
-            this._cancelReconnectTimer = null;
-        }
         this.stopClient();
     }
 }

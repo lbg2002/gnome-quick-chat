@@ -6,9 +6,7 @@ import Gio from 'gi://Gio';
 import {BaseBackendAdapter} from './baseAdapter.js';
 import {resolveDesktopAssistantPrompt} from '../core/dshModelCatalog.js';
 import {
-    augmentPromptWithDesktopContext,
     buildCodexArgs,
-    buildCrossBackendPromptWithContext,
     normalizeEffectiveAgentMode,
     preparePromptWithinBudget,
 } from '../protocol.js';
@@ -76,22 +74,10 @@ export class CodexAdapter extends BaseBackendAdapter {
         const modeInfo = normalizeEffectiveAgentMode('codex', this._config?.mode || 'readonly', cliCaps);
         const effectiveMode = modeInfo.effectiveMode;
 
-        const ctxCfg = this._getSessionContextConfig();
-        const historyBeforePrompt = this._store ? [...this._store.messages] : [];
-        const remoteId = this._store
-            ? (typeof this._store.resolveRemoteSessionForTurn === 'function'
-                ? this._store.resolveRemoteSessionForTurn('codex', ctxCfg)
-                : (this._store.remoteSessionId || ''))
-            : '';
-        const promptWithDesktopEnv = augmentPromptWithDesktopContext(budgetCheck.promptText, specialDirs, {
-            isFirstTurn: !remoteId,
-            mode: effectiveMode,
-            workspace,
+        const {remoteId, prompt: effectiveCliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
+            workspace, specialDirs, mode: effectiveMode,
             assistantInstructions: resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
         });
-        const effectiveCliPrompt = (!remoteId && historyBeforePrompt.length > 0)
-            ? buildCrossBackendPromptWithContext(historyBeforePrompt, promptWithDesktopEnv)
-            : promptWithDesktopEnv;
 
         const useCodexStdin = Boolean(cliCaps?.supportsStdinPrompt !== false);
         let rawArgv = [];
