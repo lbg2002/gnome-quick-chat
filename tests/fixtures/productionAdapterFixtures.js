@@ -353,7 +353,14 @@ const serverA = http.createServer((req, res) => {
 
             let memoryAnswer = '';
             if (lastUserContent.startsWith('总结可跨会话复用')) {
-                if (lastUserContent.includes('TEST_EXPERIENCE_')) {
+                if (lastUserContent.includes('TEST_MIXED_RECEIPT')) {
+                    memoryAnswer = JSON.stringify([
+                        {scope: 'computer', name: 'MEMORY.md', markdown: '[更新](preview.md)'},
+                        {scope: 'computer', name: 'preview.md', markdown: 'Updated'},
+                        {scope: 'project', name: 'MEMORY.md', markdown: ''},
+                        {scope: 'project', name: 'preview.md', markdown: null},
+                    ]);
+                } else if (lastUserContent.includes('TEST_EXPERIENCE_')) {
                     const context = JSON.parse(lastUserContent.split('\\n').at(-1));
                     const note = context.notes['memory://computer/preview.md'];
                     const update = (name, markdown) => ({scope: 'computer', name, markdown});
@@ -385,7 +392,8 @@ const serverA = http.createServer((req, res) => {
                         lastUserContent.includes('Verified shared-memory note') ? 'stale snapshot' : '[]';
                 }
             } else if (lastUserContent.startsWith('只返回与当前任务最相关')) {
-                memoryAnswer = JSON.stringify(['memory://computer/preview.md']);
+                memoryAnswer = JSON.stringify(lastUserContent.includes('TEST_MIXED_RECEIPT')
+                    ? ['memory://computer/preview.md', 'memory://project/preview.md'] : ['memory://computer/preview.md']);
             } else if (lastUserContent.includes('TEST_MEMORY_RECALL')) {
                 memoryAnswer = lastUserContent.includes('Verified shared-memory note')
                     ? 'RECALL_OK' : 'RECALL_MISSING';

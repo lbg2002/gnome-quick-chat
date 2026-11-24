@@ -774,12 +774,16 @@ export class BackendClient {
         if (saved.length) {
             const messages = [];
             const names = kind => saved.filter(change => change.kind === kind)
-                .map(({address}) => address.split('/').at(-1)).join('、');
+                .map(({address}) => {
+                    const [, scope, name] = /^memory:\/\/(computer|project)\/(.+)$/.exec(address);
+                    return (scope === 'project' ? '项目 / ' : '电脑 / ') + name;
+                }).join('、');
             const unindexed = names('unindexed');
             const deleted = names('deleted');
             if (unindexed) messages.push('已移出索引，文件仍保留：' + unindexed);
             if (deleted) messages.push('已删除：' + deleted);
-            if (!messages.length) messages.push('记忆已提交 · ' + names('updated'));
+            const updated = names('updated');
+            if (updated) messages.push('已更新：' + updated);
             this._memoryNotice(messages.join(' · '), job, 'committed');
         } else if (!job.cancelled && /^(?:请[，, ]*)?(?:记住|忘记|忘掉|纠正记忆|remember\b|forget\b)/i.test(job.userText)) {
             this._memoryNotice('本轮未修改记忆', job, 'unchanged');
@@ -1111,7 +1115,7 @@ export class BackendClient {
                 try { memoryContext = await this._prepareMemory(job); }
                 catch (_) {
                     memoryContext = MEMORY_INSTRUCTIONS + ' 本轮未能读取已有笔记。';
-                    if (!job.cancelled) this._memoryNotice('本轮记忆读取失败');
+                    if (!job.cancelled) this._memoryNotice('本轮记忆读取失败', job, 'failed');
                 }
                 if (job.cancelled || this._closed) {
                     if (this._memoryTurn === job) this._memoryTurn = null;

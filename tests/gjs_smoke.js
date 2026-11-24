@@ -549,8 +549,8 @@ let mockHttpProc = null;
             const deletedLine = formatMemoryReceipt(receipt);
             const unindexedLine = formatMemoryReceipt(unindexed);
             assert(deletedLine.includes('forget-a') && deletedLine.includes('忘记测试笔记') &&
-                deletedLine.includes('已删除：preview.md') && unindexedLine.includes('nindex-b') &&
-                unindexedLine.includes('从索引移出测试笔记') && unindexedLine.includes('文件仍保留：preview.md'),
+                deletedLine.includes('已删除：电脑 / preview.md') && unindexedLine.includes('nindex-b') &&
+                unindexedLine.includes('从索引移出测试笔记') && unindexedLine.includes('文件仍保留：电脑 / preview.md'),
             'User-visible receipts attribute same-name notes to their original turns and actions');
             const experience = new MarkdownMemory(tmpRoot, GLib.build_filenamev([tmpRoot, 'experience']));
             memoryReader._memory = experience;
@@ -562,7 +562,8 @@ let mockHttpProc = null;
                 ['TEMPORARY', '# 偏好 B', false],
                 ['FORGET', undefined, true],
             ]) {
-                await memoryReader.request('prompt', {message: 'TEST_EXPERIENCE_' + scenario, turnId: scenario});
+                const userRequest = (scenario === 'DUPLICATE' ? '记住 ' : '') + 'TEST_EXPERIENCE_' + scenario;
+                await memoryReader.request('prompt', {message: userRequest, turnId: scenario});
                 await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === scenario);
                 for (let attempt = 0; attempt < 200 && memoryReader._memoryUpdates.size; attempt++) await sleepGjs(20);
                 const note = (await experience.recall(await experience.snapshot(),
@@ -571,7 +572,34 @@ let mockHttpProc = null;
                 assert(memoryReaderEvents.some(e => e.memoryTurnId === scenario && e.status === 'committed') === changed &&
                     !memoryReaderEvents.some(e => e.memoryTurnId === scenario && e.status === 'failed'),
                 scenario + ' expected commit receipt');
+                if (scenario === 'DUPLICATE') {
+                    assert(memoryReaderEvents.some(e => e.memoryTurnId === scenario && e.status === 'unchanged' &&
+                        e.message === '本轮未修改记忆'), 'Explicit no-op has distinct receipt');
+                } else if (scenario === 'TEMPORARY') {
+                    assert(!memoryReaderEvents.some(e => e.memoryTurnId === scenario), 'Ordinary no-op stays quiet');
+                }
             }
+            const mixed = new MarkdownMemory(tmpRoot, GLib.build_filenamev([tmpRoot, 'mixed-receipt']));
+            await mixed.edit(await mixed.snapshot(), new Map(), JSON.stringify([
+                {scope: 'computer', name: 'MEMORY.md', markdown: '[预览](preview.md) [保留](keep.md)'},
+                {scope: 'computer', name: 'preview.md', markdown: 'Before'},
+                {scope: 'computer', name: 'keep.md', markdown: 'Keep body'},
+                {scope: 'project', name: 'MEMORY.md', markdown: '[项目预览](preview.md)'},
+                {scope: 'project', name: 'preview.md', markdown: 'Delete body'},
+            ]), () => true);
+            memoryReader._memory = mixed;
+            await memoryReader.request('prompt', {message: 'TEST_MIXED_RECEIPT', turnId: 'mixed-turn'});
+            const mixedReceipt = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'mixed-turn');
+            assert(mixedReceipt.status === 'committed' && mixedReceipt.message.includes('已删除：项目 / preview.md') &&
+                mixedReceipt.message.includes('文件仍保留：电脑 / keep.md') &&
+                mixedReceipt.message.includes('已更新：电脑 / MEMORY.md、电脑 / preview.md、项目 / MEMORY.md'),
+            'Mixed receipt lists every committed change and disambiguates identical filenames');
+            GLib.file_set_contents(mixed.path('computer', 'MEMORY.md'), 'x'.repeat(9000));
+            await memoryReader.request('prompt', {message: '测试读取失败时的原问题', turnId: 'read-error'});
+            const readReceipt = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'read-error');
+            await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'read-error');
+            assert(readReceipt.status === 'failed' && formatMemoryReceipt(readReceipt).includes('测试读取失败时的原问题'),
+                'Read failure is visibly attributed to its original prompt while the main turn completes');
         } finally {
             memoryWriter.close();
             memoryReader.close();
