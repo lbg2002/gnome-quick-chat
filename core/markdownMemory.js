@@ -63,6 +63,8 @@ function ensureDirectory(path) {
     if (GLib.mkdir_with_parents(path, 0o700) !== 0) throw new Error('无法创建记忆目录');
 }
 
+export class MemoryEditError extends Error {}
+
 export class MarkdownMemory {
     constructor(workspace, root = getMemoryDirectory()) {
         this.root = root;
@@ -143,24 +145,24 @@ export class MarkdownMemory {
         const changes = new Map(edits.filter(edit => edit.scope === scope).map(edit => [edit.name, edit]));
         if (!changes.size) return;
         const currentIndex = await read(this.path(scope, INDEX));
-        if (currentIndex !== snapshot.indexes[scope]) throw new Error('记忆索引已被编辑，请读取最新索引后重试');
+        if (currentIndex !== snapshot.indexes[scope]) throw new MemoryEditError('记忆索引已被编辑，请读取最新索引后重试');
         const indexEdit = changes.get(INDEX);
         const links = topicLinks(indexEdit ? indexEdit.markdown : currentIndex);
-        if (links.size > 48) throw new Error('记忆索引最多链接 48 篇主题，请合并旧主题');
+        if (links.size > 48) throw new MemoryEditError('记忆索引最多链接 48 篇主题，请合并旧主题');
         for (const [name, edit] of changes) {
             if (name === INDEX) continue;
             if (edit.markdown === null && links.has(name)) {
-                throw new Error('删除主题时，请同时从 MEMORY.md 移除链接：' + name);
+                throw new MemoryEditError('删除主题时，请同时从 MEMORY.md 移除链接：' + name);
             }
             if (edit.markdown !== null && !links.has(name)) {
-                throw new Error('请在 MEMORY.md 添加主题的相对链接：' + name);
+                throw new MemoryEditError('请在 MEMORY.md 添加主题的相对链接：' + name);
             }
         }
         if (indexEdit) {
             for (const name of links) {
                 const target = changes.get(name);
                 if ((target ? target.markdown : await read(this.path(scope, name))) === null) {
-                    throw new Error('MEMORY.md 的主题链接没有对应文件：' + name);
+                    throw new MemoryEditError('MEMORY.md 的主题链接没有对应文件：' + name);
                 }
             }
         }
@@ -198,7 +200,7 @@ export class MarkdownMemory {
             if (encoder.encode(journal).length > MAX_JOURNAL_BYTES) throw new Error('记忆事务过长');
             await replace(this.journal, journal);
             if (await this.recover() === false) {
-                throw new Error('记忆提交遇到外部修改，待恢复内容已保存在 .conflict 文件');
+                throw new MemoryEditError('记忆提交遇到外部修改，待恢复内容已保存在 .conflict 文件');
             }
             return edits.map(({scope, name}) => `memory://${scope}/${name}`);
         });

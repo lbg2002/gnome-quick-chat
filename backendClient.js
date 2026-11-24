@@ -30,7 +30,7 @@ import {
     removeFileQuietly,
 } from './core/paths.js';
 import {inspectEndpointSecurity} from './core/secretPolicy.js';
-import {MarkdownMemory} from './core/markdownMemory.js';
+import {MarkdownMemory, MemoryEditError} from './core/markdownMemory.js';
 import {SessionStore} from './core/sessionStore.js';
 import {TurnController} from './core/turnController.js';
 import {redactSensitiveText, resolveSplitTimeouts} from './runtime/sseParser.js';
@@ -697,8 +697,10 @@ export class BackendClient {
         if (job.cancelled || event.status !== 'completed' || event.partial ||
             !job.learn || !job.snapshot || !job.answer) return;
         this._memoryUpdates.add(job);
-        enqueueMemoryUpdate(this._memory.root, () => this._updateMemory(job)).catch(() => {
-            if (!job.cancelled) this._memoryNotice('记忆更新未提交，可重新提出修改要求', job, 'failed');
+        enqueueMemoryUpdate(this._memory.root, () => this._updateMemory(job)).catch(error => {
+            if (job.cancelled) return;
+            const hint = error instanceof MemoryEditError ? error.message : '可重新提出修改要求';
+            this._memoryNotice('记忆更新未提交 · ' + hint, job, 'failed');
         }).finally(() => this._memoryUpdates.delete(job));
     }
 
