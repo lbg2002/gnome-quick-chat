@@ -4,7 +4,7 @@
 >
 > **本轮用户报告已实证：** DSH Headless 可以启动，但在 GNOME 环境里失败时仅显示“error”；还需要桌面控制专用提示词、可选 DSH 模型，以及真实主机 Bash 权限而非一直只读。对应补丁已写入 `protocol.js`、`core/dshModelCatalog.js`、`backends/dshAdapter.js`、`core/backendDetect.js`、`core/backendRegistry.js`、`prefs.js`、`extension.js`、`tests/dshAndPermissionModes.test.js`。详细验收见 README 的 DSH 部分和 [专项报告](docs/reviews/2026-11-20-dsh-desktop-integration.md)。
 >
-> **权限边界不可变：** DSH 只读=`read-only`，完全权限=`danger-full-access`（本机 Bash，仍受 GNOME/用户权限约束）；智能默认只读，仅用户显式开启实验 Auto Review 且安装官方 DSH 插件后使用 `auto`（模型审核可能误判，无实时弹窗）。Codex `exec` 无审批回传，智能必须保持只读；ZCode 智能使用已验证的 Bridge 审批。不能通过 `--no-sandbox`、提权、自然语言关键词推断的方式绕过权限。桌面程序启动需有用户明确授权，删除、改写配置和系统服务操作不得静默提权。
+> **权限边界不可变：** DSH 只读=`read-only`，完全权限=`danger-full-access`（本机 Bash，仍受 GNOME/用户权限约束）。SDK 智能使用原生审批。Headless 智能保持只读，包括旧配置开启实验 Auto Review 的情形。Codex `exec` 无审批回传，智能必须保持只读；ZCode 智能使用已验证的 Bridge 审批。不能通过 `--no-sandbox`、提权、自然语言关键词推断的方式绕过权限。桌面程序启动需有用户明确授权，删除、改写配置和系统服务操作不得静默提权。
 >
 > **模型/配置行为：** DSH Headless 没有完整 models-list API；从官方内置 `deepseek-flash` / `deepseek-v4-pro` 与 `dsh --profile headless --dump-config` 的已选模型组成建议列表（不是保证可用的在线模型）。用户选择模型与桌面 persona 使用私有临时 `--patch`，不修改 DSH 全局 profile 或凭据；ZCode/Codex 首轮注入桌面指引。故障显示 Headless `final.reason.error.code/message`，不得再吞掉具体错误。
 >

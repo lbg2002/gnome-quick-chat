@@ -1025,20 +1025,6 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             dialog.present(window);
         });
 
-        // DSH native Auto Review is a model-based approval substitute, NOT a
-        // reliable sandbox or Quick Chat interactive approval. Leave off by
-        // default and require the user to install the experimental bundle.
-        const dshReviewRow = new Adw.SwitchRow({
-            title: '旧版 DSH · 实验性 Auto Review',
-            subtitle: '仅旧版 Headless 生效，模型审核可能误判',
-            tooltip_text: '需要在 DSH Headless 配置档安装 auto-review 插件。高风险操作会被拒绝，不弹出确认。',
-        });
-        if (hasKey('dsh-auto-review')) {
-            s.bind('dsh-auto-review', dshReviewRow, 'active', Gio.SettingsBindFlags.DEFAULT);
-        }
-        dshReviewRow.visible = getEffectiveBackend() === 'dsh';
-        agentGroup.add(dshReviewRow);
-
         // --- Group 4: 隐私与本地历史管理 ---
         const privacyGroup = new Adw.PreferencesGroup({
             title: '隐私与本地会话存储',
@@ -1618,7 +1604,6 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 syncingWorkspace = false;
             }
             workspaceRow.sensitive = eff === 'zcode' || eff === 'codex' || eff === 'dsh';
-            dshReviewRow.visible = eff === 'dsh';
             refreshMemoryRow();
 
             modeRow.sensitive = caps.supportsTools;

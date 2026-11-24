@@ -1122,17 +1122,9 @@ export default class QuickChat extends Extension {
         const eff = selection?.effectiveBackend || 'unconfigured';
         const config = this._registry.buildRuntimeConfig(eff, {apiKey});
 
-        if (config.workspace && config.workspace.endsWith('/gnome-quick-chat/workspace')) {
-            this._settings.set_string('workspace', '');
-            config.workspace = '';
-        }
-
         const workspace = resolveWorkspacePath(config.workspace);
-        if (!GLib.file_test(workspace, GLib.FileTest.IS_DIR)) {
-            GLib.mkdir_with_parents(workspace, 0o700);
-        }
-        if (!GLib.file_test(workspace, GLib.FileTest.IS_DIR)) {
-            throw new Error('配置的工作目录不存在');
+        if (!GLib.path_is_absolute(workspace) || !GLib.file_test(workspace, GLib.FileTest.IS_DIR)) {
+            throw new Error(`工作目录必须是已存在的绝对路径：${workspace}`);
         }
 
         let sessionId = this._getSettingString('session-id', '');

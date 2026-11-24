@@ -238,16 +238,10 @@ export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly',
     if (backend === 'dsh' && mode === 'smart' && cliCaps?.dshSdk === true) {
         return {effectiveMode: 'smart', downgradedFromChat: false, notice: 'DSH SDK：只读沙箱，按原生请求弹窗授权单次操作。'};
     }
-    if (backend === 'dsh' && mode === 'smart' && cliCaps?.enableAutoReview === true) {
-        return {
-            effectiveMode: 'smart', downgradedFromChat: false,
-            notice: '已使用 DSH 实验性 Auto Review（独立模型审核工具调用）。低风险操作可能直接在主机执行，高风险会被拒绝而非弹窗；请确保已在 DSH headless profile 安装 auto-review 插件。',
-        };
-    }
     if (backend === 'dsh' && (mode === 'smart' || mode === 'chat')) {
         return {
             effectiveMode: 'readonly', downgradedFromChat: mode === 'chat',
-            notice: 'DSH Headless 无随问弹窗审批。未启用实验 Auto Review 时，智能模式保持只读；桌面操作需明确选择授权模式。',
+            notice: 'DSH Headless 无随问弹窗审批。智能模式保持只读。',
         };
     }
     if (backend === 'codex' && mode === 'smart') {
@@ -642,12 +636,7 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
  */
 export function buildDshArgs(config, resumeSessionId = '', {overlayPath = ''} = {}) {
     const executable = String(config?.executable || 'dsh').trim() || 'dsh';
-    const {effectiveMode} = normalizeEffectiveAgentMode(
-        'dsh', config?.mode || 'readonly',
-        {enableAutoReview: config?.dshAutoReview === true}
-    );
-    const preset = effectiveMode === 'full' ? 'danger-full-access'
-        : effectiveMode === 'smart' ? 'auto' : 'read-only';
+    const preset = config?.mode === 'full' ? 'danger-full-access' : 'read-only';
     if (overlayPath && (!overlayPath.startsWith('/') ||
         overlayPath.includes('\u0000') || overlayPath.includes('\n'))) {
         throw new Error('DSH 临时配置补丁路径无效');

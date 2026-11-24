@@ -118,9 +118,9 @@ test('DSH: headless CLI invocation passes prompt only on stdin and isolates perm
     const smartEnabled = buildDshArgs({executable:'dsh',mode:'smart',dshAutoReview:true},'',{
         overlayPath:'/tmp/qc-dsh-overlay.yml',
     });
-    assert.equal(smartEnabled[smartEnabled.indexOf('--permission-mode')+1], 'auto');
+    assert.equal(smartEnabled[smartEnabled.indexOf('--permission-mode')+1], 'read-only');
     assert.equal(smartEnabled[smartEnabled.indexOf('--patch')+1], '/tmp/qc-dsh-overlay.yml');
-    assert.equal(normalizeEffectiveAgentMode('dsh','smart',{enableAutoReview:true}).effectiveMode,'smart');
+    assert.equal(normalizeEffectiveAgentMode('dsh','smart',{enableAutoReview:true}).effectiveMode,'readonly');
     assert.throws(() => buildDshArgs({mode:'full'},'',{overlayPath:'../../evil.yml'}));
     assert.ok(full.includes('session-123'));
 });
