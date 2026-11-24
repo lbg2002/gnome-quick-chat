@@ -129,6 +129,9 @@ export function releaseCardRuntimeReferences(card, {clearTimer = null} = {}) {
         card.toolNodes = [];
     }
     try { card.dirtyToolNodeIds?.clear?.(); } catch (_) {}
+    if (card.detailDrawer && card.detailDrawer.get_parent?.() !== card.traceBox) {
+        try { card.detailDrawer.destroy?.(); } catch (_) {}
+    }
     if (card.box) {
         try { card.box.remove_all_transitions?.(); } catch (_) {}
         try { card.box.destroy?.(); } catch (_) {}

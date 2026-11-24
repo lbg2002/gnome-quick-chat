@@ -398,6 +398,16 @@ export class ChatPanelView {
         this.buildEmptyState();
         this._buildContextAndSlashBars();
 
+        this.approvalSlot = new St.BoxLayout({orientation: V, x_expand: true});
+        const approvalScroll = new St.ScrollView({
+            style_class: 'qc-approval-scroll',
+            x_expand: true,
+            overlay_scrollbars: true,
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+        });
+        approvalScroll.set_child(this.approvalSlot);
+        this.chatBox.add_child(approvalScroll);
         const inputRow = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-input-row',

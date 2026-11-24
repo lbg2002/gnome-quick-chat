@@ -151,6 +151,7 @@ export default class QuickChat extends Extension {
             this._tracePanel = new TracePanelController({
                 copyWithFeedback: (btn, getTextFn, defaultLabel) =>
                     this._cardFactory?.copyWithFeedback(btn, getTextFn, defaultLabel),
+                getApprovalSlot: card => card === this._live ? this._panel?.approvalSlot : null,
                 onSubmitToolDecision: (card, decision, alwaysAllow) =>
                     this._submitActiveToolDecision(card, decision, alwaysAllow),
                 onSubmitQuestionDecision: (card, action) =>

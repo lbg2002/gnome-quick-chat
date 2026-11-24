@@ -80,8 +80,8 @@ export class MessageCardFactory {
         );
         const placeholderText = pendingNode
             ? (pendingNode.isQuestion
-                ? '请在上方问题卡片中选择或输入您的回答…'
-                : '请在上方展开的审批栏中选择是否允许执行…')
+                ? '请在输入框旁的问题卡片中选择或输入您的回答…'
+                : '请在输入框旁的审批栏中选择是否允许执行…')
             : card.activeTool
                 ? `正在执行 ${card.toolNodes?.at(-1)?.toolName || '工具'}…`
                 : card.thinking

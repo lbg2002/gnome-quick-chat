@@ -51,10 +51,12 @@ export function createWrapLabel(text, style = '') {
 export class TracePanelController {
     constructor({
         copyWithFeedback,
+        getApprovalSlot = null,
         onSubmitToolDecision,
         onSubmitQuestionDecision,
     }) {
         this._copyWithFeedback = copyWithFeedback;
+        this._getApprovalSlot = getApprovalSlot;
         this._onSubmitToolDecision = onSubmitToolDecision;
         this._onSubmitQuestionDecision = onSubmitQuestionDecision;
     }
@@ -697,6 +699,17 @@ export class TracePanelController {
         card.dirtyToolNodeIds.clear();
         card.allToolDotsDirty = false;
 
+        const pending = tools.filter(node => node.status === 'pending_approval' || node.status === 'sending_approval');
+        const slot = this._getApprovalSlot?.(card);
+        if (slot && pending.length && !pending.some(node => node.id === card.selectedNodeId)) {
+            card.selectedNodeId = pending[0].id;
+        }
+        const parent = slot && pending.length ? slot : card.traceBox;
+        if (slot && pending.length) this.ensureCardDetailDrawer(card);
+        if (card.detailDrawer && card.detailDrawer.get_parent() !== parent) {
+            card.detailDrawer.get_parent()?.remove_child(card.detailDrawer);
+            parent.add_child(card.detailDrawer);
+        }
         this.updateTraceHint(card);
 
         const selId = card.selectedNodeId;
