@@ -156,6 +156,27 @@ test('R7.2: Concurrent same-name tools, duplicate tool_execution_end, and tool_e
     assert.equal(card.toolNodes[1].status, 'running');
 });
 
+test('DSH individual results agree across protocol, controller and trace', () => {
+    const turns = new TurnController(() => {});
+    const turn = turns.beginTurn({turnId: 'dsh-results', sessionId: 'sess_r7'});
+    const card = createMockCard();
+    for (const [wireStatus, outcome, status] of [
+        ['failed', 'failed', 'error'],
+        ['error', 'failed', 'error'],
+        ['completed', 'succeeded', 'done'],
+        ['unexpected', 'unknown', 'unknown'],
+    ]) {
+        const start = normalizeEvent('dsh', {type: 'tool_call', callId: wireStatus, tool: 'Probe'});
+        turns.recordToolStart(turn, start);
+        applyToolTraceEventToCard(card, start, {activeTurn: turn});
+        const end = normalizeEvent('dsh', {type: 'tool_result', callId: wireStatus, status: wireStatus});
+        assert.equal(end.executionOutcome, outcome);
+        assert.equal(end.isError, outcome === 'failed');
+        assert.equal(turns.recordToolEnd(turn, end).status, status);
+        assert.equal(applyToolTraceEventToCard(card, end, {activeTurn: turn}).node.status, status);
+    }
+});
+
 test('R7.3: Cross-batch tool_batch_end only modifies explicit IDs, never infers all tools succeeded on missing IDs, and uses unknown for unconfirmed batch ends', () => {
     const turns = new TurnController(() => {});
     const turn = turns.beginTurn({turnId: 'turn_r7_3', sessionId: 'sess_r7'});
@@ -200,6 +221,13 @@ test('R7.3: Cross-batch tool_batch_end only modifies explicit IDs, never infers 
 
     assert.equal(card.toolNodes[2].status, 'running');
     assert.equal(computeToolDotVisualState(card.toolNodes[2]).colorClass, 'qc-dot-tool-running');
+
+    const batch2End = {type: 'tool_batch_end', toolCallIds: ['t_batch2_c'],
+        statusById: {t_batch2_c: 'failed'}, allSucceeded: true};
+    turns.recordToolBatchEnd(turn, batch2End);
+    applyToolTraceEventToCard(card, batch2End, {activeTurn: turn});
+    assert.equal(turn.toolExecutions.get('t_batch2_c').status, 'error');
+    assert.equal(card.toolNodes[2].status, 'error');
 });
 
 test('R7.4: Result arriving before permission_resolved ACK, parallel approvals, and cancellation in intermediate states', () => {

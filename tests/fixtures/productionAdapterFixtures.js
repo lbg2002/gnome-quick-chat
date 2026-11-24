@@ -499,12 +499,20 @@ function respond() {
         };
         tool('same-1', 'started');
         tool('same-2', 'started');
-        tool('same-2', 'result', 'error');
+        tool('same-2', 'result', backend === 'dsh' ? 'failed' : 'error');
         tool('same-1', 'result', 'completed');
         tool('same-1', 'result', 'completed');
         tool('unknown', 'result', undefined, 'Uncertain');
         tool('unfinished', 'started', undefined, 'Unfinished');
         tool('', 'result', 'completed', 'MissingId');
+        if (backend === 'zcode') {
+            tool('batch-failed', 'started', undefined, 'BatchFailure');
+            tool('batch-unknown', 'started', undefined, 'BatchUnconfirmed');
+            emit({type: 'tool.updated', payload: {
+                kind: 'batch', toolCallIds: ['batch-failed', 'batch-unknown'],
+                statusById: {'batch-failed': 'failed', 'missing-start': 'completed'},
+            }});
+        }
         tool('secret', 'result', 'completed', 'sk-testsecret123456789');
         for (let index = 0; index < 20; index++) tool('extra-' + index, 'result', 'completed', 'Extra');
     }

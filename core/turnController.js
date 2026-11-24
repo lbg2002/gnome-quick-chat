@@ -7,6 +7,8 @@
  *   -> completed | cancelled | failed | interrupted | timed_out
  */
 
+import {getToolBatchStatus, getToolEndStatus} from '../protocol.js';
+
 export const TURN_STATES = Object.freeze([
     'idle',
     'starting',
@@ -373,7 +375,7 @@ export class TurnController {
                     turn.activeToolIds.delete(toolCallId);
                 } else if (toolEntry.status === 'pending_approval' || toolEntry.status === 'sending_approval') {
                     if (toolEntry.earlyExecutionEnd) {
-                        toolEntry.status = toolEntry.earlyExecutionEnd.isError ? 'error' : 'done';
+                        toolEntry.status = toolEntry.earlyExecutionEnd.status;
                         turn.activeToolIds.delete(toolCallId);
                     } else {
                         toolEntry.status = 'running';
@@ -514,8 +516,8 @@ export class TurnController {
     recordToolEnd(turn, event = {}) {
         if (!this.isCurrent(turn)) return null;
         const explicitId = String(event.toolCallId || event.requestId || '').trim();
-        const isError = Boolean(event.isError);
-        const nextStatus = isError ? 'error' : 'done';
+        const nextStatus = getToolEndStatus(event);
+        const isError = nextStatus === 'error';
 
         if (!explicitId) {
             const orphanId = `unmatched_end_${++turn.anonToolSeq}`;
@@ -562,7 +564,7 @@ export class TurnController {
                 entry.duration = event.duration;
             }
             entry.earlyExecutionEnd = {
-                isError,
+                status: nextStatus,
                 detail: entry.detail || '',
                 duration: entry.duration || 0,
             };
@@ -596,32 +598,8 @@ export class TurnController {
             if (!entry) continue;
             turn.activeToolIds.delete(id);
             if (entry.status === 'running') {
-                const perIdStatus = event.statusById && typeof event.statusById === 'object'
-                    ? String(event.statusById[id] || '')
-                    : '';
-                const batchStatus = String(event.batchStatus || '');
-                if (
-                    perIdStatus === 'done' ||
-                    perIdStatus === 'completed' ||
-                    perIdStatus === 'success' ||
-                    event.allSucceeded === true ||
-                    batchStatus === 'done' ||
-                    batchStatus === 'completed'
-                ) {
-                    entry.status = 'done';
-                } else if (
-                    perIdStatus === 'error' ||
-                    perIdStatus === 'failed' ||
-                    batchStatus === 'error' ||
-                    batchStatus === 'failed'
-                ) {
-                    entry.status = 'error';
-                    entry.isError = true;
-                } else if (perIdStatus === 'interrupted' || batchStatus === 'interrupted') {
-                    entry.status = 'interrupted';
-                } else {
-                    entry.status = 'unknown';
-                }
+                entry.status = getToolBatchStatus(event, id);
+                entry.isError = entry.status === 'error';
                 updated.push(entry);
             }
         }

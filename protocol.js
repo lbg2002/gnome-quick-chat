@@ -958,6 +958,32 @@ export function parseOpenAISSELine(line) {
     }
 }
 
+function terminalToolStatus(status) {
+    if (['done', 'completed', 'success'].includes(status)) return 'done';
+    if (['error', 'failed'].includes(status)) return 'error';
+    if (status === 'interrupted') return 'interrupted';
+    return null;
+}
+
+export function getToolEndStatus(event) {
+    switch (event.executionOutcome) {
+        case 'succeeded': return 'done';
+        case 'failed': return 'error';
+        case 'interrupted': return 'interrupted';
+        case 'unknown': return 'unknown';
+        default: return event.isError ? 'error' : 'done';
+    }
+}
+
+export function getToolBatchStatus(event, id, {individualOnly = false} = {}) {
+    if (event.statusById && Object.hasOwn(event.statusById, id)) {
+        const status = terminalToolStatus(event.statusById[id]);
+        if (status) return status;
+    }
+    if (individualOnly) return null;
+    return event.allSucceeded === true ? 'done' : terminalToolStatus(event.batchStatus) || 'unknown';
+}
+
 export function normalizeEvent(backend, record) {
     if (!record || typeof record !== 'object') return null;
 
@@ -1233,20 +1259,22 @@ export function normalizeEvent(backend, record) {
                             ? {rawArguments: record.input.slice(0, 4096)}
                             : null),
                 };
-            case 'tool_result':
+            case 'tool_result': {
+                const status = terminalToolStatus(record.status);
                 return {
                     type: 'tool_execution_end',
                     toolCallId: String(record.callId || ''),
                     toolName: '工具',
-                    isError: record.status === 'error',
-                    executionOutcome: ['error', 'failed'].includes(record.status) ? 'failed'
-                        : ['completed', 'success'].includes(record.status) ? 'succeeded' : 'unknown',
+                    isError: status === 'error',
+                    executionOutcome: status === 'error' ? 'failed'
+                        : status === 'done' ? 'succeeded' : status || 'unknown',
                     detail: String(
                         record.error?.reason || record.error?.message ||
                         record.result || record.error?.code || ''
                     ).slice(0, 2048),
                     ...(record.error?.code ? {errorCode: String(record.error.code).slice(0, 96)} : {}),
                 };
+            }
             case 'final': {
                 // DSH's durable final.reason is a structured turn/end reason
                 // ({kind:'completed'}), not a bare string. Fail closed for any

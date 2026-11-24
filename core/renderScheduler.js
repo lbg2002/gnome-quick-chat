@@ -2,7 +2,7 @@
  * Pure-JS Unified Render Scheduler, Tool Dot Differ/Folder, UI Buffer Capper,
  * and Windowed History Actor Controller (Stage D2 & D3, zero GJS dependencies).
  */
-import {formatAskUserAnswerSummary, isSideEffectingToolExecution} from '../protocol.js';
+import {formatAskUserAnswerSummary, getToolBatchStatus, getToolEndStatus, isSideEffectingToolExecution} from '../protocol.js';
 import {extractUserQuestionAndAttachmentsFromPrompt} from './attachmentManager.js';
 
 const UTF8_ENCODER = new TextEncoder();
@@ -451,7 +451,7 @@ export function applyToolTraceEventToCard(card, event, {
             } else {
                 if (node.status !== 'done' && node.status !== 'error') {
                     if (node.earlyExecutionEnd) {
-                        node.status = node.earlyExecutionEnd.isError ? 'error' : 'done';
+                        node.status = node.earlyExecutionEnd.status;
                     } else {
                         node.status = 'running';
                     }
@@ -538,12 +538,12 @@ export function applyToolTraceEventToCard(card, event, {
                 node.duration = event.duration;
             }
             if (!isAlreadyFinal) {
+                node.status = getToolEndStatus(event);
                 node.earlyExecutionEnd = {
-                    isError: Boolean(event.isError),
+                    status: node.status,
                     detail: node.detail || '',
                     duration: node.duration || 0,
                 };
-                node.status = event.isError ? 'error' : 'done';
             }
             markDirty(node);
         }
@@ -560,31 +560,7 @@ export function applyToolTraceEventToCard(card, event, {
             const confirmedIds = new Set(ids);
             for (const node of card.toolNodes) {
                 if (node.status === 'running' && node.toolCallId && confirmedIds.has(node.toolCallId)) {
-                    const perIdStatus = event.statusById && typeof event.statusById === 'object'
-                        ? String(event.statusById[node.toolCallId] || '')
-                        : '';
-                    const batchStatus = String(event.batchStatus || '');
-                    if (
-                        perIdStatus === 'done' ||
-                        perIdStatus === 'completed' ||
-                        perIdStatus === 'success' ||
-                        event.allSucceeded === true ||
-                        batchStatus === 'done' ||
-                        batchStatus === 'completed'
-                    ) {
-                        node.status = 'done';
-                    } else if (
-                        perIdStatus === 'error' ||
-                        perIdStatus === 'failed' ||
-                        batchStatus === 'error' ||
-                        batchStatus === 'failed'
-                    ) {
-                        node.status = 'error';
-                    } else if (perIdStatus === 'interrupted' || batchStatus === 'interrupted') {
-                        node.status = 'interrupted';
-                    } else {
-                        node.status = 'unknown';
-                    }
+                    node.status = getToolBatchStatus(event, node.toolCallId);
                     markDirty(node);
                 }
             }

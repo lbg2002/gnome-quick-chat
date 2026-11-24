@@ -714,9 +714,9 @@ let mockHttpProc = null;
             await runMemoryTurn(backend, sharedMemory, 'evidence-' + backend, 'TEST_TOOL_EVIDENCE',
                 {expectReview: true, injectForeignTool: true});
             const last = JSON.parse(Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').at(-1));
-            const {toolEvidence, assistantReport} = last.evidence;
+            const {toolEvidence, toolEvidenceIncomplete, assistantReport} = last.evidence;
             const encoded = JSON.stringify(toolEvidence);
-            assert(toolEvidence.length === 8 && Encoder.encode(encoded).length <= 1024,
+            assert(toolEvidence.length === 8 && Encoder.encode(encoded).length <= 1024 && toolEvidenceIncomplete === true,
                 backend + ' maintains the count and byte budgets');
             assert(toolEvidence.filter(entry => entry.tool === 'Probe').length === 2 &&
                 toolEvidence.some(entry => entry.tool === 'Probe' && entry.outcome === 'succeeded') &&
@@ -725,13 +725,21 @@ let mockHttpProc = null;
             assert(toolEvidence.some(entry => entry.outcome === 'unknown' && entry.endObserved) &&
                 toolEvidence.some(entry => entry.outcome === 'unknown' && !entry.endObserved),
                 backend + ' reports both unknown outcome and unobserved termination');
+            if (backend === 'zcode') {
+                assert(toolEvidence.some(entry => entry.tool === 'BatchFailure' &&
+                        entry.endObserved && entry.outcome === 'failed') &&
+                    toolEvidence.some(entry => entry.tool === 'BatchUnconfirmed' &&
+                        !entry.endObserved && entry.outcome === 'unknown'),
+                'Only a per-call batch result supplies terminal evidence');
+            }
             assert(!/MissingId|WrongTurn|test-secret|testsecret|raw stdout|same-1/.test(encoded) &&
                 assistantReport === 'CLI main turn' && !Object.hasOwn(last.evidence, 'goalEvidence'),
                 backend + ' separates assistant claims, execution evidence and goal evidence');
             await runMemoryTurn(backend, sharedMemory, 'without-evidence-' + backend, 'TEST_CLEAN_TURN',
                 {expectReview: true, priorBrowserReceipt: true});
             const clean = JSON.parse(Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').at(-1));
-            assert(clean.evidence.toolEvidence.length === 0, backend + ' does not carry evidence into another turn');
+            assert(clean.evidence.toolEvidence.length === 0 && clean.evidence.toolEvidenceIncomplete === false,
+                backend + ' does not carry evidence or its truncation marker into another turn');
             assert(!JSON.stringify(clean.evidence).includes('open_default_browser'),
                 backend + ' never attributes an earlier browser action to a new question');
             await runMemoryTurn(backend, sharedMemory, 'excluded-evidence-' + backend, 'TEST_TOOL_EVIDENCE',
