@@ -528,6 +528,16 @@ let mockHttpProc = null;
             assert(!(await sharedMemory.snapshot()).notes.has('memory://computer/preview.md') &&
                 !GLib.file_test(sharedMemory.path('computer', 'preview.md'), GLib.FileTest.EXISTS),
                 'Forgetting commits both note deletion and index update');
+            await memoryReader.request('prompt', {message: 'TEST_MEMORY_FAIL', turnId: 'fail-a'});
+            await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'fail-a');
+            await memoryReader.request('prompt', {message: 'TEST_MEMORY_WRITE', turnId: 'commit-b'});
+            await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'commit-b');
+            assert(!memoryReaderEvents.some(e => e.memoryTurnId === 'fail-a'), 'B is queued before A fails');
+            const failure = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'fail-a');
+            const success = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'commit-b');
+            assert(failure.status === 'failed' && success.status === 'committed' &&
+                (await sharedMemory.snapshot()).notes.has('memory://computer/preview.md'),
+            'A fails independently and B actually writes its topic');
         } finally {
             memoryWriter.close();
             memoryReader.close();

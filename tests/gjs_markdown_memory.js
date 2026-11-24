@@ -87,6 +87,39 @@ try {
     assert(archive && new TextDecoder().decode(GLib.file_get_contents(root + '/' + archive)[1]) === journal,
         'Prepared changes preserved for manual recovery');
 
+    const invalidUtf8 = Uint8Array.of(0xC3, 0x28);
+    for (const manual of ['x'.repeat(9000), invalidUtf8]) {
+        GLib.file_set_contents(computer.journal, journal);
+        GLib.file_set_contents(projectPath, manual);
+        assert((await otherWorkspace.snapshot()).notes.has(topic), 'Unreadable project note is isolated');
+        const actual = GLib.file_get_contents(projectPath)[1];
+        const expected = typeof manual === 'string' ? new TextEncoder().encode(manual) : manual;
+        assert(actual.length === expected.length && actual.every((byte, index) => byte === expected[index]),
+            'Oversized or invalid UTF-8 manual note preserved byte for byte');
+        assert(!GLib.file_test(computer.journal, GLib.FileTest.EXISTS), 'Unreadable note detached the journal');
+    }
+    for (const damaged of ['{broken', invalidUtf8, JSON.stringify({
+        projectId: computer.projectId, edits: [{...edits[3], name: '../outside.md', before: null}],
+    })]) {
+        GLib.file_set_contents(computer.journal, damaged);
+        assert((await otherWorkspace.snapshot()).notes.has(topic), 'Malformed journal does not block readers');
+        assert(!GLib.file_test(computer.journal, GLib.FileTest.EXISTS), 'Malformed journal detached');
+    }
+    const archived = Gio.File.new_for_path(root).enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+    const invalidLogs = [];
+    const conflictLogs = [];
+    for (let item; (item = archived.next_file(null));) {
+        const name = item.get_name();
+        if (name.startsWith('.invalid-')) invalidLogs.push(name);
+        else if (name.startsWith('.conflict-')) conflictLogs.push(name);
+    }
+    archived.close(null);
+    assert(invalidLogs.length === 3 && conflictLogs.length === 3, 'All original journal data retained');
+    assert(invalidLogs.some(name => {
+        const bytes = GLib.file_get_contents(root + '/' + name)[1];
+        return bytes.length === invalidUtf8.length && bytes.every((byte, index) => byte === invalidUtf8[index]);
+    }), 'Invalid UTF-8 journal archived byte for byte');
+
     await computer.edit(await computer.snapshot(), current, JSON.stringify([
         {...edits[0], markdown: ''}, {...edits[1], markdown: null},
     ]), () => true);

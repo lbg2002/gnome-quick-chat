@@ -85,22 +85,44 @@ export class MarkdownMemory {
         return GLib.build_filenamev([directory, name]);
     }
 
+    archiveJournal(kind) {
+        const archive = GLib.build_filenamev([this.root, '.' + kind + '-' + GLib.uuid_string_random()]);
+        Gio.File.new_for_path(this.journal).move(Gio.File.new_for_path(archive),
+            Gio.FileCopyFlags.NOFOLLOW_SYMLINKS, null, null);
+        return false;
+    }
+
     async recover() {
         this.path('computer', INDEX);
-        const pending = await read(this.journal, MAX_JOURNAL_BYTES);
-        if (pending === null) return;
-        const {projectId, edits} = JSON.parse(pending);
-        const pendingEdits = [];
-        for (const {scope, name, before, markdown} of edits) {
-            const path = this.path(scope, name, projectId);
-            const current = await read(path);
-            if (current === markdown) continue;
-            if (current !== before) {
-                const archive = GLib.build_filenamev([this.root, '.conflict-' + GLib.uuid_string_random()]);
-                Gio.File.new_for_path(this.journal).move(Gio.File.new_for_path(archive),
-                    Gio.FileCopyFlags.NONE, null, null);
-                return false;
+        let entries;
+        try {
+            const pending = await read(this.journal, MAX_JOURNAL_BYTES);
+            if (pending === null) return;
+            const {projectId, edits} = JSON.parse(pending);
+            if (typeof projectId !== 'string' || !/^[a-f0-9]{64}$/.test(projectId) ||
+                !Array.isArray(edits) || !edits.length || edits.length > MAX_CHANGES ||
+                edits.some(edit => !edit || !SCOPES.includes(edit.scope) ||
+                    typeof edit.name !== 'string' || !TOPIC.test(edit.name) ||
+                    [edit.before, edit.markdown].some(value => value !== null &&
+                        (typeof value !== 'string' || value.includes('\0') || encoder.encode(value).length > MAX_NOTE_BYTES))) ||
+                new Set(edits.map(({scope, name}) => scope + '/' + name)).size !== edits.length) {
+                throw new Error('无效的记忆事务');
             }
+            entries = edits.map(({scope, name, before, markdown}) => ({scope, name, before, markdown, projectId}));
+        } catch (_) {
+            return this.archiveJournal('invalid');
+        }
+        const pendingEdits = [];
+        for (const {scope, name, before, markdown, projectId} of entries) {
+            let path, current;
+            try {
+                path = this.path(scope, name, projectId);
+                current = await read(path);
+            } catch (_) {
+                return this.archiveJournal('conflict');
+            }
+            if (current === markdown) continue;
+            if (current !== before) return this.archiveJournal('conflict');
             pendingEdits.push({path, markdown});
         }
         for (const {path, markdown} of pendingEdits) {
@@ -200,7 +222,7 @@ export class MarkdownMemory {
             if (encoder.encode(journal).length > MAX_JOURNAL_BYTES) throw new Error('记忆事务过长');
             await replace(this.journal, journal);
             if (await this.recover() === false) {
-                throw new MemoryEditError('记忆提交遇到外部修改，待恢复内容已保存在 .conflict 文件');
+                throw new MemoryEditError('记忆提交遇到冲突或损坏，待恢复内容已归档');
             }
             return edits.map(({scope, name}) => `memory://${scope}/${name}`);
         });

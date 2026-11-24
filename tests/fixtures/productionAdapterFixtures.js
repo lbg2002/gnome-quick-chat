@@ -353,7 +353,9 @@ const serverA = http.createServer((req, res) => {
 
             let memoryAnswer = '';
             if (lastUserContent.startsWith('总结可跨会话复用')) {
-                if (lastUserContent.includes('TEST_MEMORY_FORGET')) {
+                if (lastUserContent.includes('TEST_MEMORY_FAIL')) {
+                    memoryAnswer = 'invalid model response';
+                } else if (lastUserContent.includes('TEST_MEMORY_FORGET')) {
                     memoryAnswer = JSON.stringify([
                         {scope: 'computer', name: 'MEMORY.md', markdown: ''},
                         {scope: 'computer', name: 'preview.md', markdown: null},
@@ -380,7 +382,7 @@ const serverA = http.createServer((req, res) => {
                         delta: {content: memoryAnswer}, finish_reason: 'stop'}]}) + '\\n\\n');
                     res.end('data: [DONE]\\n\\n');
                 };
-                if (lastUserContent.startsWith('总结可跨会话复用') && lastUserContent.includes('TEST_MEMORY_FORGET')) {
+                if (lastUserContent.startsWith('总结可跨会话复用') && /TEST_MEMORY_(?:FORGET|FAIL)/.test(lastUserContent)) {
                     setTimeout(replyMemory, 900);
                 } else replyMemory();
                 return;
