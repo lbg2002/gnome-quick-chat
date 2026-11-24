@@ -353,10 +353,20 @@ const serverA = http.createServer((req, res) => {
 
             let memoryAnswer = '';
             if (lastUserContent.startsWith('总结可跨会话复用')) {
-                memoryAnswer = lastUserContent.includes('TEST_MEMORY_WRITE') ? JSON.stringify([
-                    {scope: 'computer', name: 'MEMORY.md', markdown: '[测试笔记](preview.md)'},
-                    {scope: 'computer', name: 'preview.md', markdown: 'Verified shared-memory note'},
-                ]) : '[]';
+                if (lastUserContent.includes('TEST_MEMORY_FORGET')) {
+                    memoryAnswer = JSON.stringify([
+                        {scope: 'computer', name: 'MEMORY.md', markdown: ''},
+                        {scope: 'computer', name: 'preview.md', markdown: null},
+                    ]);
+                } else if (lastUserContent.includes('TEST_MEMORY_WRITE')) {
+                    memoryAnswer = JSON.stringify([
+                        {scope: 'computer', name: 'MEMORY.md', markdown: '[测试笔记](preview.md)'},
+                        {scope: 'computer', name: 'preview.md', markdown: 'Verified shared-memory note'},
+                    ]);
+                } else {
+                    memoryAnswer = lastUserContent.includes('TEST_MEMORY_AFTER_FORGET') &&
+                        lastUserContent.includes('Verified shared-memory note') ? 'stale snapshot' : '[]';
+                }
             } else if (lastUserContent.startsWith('只返回与当前任务最相关')) {
                 memoryAnswer = JSON.stringify(['memory://computer/preview.md']);
             } else if (lastUserContent.includes('TEST_MEMORY_RECALL')) {
@@ -364,10 +374,15 @@ const serverA = http.createServer((req, res) => {
                     ? 'RECALL_OK' : 'RECALL_MISSING';
             }
             if (memoryAnswer) {
-                res.writeHead(200, {'Content-Type': 'text/event-stream'});
-                res.write('data: ' + JSON.stringify({choices: [{index: 0,
-                    delta: {content: memoryAnswer}, finish_reason: 'stop'}]}) + '\\n\\n');
-                res.end('data: [DONE]\\n\\n');
+                const replyMemory = () => {
+                    res.writeHead(200, {'Content-Type': 'text/event-stream'});
+                    res.write('data: ' + JSON.stringify({choices: [{index: 0,
+                        delta: {content: memoryAnswer}, finish_reason: 'stop'}]}) + '\\n\\n');
+                    res.end('data: [DONE]\\n\\n');
+                };
+                if (lastUserContent.startsWith('总结可跨会话复用') && lastUserContent.includes('TEST_MEMORY_FORGET')) {
+                    setTimeout(replyMemory, 900);
+                } else replyMemory();
                 return;
             }
 

@@ -1982,7 +1982,7 @@ export default class QuickChat extends Extension {
         this._capsule?.recordEvent(event);
 
         if (event.type === 'memory_notice') {
-            if (!activeTurn) this._panel?.setStatusIndicator('ready', event.message);
+            this._panel?.setMemoryReceipt(event.message);
             return;
         }
 

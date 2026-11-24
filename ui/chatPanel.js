@@ -398,6 +398,9 @@ export class ChatPanelView {
         this.buildEmptyState();
         this._buildContextAndSlashBars();
 
+        this._memoryReceipt = createWrapLabel('', 'qc-inline-banner');
+        this._memoryReceipt.hide();
+        this.chatBox.add_child(this._memoryReceipt);
         this.approvalSlot = new St.BoxLayout({orientation: V, x_expand: true});
         const approvalScroll = new St.ScrollView({
             style_class: 'qc-approval-scroll',
@@ -442,6 +445,12 @@ export class ChatPanelView {
         inputRow.add_child(this._sendButton);
         inputRow.add_child(this._stopButton);
         this.chatBox.add_child(inputRow);
+    }
+
+    setMemoryReceipt(message) {
+        if (!this._memoryReceipt) return;
+        this._memoryReceipt.text = message;
+        this._memoryReceipt.visible = Boolean(message);
     }
 
     _buildContextAndSlashBars() {
@@ -1605,6 +1614,7 @@ export class ChatPanelView {
     }
 
     clearMessages({buildEmpty = true} = {}) {
+        this.setMemoryReceipt('');
         for (const c of this.mountedCards) {
             this._cardFactory.destroyCardActor(c);
         }

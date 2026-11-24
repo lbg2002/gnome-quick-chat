@@ -505,6 +505,20 @@ let mockHttpProc = null;
             }
             assert(memoryReaderEvents.some(event => event.message?.content?.some?.(part => part.text === 'RECALL_OK')),
                 'New client received the model-selected Markdown topic in its normal request');
+            await memoryReader.request('prompt', {message: '忘记测试笔记 TEST_MEMORY_FORGET', turnId: 'forget-a'});
+            await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'forget-a');
+            await memoryReader.request('prompt', {message: 'TEST_MEMORY_AFTER_FORGET', turnId: 'follow-b'});
+            await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'follow-b');
+            assert(!memoryReaderEvents.some(e => e.memoryTurnId === 'forget-a'), 'B settles while A still updates');
+            const receipt = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'forget-a');
+            assert(receipt.status === 'committed' && receipt.message.includes('preview.md'),
+                'A emits a real commit receipt even after B completed');
+            for (let attempt = 0; attempt < 200 && memoryReader._memoryUpdates.size; attempt++) await sleepGjs(20);
+            assert(!memoryReader._memoryUpdates.size && !memoryReaderEvents.some(e => e.status === 'failed' && e.memoryTurnId),
+                'B generated against the updated snapshot');
+            assert(!(await sharedMemory.snapshot()).notes.has('memory://computer/preview.md') &&
+                !GLib.file_test(sharedMemory.path('computer', 'preview.md'), GLib.FileTest.EXISTS),
+                'Forgetting commits both note deletion and index update');
         } finally {
             memoryWriter.close();
             memoryReader.close();
