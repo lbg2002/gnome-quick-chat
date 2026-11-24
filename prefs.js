@@ -17,6 +17,7 @@ import {
     migrateGSettingsIfNeeded,
     peekCachedBackendCatalog,
 } from './core/backendDetect.js';
+import {getMemoryDirectory} from './core/markdownMemory.js';
 import {BackendRegistry} from './core/backendRegistry.js';
 import {compactNameCombo, compactPreferenceRow} from './ui/preferencesLayout.js';
 import {DEFAULT_DESKTOP_ASSISTANT_PROMPT} from './core/dshModelCatalog.js';
@@ -1045,6 +1046,40 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         uiPage.add(privacyGroup);
 
+        const memoryRow = new Adw.SwitchRow({
+            title: '为当前后端启用共享 Markdown 记忆',
+            subtitle: '向当前后端发送相关记忆。模型可在回合结束后自动总结并更新笔记。',
+        });
+        const refreshMemoryRow = () => {
+            if (!hasKey('shared-memory-backends')) return;
+            memoryRow.active = s.get_strv('shared-memory-backends')
+                .includes(registry.getMemoryDestination(getEffectiveBackend()));
+        };
+        memoryRow.connect('notify::active', () => {
+            if (!hasKey('shared-memory-backends')) return;
+            const target = registry.getMemoryDestination(getEffectiveBackend());
+            const destinations = s.get_strv('shared-memory-backends');
+            if (destinations.includes(target) === memoryRow.active) return;
+            s.set_strv('shared-memory-backends', memoryRow.active
+                ? [...destinations, target] : destinations.filter(value => value !== target));
+        });
+        privacyGroup.add(memoryRow);
+        const memoryLocation = new Adw.ActionRow({title: '我的电脑 · Markdown 记忆', subtitle: getMemoryDirectory()});
+        const openMemory = new Gtk.Button({label: '打开目录', valign: Gtk.Align.CENTER});
+        openMemory.connect('clicked', () => {
+            const directory = getMemoryDirectory();
+            if (GLib.file_test(directory, GLib.FileTest.IS_SYMLINK)) return;
+            GLib.mkdir_with_parents(directory, 0o700);
+            Gio.AppInfo.launch_default_for_uri_async(Gio.File.new_for_path(directory).get_uri(),
+                null, null, (_, result) => {
+                    try { Gio.AppInfo.launch_default_for_uri_finish(result); }
+                    catch (_) { memoryLocation.subtitle = '无法打开 ' + directory; }
+                });
+        });
+        memoryLocation.add_suffix(openMemory);
+        privacyGroup.add(memoryLocation);
+        refreshMemoryRow();
+
         const resetSessionRow = new Adw.ActionRow({
             title: '新建空白当前会话',
             subtitle: '开始新会话并撤销本次工具授权',
@@ -1584,6 +1619,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             }
             workspaceRow.sensitive = eff === 'zcode' || eff === 'codex' || eff === 'dsh';
             dshReviewRow.visible = eff === 'dsh';
+            refreshMemoryRow();
 
             modeRow.sensitive = caps.supportsTools;
             if (eff === 'unconfigured') {

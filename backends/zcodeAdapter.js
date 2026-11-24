@@ -118,6 +118,8 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         sessionId = '',
         specialDirs = {},
         timeouts = null,
+        memoryContext = '',
+        disableResume = false,
     }) {
         const budgetCheck = preparePromptWithinBudget(promptText, {allowTruncate: false});
         if (!budgetCheck.ok) {
@@ -144,6 +146,7 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         const effectiveMode = modeInfo.effectiveMode;
 
         const {remoteId, prompt: effectiveCliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
+            memoryContext, allowResume: !disableResume,
             workspace, specialDirs, mode: effectiveMode,
             assistantInstructions: resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
         });

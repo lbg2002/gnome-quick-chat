@@ -24,6 +24,7 @@ import {
     shouldStripAuthOnRedirect,
 } from '../core/secretPolicy.js';
 import {buildRuntimeContextSignature, buildBudgetedContextMessages} from '../core/contextManager.js';
+import {MarkdownMemory} from '../core/markdownMemory.js';
 import {SessionStore} from '../core/sessionStore.js';
 import {TurnController} from '../core/turnController.js';
 import {writePrivateFileAsync, removeFileQuietly} from '../core/paths.js';
@@ -478,6 +479,37 @@ let mockHttpProc = null;
         assert(codexSettled.status === 'completed', `Codex turn failed in GJS: ${codexSettled.errorMessage}`);
         assert(codexStore.remoteSessionId === 'codex_thread_r10_prod', 'Codex remoteSessionId persisted in GJS');
         
+        // A real BackendClient uses independent OpenAI turns for recall and durable learning.
+        const sharedMemory = new MarkdownMemory(tmpRoot, GLib.build_filenamev([tmpRoot, 'shared-memory']));
+        const memoryRuntime = {backend: 'openai', baseUrl: originABase, chatUrl: originABase + '/chat/completions',
+            modelsUrl: originABase + '/models', apiKey: 'sk-mock', modelId: 'gpt-4o-mini', resolvedModel: 'gpt-4o-mini'};
+        const memoryConfig = {openaiModel: 'gpt-4o-mini', mode: 'chat'};
+        const memoryWriterEvents = [];
+        const memoryWriter = new BackendClient(event => memoryWriterEvents.push(event), () => {});
+        const memoryReaderEvents = [];
+        const memoryReader = new BackendClient(event => memoryReaderEvents.push(event), () => {});
+        try {
+            memoryWriter._initWithRuntime(memoryRuntime, memoryConfig, tmpRoot, tmpRoot, 'memory-writer');
+            memoryWriter._memory = sharedMemory;
+            await memoryWriter.request('prompt', {message: 'TEST_MEMORY_WRITE'});
+            for (let i = 0; i < 200 && !memoryWriterEvents.some(event => event.type === 'memory_notice'); i++) {
+                await sleepGjs(20);
+            }
+            assert((await sharedMemory.snapshot()).notes.has('memory://computer/preview.md'),
+                'Model authored Markdown was written by the host');
+            memoryReader._initWithRuntime({...memoryRuntime}, memoryConfig, tmpRoot, tmpRoot, 'memory-reader');
+            memoryReader._memory = sharedMemory;
+            await memoryReader.request('prompt', {message: 'TEST_MEMORY_RECALL'});
+            for (let i = 0; i < 200 && !memoryReaderEvents.some(event => event.type === 'agent_settled'); i++) {
+                await sleepGjs(20);
+            }
+            assert(memoryReaderEvents.some(event => event.message?.content?.some?.(part => part.text === 'RECALL_OK')),
+                'New client received the model-selected Markdown topic in its normal request');
+        } finally {
+            memoryWriter.close();
+            memoryReader.close();
+        }
+
         // 5D2. Real DSH Headless JSONL → Gio.Subprocess → shared TurnController.
         const fakeDshScript = GLib.build_filenamev([tmpRoot, 'fake_dsh_cli.cjs']);
         writeExecutableScriptSync(fakeDshScript, [

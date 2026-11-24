@@ -42,7 +42,7 @@ export class DshAdapter extends BaseBackendAdapter {
     }
 
     async sendMessage({promptText, turnMeta = {}, workspace = '', sessionId = '',
-        specialDirs = {}, timeouts = null}) {
+        specialDirs = {}, timeouts = null, memoryContext = '', disableResume = false}) {
         const budgetCheck = preparePromptWithinBudget(promptText, {allowTruncate: false});
         if (!budgetCheck.ok) throw new Error(budgetCheck.warning || '当前提问超过输入上限');
 
@@ -67,6 +67,7 @@ export class DshAdapter extends BaseBackendAdapter {
         );
         const effectiveMode = modeInfo.effectiveMode;
         const {remoteId, prompt: cliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
+            memoryContext, allowResume: !disableResume,
             workspace, specialDirs, mode: effectiveMode,
         });
 

@@ -153,6 +153,12 @@ stateDiagram-v2
 
 ---
 
+## 共享 Markdown 记忆
+
+在「设置 → 界面与权限 → 隐私与本地会话存储」为当前后端启用共享记忆。切换到其他后端后，可分别为它们启用访问权限。随问在本机共享同一个记忆目录，默认位于 `~/.local/share/gnome-quick-chat/memory/`。根索引为 `MEMORY.md`，项目笔记位于对应的 `projects/` 子目录。可从设置打开目录并直接编辑 Markdown。
+
+模型按需选取主题，成功回合结束后自行总结和更新笔记。有附件正文的回合跳过自动整理。可以在聊天中要求“记住这个做法”或“忘掉指定笔记”，实际保存以随问状态提示为准。选题和整理可能各产生一次额外模型请求。启用记忆时，CLI 每轮以随问保存的本地会话上下文重建请求，以便反映手工修改或遗忘。
+
 ## DeepSeek Harness 与权限分级
 
 在设置中可以选择 **ZCode、Codex、DeepSeek Harness (dsh)、OpenAI API** 四种后端。DSH 需先按照 [DeepSeek Harness 官方说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/headless/README.zh.md) 安装并配置可运行的 `dsh`，再通过“模型与后端”或“界面与权限”选择它。

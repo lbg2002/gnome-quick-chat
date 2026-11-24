@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
   <schema id="org.gnome.shell.extensions.quick-chat" path="/org/gnome/shell/extensions/quick-chat/">
+    <key name="shared-memory-backends" type="as">
+      <default>[]</default>
+      <summary>Backend destinations allowed to use shared Markdown memory</summary>
+    </key>
     <key name="config-version" type="i">
       <default>0</default>
       <summary>Schema migration version marker</summary>

@@ -67,7 +67,7 @@ export class BaseBackendAdapter {
         };
     }
 
-    prepareCliContext(prompt, {workspace, specialDirs, mode, assistantInstructions, allowResume = true}) {
+    prepareCliContext(prompt, {workspace, specialDirs, mode, assistantInstructions, memoryContext = '', allowResume = true}) {
         const store = this._store;
         const context = this._getSessionContextConfig();
         // A native session ID is a cache tied to the local history revision.
@@ -75,7 +75,9 @@ export class BaseBackendAdapter {
         const remoteId = allowResume
             ? store?.resolveRemoteSessionForTurn?.(this.backendId, context) ?? store?.remoteSessionId ?? ''
             : '';
-        const desktopPrompt = augmentPromptWithDesktopContext(prompt, specialDirs, {
+        const withMemory = memoryContext && new TextEncoder().encode(prompt + memoryContext).length <= 24 * 1024
+            ? `${memoryContext}\n\n本轮请求\n${prompt}` : prompt;
+        const desktopPrompt = augmentPromptWithDesktopContext(withMemory, specialDirs, {
             workspace, mode, assistantInstructions, isFirstTurn: !remoteId,
         });
         return {

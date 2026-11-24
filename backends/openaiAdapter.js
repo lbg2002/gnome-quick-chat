@@ -706,12 +706,13 @@ export class OpenAIAdapter extends BaseBackendAdapter {
         const {
             promptText: rawPromptText,
             text: fallbackText,
+            memoryContext = '',
             turnMeta = {},
             sessionId = '',
             timeouts = null,
         } = opts;
         const promptText = rawPromptText ?? fallbackText ?? '';
-        const systemPrompt = this._runtime.systemPrompt ||
+        const baseSystemPrompt = this._runtime.systemPrompt ||
             '你是 Ubuntu 26 / GNOME 50 桌面顶栏中的「随问」AI 助手。请用清晰、简明、准确的中文回答问题。';
         const initialModelId = this._hasExplicitUserModel
             ? this._userConfiguredModelId
@@ -721,6 +722,7 @@ export class OpenAIAdapter extends BaseBackendAdapter {
         const configuredReserveOutput = Number(this._config?.reserveOutputTokens || 0) || undefined;
         const allowPromptTruncate = Boolean(this._config?.allowPromptTruncate);
 
+        let systemPrompt = baseSystemPrompt;
         const initialBudgetCheck = preparePromptWithinBudget(promptText, {
             systemPrompt,
             ...(knownCtxWindow ? {contextWindowTokens: knownCtxWindow} : {}),
@@ -792,6 +794,13 @@ export class OpenAIAdapter extends BaseBackendAdapter {
                 error: budgetErr,
             };
         }
+        if (memoryContext) {
+            const candidate = `${baseSystemPrompt}\n\n${memoryContext}`;
+            if (preparePromptWithinBudget(promptText, {
+                systemPrompt: candidate, contextWindowTokens: effectiveCtxWindow || undefined,
+                reserveOutputTokens: configuredReserveOutput, allowTruncate: false,
+            }).ok) systemPrompt = candidate;
+        }
         turn.promptText = budgetCheck.promptText;
         turn.contextWindowTokens = effectiveCtxWindow || budgetCheck.contextWindowTokens || 0;
 
@@ -857,8 +866,12 @@ export class OpenAIAdapter extends BaseBackendAdapter {
             budgetedHistoryMessages = [{role: 'user', content: budgetCheck.promptText}];
         }
 
+        if (systemPrompt !== baseSystemPrompt) {
+            const lastUser = budgetedHistoryMessages.findLast(message => message.role === 'user');
+            if (lastUser) lastUser.content = `${memoryContext}\n\n本轮请求\n${lastUser.content}`;
+        }
         const apiMessages = [
-            {role: 'system', content: systemPrompt},
+            {role: 'system', content: baseSystemPrompt},
             ...budgetedHistoryMessages,
         ];
 

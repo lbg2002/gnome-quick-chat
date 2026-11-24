@@ -439,6 +439,14 @@ export class BackendRegistry {
         return this.bumpGeneration();
     }
 
+    getMemoryDestination(backend) {
+        const profile = this.getBackendProfile(backend);
+        const endpoint = backend === 'openai'
+            ? readString(this._settings, 'openai-base-url', '').trim()
+            : readString(this._settings, backend + '-path', '').trim();
+        return JSON.stringify([backend, endpoint, profile.provider || '']);
+    }
+
     buildRuntimeConfig(effectiveBackend, {apiKey = ''} = {}) {
         const profile = this.getBackendProfile(effectiveBackend);
         const configuredBackend = this.getConfiguredBackend();
@@ -459,6 +467,8 @@ export class BackendRegistry {
             assistantInstructions: readString(this._settings, 'desktop-assistant-prompt', '').trim(),
             dshAutoReview: effectiveBackend === 'dsh'
                 ? readBoolean(this._settings, 'dsh-auto-review', false) : false,
+            autoMemory: readStrv(this._settings, 'shared-memory-backends').includes(
+                this.getMemoryDestination(effectiveBackend)),
             mode: profile.mode || 'readonly',
             workspace: profile.workspace || '',
             configGeneration: this._generation,

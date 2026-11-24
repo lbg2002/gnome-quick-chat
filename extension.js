@@ -1055,6 +1055,7 @@ export default class QuickChat extends Extension {
             'dsh-provider',
             'dsh-model',
             'desktop-assistant-prompt',
+            'shared-memory-backends',
             'openai-base-url',
             'openai-api-key',
             'openai-model',
@@ -1520,6 +1521,7 @@ export default class QuickChat extends Extension {
             });
             if (!draftIsCurrent()) return;
             this._panel.setEntryTextProgrammatically('', {focus: false});
+            this._chatController?.client?.recordBrowserLaunch();
             this._panel.setStatusIndicator('ready', '已向桌面提交默认浏览器启动请求');
             this._dateIntegration?.menu?.close();
         } catch (err) {
@@ -1985,6 +1987,11 @@ export default class QuickChat extends Extension {
             return;
         }
         this._capsule?.recordEvent(event);
+
+        if (event.type === 'memory_notice') {
+            if (!activeTurn) this._panel?.setStatusIndicator('ready', event.message);
+            return;
+        }
 
         if (event.type === 'session_save_error') {
             const msg = event.message || '历史未保存';

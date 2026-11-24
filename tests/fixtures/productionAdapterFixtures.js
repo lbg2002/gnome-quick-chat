@@ -351,6 +351,26 @@ const serverA = http.createServer((req, res) => {
                 return;
             }
 
+            let memoryAnswer = '';
+            if (lastUserContent.startsWith('总结可跨会话复用')) {
+                memoryAnswer = lastUserContent.includes('TEST_MEMORY_WRITE') ? JSON.stringify([
+                    {scope: 'computer', name: 'MEMORY.md', markdown: '[测试笔记](preview.md)'},
+                    {scope: 'computer', name: 'preview.md', markdown: 'Verified shared-memory note'},
+                ]) : '[]';
+            } else if (lastUserContent.startsWith('只返回与当前任务最相关')) {
+                memoryAnswer = JSON.stringify(['memory://computer/preview.md']);
+            } else if (lastUserContent.includes('TEST_MEMORY_RECALL')) {
+                memoryAnswer = lastUserContent.includes('Verified shared-memory note')
+                    ? 'RECALL_OK' : 'RECALL_MISSING';
+            }
+            if (memoryAnswer) {
+                res.writeHead(200, {'Content-Type': 'text/event-stream'});
+                res.write('data: ' + JSON.stringify({choices: [{index: 0,
+                    delta: {content: memoryAnswer}, finish_reason: 'stop'}]}) + '\\n\\n');
+                res.end('data: [DONE]\\n\\n');
+                return;
+            }
+
             const finishReason = lastUserContent.includes('[SCENARIO:FINISH_LENGTH]') ? 'length' : 'stop';
             res.writeHead(200, {'Content-Type': 'text/event-stream'});
             const c1 = {

@@ -52,7 +52,9 @@ jobs:
           PY
 
       - name: Run headless GJS pure-module & Gio integration smoke check
-        run: gjs -m tests/gjs_smoke.js
+        run: |
+          gjs -m tests/gjs_markdown_memory.js
+          gjs -m tests/gjs_smoke.js
 
       - name: Test installed extension bundle in real headless GJS
         run: |
