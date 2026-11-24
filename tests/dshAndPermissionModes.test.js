@@ -102,7 +102,7 @@ test('DSH: YAML overlay injects only isolated model/persona fields, never patch 
     assert.equal(overlay.split(/^[-] id:/m).length - 1, 2, 'only two intended patch rows');
     assert.equal(overlay.includes('\n- id: evil'),false);
     assert.throws(() => buildDshProfileOverlay({provider:'foo\n- id: evil',model:'bar'}));
-    assert.ok(resolveDesktopAssistantPrompt('').includes('GNOME'));
+    assert.ok(resolveDesktopAssistantPrompt('').includes('自主选择工具'));
     assert.equal(resolveDesktopAssistantPrompt('  自定义指引  '),'自定义指引');
     assert.equal(resolveDesktopAssistantPrompt(''),DEFAULT_DESKTOP_ASSISTANT_PROMPT);
 });

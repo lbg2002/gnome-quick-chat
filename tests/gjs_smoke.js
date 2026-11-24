@@ -552,6 +552,26 @@ let mockHttpProc = null;
                 deletedLine.includes('已删除：preview.md') && unindexedLine.includes('nindex-b') &&
                 unindexedLine.includes('从索引移出测试笔记') && unindexedLine.includes('文件仍保留：preview.md'),
             'User-visible receipts attribute same-name notes to their original turns and actions');
+            const experience = new MarkdownMemory(tmpRoot, GLib.build_filenamev([tmpRoot, 'experience']));
+            memoryReader._memory = experience;
+            const experienceAddress = 'memory://computer/preview.md';
+            for (const [scenario, expected, changed] of [
+                ['FIRST', '# 偏好 A', true],
+                ['DUPLICATE', '# 偏好 A', false],
+                ['CORRECT', '# 偏好 B', true],
+                ['TEMPORARY', '# 偏好 B', false],
+                ['FORGET', undefined, true],
+            ]) {
+                await memoryReader.request('prompt', {message: 'TEST_EXPERIENCE_' + scenario, turnId: scenario});
+                await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === scenario);
+                for (let attempt = 0; attempt < 200 && memoryReader._memoryUpdates.size; attempt++) await sleepGjs(20);
+                const note = (await experience.recall(await experience.snapshot(),
+                    JSON.stringify([experienceAddress]))).get(experienceAddress);
+                assert(note === expected && !memoryReader._memoryUpdates.size, scenario + ' expected note state');
+                assert(memoryReaderEvents.some(e => e.memoryTurnId === scenario && e.status === 'committed') === changed &&
+                    !memoryReaderEvents.some(e => e.memoryTurnId === scenario && e.status === 'failed'),
+                scenario + ' expected commit receipt');
+            }
         } finally {
             memoryWriter.close();
             memoryReader.close();
@@ -631,6 +651,21 @@ let mockHttpProc = null;
             assert(calls.filter(call => call.update).length === 1 && calls.every(call =>
                 call.recall || call.update ? call.readonly : !call.readonly),
             backend + ' only uses read-only for auxiliary calls and skips learning on attachment turns');
+        }
+
+        for (const backend of ['zcode', 'dsh']) {
+            const calls = Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').map(JSON.parse);
+            const directive = '根据用户当前意图和已授予的权限，自主选择工具与执行方式。';
+            const main = calls.find(call => !call.recall && !call.update);
+            assert(main.instructions.split(directive).length === 2 && !main.instructions.includes('gtk-launch'),
+                backend + ' sends the shared generic instructions once');
+            routeRegistry.setMemoryEnabled(backend, false);
+            routeSettings.set_string('desktop-assistant-prompt', '测试专用用户指引');
+            await runMemoryTurn(backend, sharedMemory, 'custom-' + backend, '测试用户自定义指引');
+            const last = JSON.parse(Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').at(-1));
+            assert(last.instructions.includes('测试专用用户指引') && !last.instructions.includes(directive),
+                backend + ' sends the configured instructions');
+            routeRegistry.setMemoryEnabled(backend, true);
         }
 
         // 5D2. Real DSH Headless JSONL → Gio.Subprocess → shared TurnController.

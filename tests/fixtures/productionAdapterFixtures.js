@@ -353,7 +353,20 @@ const serverA = http.createServer((req, res) => {
 
             let memoryAnswer = '';
             if (lastUserContent.startsWith('总结可跨会话复用')) {
-                if (lastUserContent.includes('TEST_MEMORY_FAIL')) {
+                if (lastUserContent.includes('TEST_EXPERIENCE_')) {
+                    const context = JSON.parse(lastUserContent.split('\\n').at(-1));
+                    const note = context.notes['memory://computer/preview.md'];
+                    const update = (name, markdown) => ({scope: 'computer', name, markdown});
+                    let changes = [];
+                    if (context.user.includes('TEST_EXPERIENCE_FIRST')) {
+                        changes = [update('MEMORY.md', '[经验](preview.md)'), update('preview.md', '# 偏好 A')];
+                    } else if (context.user.includes('TEST_EXPERIENCE_CORRECT') && note === '# 偏好 A') {
+                        changes = [update('preview.md', '# 偏好 B')];
+                    } else if (context.user.includes('TEST_EXPERIENCE_FORGET') && note === '# 偏好 B') {
+                        changes = [update('preview.md', null), update('MEMORY.md', '')];
+                    }
+                    memoryAnswer = JSON.stringify(changes);
+                } else if (lastUserContent.includes('TEST_MEMORY_FAIL')) {
                     memoryAnswer = 'invalid model response';
                 } else if (lastUserContent.includes('TEST_MEMORY_UNINDEX')) {
                     memoryAnswer = JSON.stringify([{scope: 'computer', name: 'MEMORY.md', markdown: ''}]);
@@ -448,7 +461,9 @@ function respond() {
     const readonly = backend === 'codex' ? args.includes('sandbox_mode="read-only"')
         : backend === 'zcode' ? args.includes('plan')
         : args[args.indexOf('--permission-mode') + 1] === 'read-only';
-    fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({recall, update, readonly, hasMemory}) + '\\n');
+    const overlay = backend === 'dsh' ? fs.readFileSync(args[args.indexOf('--patch') + 1], 'utf8') : '';
+    const instructions = backend === 'dsh' ? overlay : prompt;
+    fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({recall, update, readonly, hasMemory, instructions}) + '\\n');
     if (expected !== readonly) process.exit(2);
     let answer = 'CLI main turn';
     if (recall) answer = JSON.stringify(['memory://computer/preview.md']);
