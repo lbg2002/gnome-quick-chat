@@ -632,6 +632,12 @@ export class TracePanelController {
         if (!card.traceBox) return;
         card.traceBox.visible = true;
 
+        const pending = tools.filter(node => node.status === 'pending_approval' || node.status === 'sending_approval');
+        const slot = this._getApprovalSlot?.(card);
+        if (slot && pending.length && !pending.some(node => node.id === card.selectedNodeId)) {
+            card.selectedNodeId = pending[0].id;
+        }
+
         if (card.thinkingDot) {
             const thinkingSel = card.selectedNodeId === 'thinking';
             const thinkingKey = `${hasThinking ? '1' : '0'}|${thinkingSel ? 'sel' : 'nosel'}`;
@@ -699,11 +705,6 @@ export class TracePanelController {
         card.dirtyToolNodeIds.clear();
         card.allToolDotsDirty = false;
 
-        const pending = tools.filter(node => node.status === 'pending_approval' || node.status === 'sending_approval');
-        const slot = this._getApprovalSlot?.(card);
-        if (slot && pending.length && !pending.some(node => node.id === card.selectedNodeId)) {
-            card.selectedNodeId = pending[0].id;
-        }
         const parent = slot && pending.length ? slot : card.traceBox;
         if (slot && pending.length) this.ensureCardDetailDrawer(card);
         if (card.detailDrawer && card.detailDrawer.get_parent() !== parent) {

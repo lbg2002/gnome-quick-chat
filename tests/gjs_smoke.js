@@ -27,7 +27,7 @@ import {buildRuntimeContextSignature, buildBudgetedContextMessages} from '../cor
 import {MarkdownMemory} from '../core/markdownMemory.js';
 import {SessionStore} from '../core/sessionStore.js';
 import {TurnController} from '../core/turnController.js';
-import {writePrivateFileAsync, removeFileQuietly} from '../core/paths.js';
+import {requireWorkspaceDirectory, writePrivateFileAsync, removeFileQuietly} from '../core/paths.js';
 import {StreamingMarkdownParser} from '../core/markdownStreamParser.js';
 import {HistoryWindowController, computeAdaptiveRenderDelayMs} from '../core/renderScheduler.js';
 import {matchSlashCommands, applyQuickActionToDraft} from '../core/quickActions.js';
@@ -204,6 +204,14 @@ let mockHttpProc = null;
     assert(reader.pushChunk(frame.subarray(2)).lines[0] === '随问', 'chunk split corrupted UTF-8');
 
     try {
+        assert(requireWorkspaceDirectory(tmpRoot) === tmpRoot, 'Existing workspace is preserved');
+        const missingWorkspace = GLib.build_filenamev([tmpRoot, 'missing-workspace']);
+        let workspaceError = '';
+        try { requireWorkspaceDirectory(missingWorkspace); }
+        catch (error) { workspaceError = error.message; }
+        assert(workspaceError.includes('工作目录') && workspaceError.includes(missingWorkspace) &&
+            !GLib.file_test(missingWorkspace, GLib.FileTest.EXISTS), 'Missing workspace reports path without creating it');
+
         // 5A. Real Gio async SessionStore write + reload + unix mode 0600/0700
         const store = new SessionStore('gjs_smoke_sess', {sessionsRootDir: tmpRoot});
         await store.load('openai', {openaiModel: 'gpt-4o'});

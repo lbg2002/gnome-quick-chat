@@ -30,6 +30,14 @@ export function resolveWorkspacePath(rawWorkspace = '') {
     return resolved || fallback;
 }
 
+export function requireWorkspaceDirectory(rawWorkspace = '') {
+    const workspace = resolveWorkspacePath(rawWorkspace);
+    if (!GLib.path_is_absolute(workspace) || !GLib.file_test(workspace, GLib.FileTest.IS_DIR)) {
+        throw new Error('工作目录必须是已存在的绝对路径：' + workspace);
+    }
+    return workspace;
+}
+
 export function getUserSpecialDirs() {
     const home = GLib.get_home_dir() || '';
     const safeSpecial = dirEnum => {
