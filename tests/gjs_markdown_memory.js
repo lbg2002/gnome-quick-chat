@@ -6,6 +6,16 @@ function assert(condition, message) {
     if (!condition) throw new Error(message);
 }
 
+async function rejects(operation, expected) {
+    try {
+        await operation();
+    } catch (error) {
+        assert(error.message.includes(expected), 'Unexpected failure: ' + error.message);
+        return;
+    }
+    throw new Error('Expected rejection: ' + expected);
+}
+
 const root = GLib.dir_make_tmp('quickchat-memory-test-XXXXXX');
 const computer = new MarkdownMemory('/tmp/workspace-a', root);
 const switchedBackend = new MarkdownMemory('/tmp/workspace-a', root);
@@ -44,6 +54,39 @@ try {
         await computer.edit(snapshot, recalled, JSON.stringify([{...replacement, name: '../outside.md'}]), () => true);
     } catch (_) { rejected = true; }
     assert(rejected, 'Outside paths rejected');
+    const beforeForget = await computer.snapshot();
+    await rejects(() => computer.edit(beforeForget, current, JSON.stringify([
+        {scope: 'computer', name: 'unlisted.md', markdown: 'missing index'},
+    ]), () => true), '添加主题的相对链接');
+    await rejects(() => computer.edit(beforeForget, current, JSON.stringify([
+        {...edits[1], markdown: null},
+    ]), () => true), '移除链接');
+    await rejects(() => computer.edit(beforeForget, current, JSON.stringify([
+        {...edits[0], markdown: '[失效](unlisted.md)'},
+    ]), () => true), '没有对应文件');
+
+    const projectPath = computer.path('project', 'preview.md');
+    const journal = JSON.stringify({projectId: computer.projectId, edits: [
+        {...edits[3], before: edits[3].markdown, markdown: 'Prepared next version'},
+    ]});
+    GLib.file_set_contents(computer.journal, journal);
+    assert((await switchedBackend.recall(snapshot, JSON.stringify([projectTopic]))).get(projectTopic) ===
+        'Prepared next version', 'A new instance replays a valid journal');
+    GLib.file_set_contents(computer.journal, journal);
+    GLib.file_set_contents(projectPath, 'Hand edited after interruption');
+    assert((await otherWorkspace.snapshot()).notes.has(topic), 'Conflict does not block unrelated workspace');
+    assert((await switchedBackend.recall(snapshot, JSON.stringify([projectTopic]))).get(projectTopic) ===
+        'Hand edited after interruption', 'Recovery preserves hand-edited note');
+    assert(!GLib.file_test(computer.journal, GLib.FileTest.EXISTS), 'Conflict is detached from active journal');
+    const enumerator = Gio.File.new_for_path(root).enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+    let archive;
+    for (let item; (item = enumerator.next_file(null));) {
+        if (item.get_name().startsWith('.conflict-')) archive = item.get_name();
+    }
+    enumerator.close(null);
+    assert(archive && new TextDecoder().decode(GLib.file_get_contents(root + '/' + archive)[1]) === journal,
+        'Prepared changes preserved for manual recovery');
+
     await computer.edit(await computer.snapshot(), current, JSON.stringify([
         {...edits[0], markdown: ''}, {...edits[1], markdown: null},
     ]), () => true);

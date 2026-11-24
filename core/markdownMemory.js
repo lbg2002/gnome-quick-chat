@@ -33,6 +33,11 @@ function parse(text) {
     return result;
 }
 
+function topicLinks(markdown) {
+    return new Set([...(markdown || '').matchAll(/\]\(([a-zA-Z0-9_-]+\.md)\)/g)]
+        .map(match => match[1]).filter(name => name !== INDEX && TOPIC.test(name)));
+}
+
 async function read(path, limit = MAX_NOTE_BYTES) {
     if (GLib.file_test(path, GLib.FileTest.IS_SYMLINK)) throw new Error('记忆文件不能是符号链接');
     const result = await readFileBytesBoundedAsync(path, limit);
@@ -88,7 +93,12 @@ export class MarkdownMemory {
             const path = this.path(scope, name, projectId);
             const current = await read(path);
             if (current === markdown) continue;
-            if (current !== before) throw new Error('记忆恢复遇到外部修改');
+            if (current !== before) {
+                const archive = GLib.build_filenamev([this.root, '.conflict-' + GLib.uuid_string_random()]);
+                Gio.File.new_for_path(this.journal).move(Gio.File.new_for_path(archive),
+                    Gio.FileCopyFlags.NONE, null, null);
+                return false;
+            }
             pendingEdits.push({path, markdown});
         }
         for (const {path, markdown} of pendingEdits) {
@@ -96,6 +106,7 @@ export class MarkdownMemory {
             else await replace(path, markdown);
         }
         Gio.File.new_for_path(this.journal).delete(null);
+        return true;
     }
 
     snapshot() {
@@ -106,9 +117,7 @@ export class MarkdownMemory {
             for (const scope of SCOPES) {
                 const markdown = await read(this.path(scope, INDEX));
                 indexes[scope] = markdown;
-                const names = [...(markdown || '').matchAll(/\]\(([a-zA-Z0-9_-]+\.md)\)/g)]
-                    .map(match => match[1]).filter(name => name !== INDEX);
-                for (const name of [...new Set(names)].slice(0, 48)) {
+                for (const name of [...topicLinks(markdown)].slice(0, 48)) {
                     notes.set(`memory://${scope}/${name}`, {scope, name});
                 }
             }
@@ -128,6 +137,33 @@ export class MarkdownMemory {
             }
             return result;
         });
+    }
+
+    async validateIndex(scope, edits, snapshot) {
+        const changes = new Map(edits.filter(edit => edit.scope === scope).map(edit => [edit.name, edit]));
+        if (!changes.size) return;
+        const currentIndex = await read(this.path(scope, INDEX));
+        if (currentIndex !== snapshot.indexes[scope]) throw new Error('记忆索引已被编辑，请读取最新索引后重试');
+        const indexEdit = changes.get(INDEX);
+        const links = topicLinks(indexEdit ? indexEdit.markdown : currentIndex);
+        if (links.size > 48) throw new Error('记忆索引最多链接 48 篇主题，请合并旧主题');
+        for (const [name, edit] of changes) {
+            if (name === INDEX) continue;
+            if (edit.markdown === null && links.has(name)) {
+                throw new Error('删除主题时，请同时从 MEMORY.md 移除链接：' + name);
+            }
+            if (edit.markdown !== null && !links.has(name)) {
+                throw new Error('请在 MEMORY.md 添加主题的相对链接：' + name);
+            }
+        }
+        if (indexEdit) {
+            for (const name of links) {
+                const target = changes.get(name);
+                if ((target ? target.markdown : await read(this.path(scope, name))) === null) {
+                    throw new Error('MEMORY.md 的主题链接没有对应文件：' + name);
+                }
+            }
+        }
     }
 
     edit(snapshot, recalled, response, isCurrent) {
@@ -151,6 +187,8 @@ export class MarkdownMemory {
                 if (before !== markdown) edits.push({scope, name, before, markdown});
             }
             if (!edits.length || !isCurrent()) return [];
+            for (const scope of SCOPES) await this.validateIndex(scope, edits, snapshot);
+            if (!isCurrent()) return [];
             ensureDirectory(this.root);
             if (edits.some(edit => edit.scope === 'project')) {
                 ensureDirectory(this.projects);
@@ -159,7 +197,9 @@ export class MarkdownMemory {
             const journal = JSON.stringify({projectId: this.projectId, edits});
             if (encoder.encode(journal).length > MAX_JOURNAL_BYTES) throw new Error('记忆事务过长');
             await replace(this.journal, journal);
-            await this.recover();
+            if (await this.recover() === false) {
+                throw new Error('记忆提交遇到外部修改，待恢复内容已保存在 .conflict 文件');
+            }
             return edits.map(({scope, name}) => `memory://${scope}/${name}`);
         });
     }
