@@ -185,7 +185,9 @@ export class DshSdkTurn {
                 this.nativeApprovalIds.delete(data.message?.toolCallId);
                 return data.message && normalizeEvent('dsh', {
                     type: 'tool_result', callId: data.message.toolCallId,
-                    status: data.message.isError ? 'error' : 'completed', error: data.error,
+                    status: data.message.isError === true || data.error ? 'error'
+                        : data.message.isError === false ? 'completed' : '',
+                    error: data.error,
                 });
             case 'turn/end':
                 this.endReason = data.reason;

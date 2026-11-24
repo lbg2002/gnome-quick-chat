@@ -610,7 +610,16 @@ let mockHttpProc = null;
 
         async function runMemoryTurn(backend, memory, id, message, options = {}) {
             const events = [];
-            const client = new BackendClient(event => events.push(event), () => {});
+            const client = new BackendClient(event => {
+                events.push(event);
+                if (options.expectExcludedEvidence && event.type === 'tool_execution_start') {
+                    assert(client._memoryTurn?.toolCalls === null, 'Attachment turn allocates no evidence collector');
+                }
+                if (options.injectForeignTool && event.type === 'tool_execution_start') {
+                    client._handleMemoryEvent({type: 'tool_execution_end', turnId: 'old-turn',
+                        toolCallId: 'foreign', toolName: 'WrongTurn', executionOutcome: 'succeeded'});
+                }
+            }, () => {});
             const config = routeRegistry.buildRuntimeConfig(backend);
             client._initWithRuntime({...runtimes[backend]}, config, tmpRoot, tmpRoot, id);
             if (client._memory) client._memory = memory;
@@ -621,6 +630,10 @@ let mockHttpProc = null;
                 if (options.expectWrite) {
                     const receipt = await waitForEventGjs(events, event => event.type === 'memory_notice');
                     assert(receipt.status === 'committed', id + ' memory committed: ' + receipt.message);
+                } else if (options.expectReview) {
+                    for (let attempt = 0; attempt < 200 && client._memoryUpdates.size; attempt++) await sleepGjs(20);
+                    assert(!client._memoryUpdates.size && !events.some(event => event.type === 'memory_notice'),
+                        id + ' completed its no-op review');
                 } else {
                     assert(client._memoryUpdates.size === 0, id + ' did not schedule learning');
                 }
@@ -666,6 +679,32 @@ let mockHttpProc = null;
             assert(last.instructions.includes('测试专用用户指引') && !last.instructions.includes(directive),
                 backend + ' sends the configured instructions');
             routeRegistry.setMemoryEnabled(backend, true);
+        }
+
+        for (const backend of ['zcode', 'dsh']) {
+            await runMemoryTurn(backend, sharedMemory, 'evidence-' + backend, 'TEST_TOOL_EVIDENCE',
+                {expectReview: true, injectForeignTool: true});
+            const last = JSON.parse(Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').at(-1));
+            const {toolEvidence, assistantReport, goalEvidence} = last.evidence;
+            const encoded = JSON.stringify(toolEvidence);
+            assert(toolEvidence.length === 8 && Encoder.encode(encoded).length <= 1024,
+                backend + ' maintains the count and byte budgets');
+            assert(toolEvidence.filter(entry => entry.tool === 'Probe').length === 2 &&
+                toolEvidence.some(entry => entry.tool === 'Probe' && entry.outcome === 'succeeded') &&
+                toolEvidence.some(entry => entry.tool === 'Probe' && entry.outcome === 'failed'),
+                backend + ' deduplicates terminal events and distinguishes concurrent same-name calls');
+            assert(toolEvidence.some(entry => entry.outcome === 'unknown' && entry.endObserved) &&
+                toolEvidence.some(entry => entry.outcome === 'unknown' && !entry.endObserved),
+                backend + ' reports both unknown outcome and unobserved termination');
+            assert(!/MissingId|WrongTurn|test-secret|testsecret|raw stdout|same-1/.test(encoded) &&
+                assistantReport === 'CLI main turn' && goalEvidence === null,
+                backend + ' separates assistant claims, execution evidence and goal evidence');
+            await runMemoryTurn(backend, sharedMemory, 'without-evidence-' + backend, 'TEST_CLEAN_TURN',
+                {expectReview: true});
+            const clean = JSON.parse(Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').at(-1));
+            assert(clean.evidence.toolEvidence.length === 0, backend + ' does not carry evidence into another turn');
+            await runMemoryTurn(backend, sharedMemory, 'excluded-evidence-' + backend, 'TEST_TOOL_EVIDENCE',
+                {displayUserText: '测试附件', expectExcludedEvidence: true});
         }
 
         // 5D2. Real DSH Headless JSONL → Gio.Subprocess → shared TurnController.

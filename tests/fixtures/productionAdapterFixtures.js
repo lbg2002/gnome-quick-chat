@@ -463,7 +463,8 @@ function respond() {
         : args[args.indexOf('--permission-mode') + 1] === 'read-only';
     const overlay = backend === 'dsh' ? fs.readFileSync(args[args.indexOf('--patch') + 1], 'utf8') : '';
     const instructions = backend === 'dsh' ? overlay : prompt;
-    fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({recall, update, readonly, hasMemory, instructions}) + '\\n');
+    const evidence = update ? JSON.parse(prompt.split('\\n').at(-1)) : null;
+    fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({recall, update, readonly, hasMemory, instructions, evidence}) + '\\n');
     if (expected !== readonly) process.exit(2);
     let answer = 'CLI main turn';
     if (recall) answer = JSON.stringify(['memory://computer/preview.md']);
@@ -473,6 +474,32 @@ function respond() {
     ]) : '[]';
     else if (prompt.includes('TEST_MEMORY_RECALL')) answer = hasMemory ? 'RECALL_OK' : 'RECALL_MISSING';
     const emit = obj => console.log(JSON.stringify(obj));
+    if (!expected && prompt.includes('TEST_TOOL_EVIDENCE') && backend !== 'codex') {
+        const sensitive = 'Bearer test-secret-123456 ' + 'raw stdout '.repeat(400);
+        const tool = (id, kind, status, name = 'Probe') => {
+            if (backend === 'zcode') {
+                emit({type: 'tool.updated', payload: {
+                    kind, toolCallId: id, toolName: name, input: {command: sensitive},
+                    result: {isError: status === 'error' ? true : status === 'completed' ? false : undefined,
+                        summary: sensitive},
+                }});
+            } else if (kind === 'started') {
+                emit({type: 'tool_call', callId: id, tool: name, input: {command: sensitive}});
+            } else {
+                emit({type: 'tool_result', callId: id, status, result: sensitive});
+            }
+        };
+        tool('same-1', 'started');
+        tool('same-2', 'started');
+        tool('same-2', 'result', 'error');
+        tool('same-1', 'result', 'completed');
+        tool('same-1', 'result', 'completed');
+        tool('unknown', 'result', undefined, 'Uncertain');
+        tool('unfinished', 'started', undefined, 'Unfinished');
+        tool('', 'result', 'completed', 'MissingId');
+        tool('secret', 'result', 'completed', 'sk-testsecret123456789');
+        for (let index = 0; index < 20; index++) tool('extra-' + index, 'result', 'completed', 'Extra');
+    }
     if (backend === 'codex') {
         emit({type: 'thread.started', thread_id: 'memory-thread'});
         emit({type: 'item.completed', item: {id: 'result', type: 'agent_message', text: answer}});

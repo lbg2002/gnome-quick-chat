@@ -160,7 +160,7 @@ test('normalizeEvent unifies ZCode and Codex events without duplicate settlement
             type: 'item.completed',
             item: {id: 'item_cmd_1', type: 'command_execution', command: 'false', exit_code: 2},
         }),
-        {type: 'tool_execution_end', toolCallId: 'item_cmd_1', toolName: 'Bash', isError: true, detail: '退出码 2'}
+        {type: 'tool_execution_end', toolCallId: 'item_cmd_1', toolName: 'Bash', isError: true, executionOutcome: 'failed', exitCode: 2, detail: '退出码 2'}
     );
     assert.deepEqual(
         normalizeEvent('codex', {type: 'thread.started', thread_id: 'th_123'}),

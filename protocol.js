@@ -1156,6 +1156,8 @@ export function normalizeEvent(backend, record) {
                     type: 'tool_execution_end',
                     toolName: String(toolName),
                     isError: kind === 'error' || Boolean(p.result?.isError),
+                    executionOutcome: kind === 'error' || p.result?.isError === true ? 'failed'
+                        : p.result?.isError === false ? 'succeeded' : 'unknown',
                 };
                 if (toolCallId) evt.toolCallId = toolCallId;
                 if (typeof p.duration === 'number') evt.duration = p.duration;
@@ -1237,6 +1239,8 @@ export function normalizeEvent(backend, record) {
                     toolCallId: String(record.callId || ''),
                     toolName: '工具',
                     isError: record.status === 'error',
+                    executionOutcome: ['error', 'failed'].includes(record.status) ? 'failed'
+                        : ['completed', 'success'].includes(record.status) ? 'succeeded' : 'unknown',
                     detail: String(
                         record.error?.reason || record.error?.message ||
                         record.result || record.error?.code || ''
@@ -1313,7 +1317,12 @@ export function normalizeEvent(backend, record) {
                         item.status === 'failed' ||
                         item.error
                     );
-                    const evt = {type: 'tool_execution_end', toolName, isError};
+                    const exitCode = Number.isSafeInteger(item.exit_code) ? item.exit_code : null;
+                    const executionOutcome = isError ? 'failed'
+                        : exitCode === 0 || (item.type !== 'command_execution' && item.status === 'completed')
+                            ? 'succeeded' : 'unknown';
+                    const evt = {type: 'tool_execution_end', toolName, isError, executionOutcome};
+                    if (exitCode !== null) evt.exitCode = exitCode;
                     if (toolCallId) evt.toolCallId = toolCallId;
                     if (isError && typeof item.exit_code === 'number') {
                         evt.detail = `退出码 ${item.exit_code}`;
