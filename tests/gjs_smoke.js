@@ -651,6 +651,7 @@ let mockHttpProc = null;
             const config = routeRegistry.buildRuntimeConfig(backend);
             client._initWithRuntime({...runtimes[backend]}, config, tmpRoot, tmpRoot, id);
             if (client._memory) client._memory = memory;
+            if (options.priorBrowserReceipt) client.recordBrowserLaunch?.();
             try {
                 await client.request('prompt', {message, turnId: id, ...options});
                 const done = await waitForEventGjs(events, event => event.type === 'agent_settled');
@@ -713,7 +714,7 @@ let mockHttpProc = null;
             await runMemoryTurn(backend, sharedMemory, 'evidence-' + backend, 'TEST_TOOL_EVIDENCE',
                 {expectReview: true, injectForeignTool: true});
             const last = JSON.parse(Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').at(-1));
-            const {toolEvidence, assistantReport, goalEvidence} = last.evidence;
+            const {toolEvidence, assistantReport} = last.evidence;
             const encoded = JSON.stringify(toolEvidence);
             assert(toolEvidence.length === 8 && Encoder.encode(encoded).length <= 1024,
                 backend + ' maintains the count and byte budgets');
@@ -725,12 +726,14 @@ let mockHttpProc = null;
                 toolEvidence.some(entry => entry.outcome === 'unknown' && !entry.endObserved),
                 backend + ' reports both unknown outcome and unobserved termination');
             assert(!/MissingId|WrongTurn|test-secret|testsecret|raw stdout|same-1/.test(encoded) &&
-                assistantReport === 'CLI main turn' && goalEvidence === null,
+                assistantReport === 'CLI main turn' && !Object.hasOwn(last.evidence, 'goalEvidence'),
                 backend + ' separates assistant claims, execution evidence and goal evidence');
             await runMemoryTurn(backend, sharedMemory, 'without-evidence-' + backend, 'TEST_CLEAN_TURN',
-                {expectReview: true});
+                {expectReview: true, priorBrowserReceipt: true});
             const clean = JSON.parse(Decoder.decode(GLib.file_get_contents(cliLogs[backend])[1]).trim().split('\n').at(-1));
             assert(clean.evidence.toolEvidence.length === 0, backend + ' does not carry evidence into another turn');
+            assert(!JSON.stringify(clean.evidence).includes('open_default_browser'),
+                backend + ' never attributes an earlier browser action to a new question');
             await runMemoryTurn(backend, sharedMemory, 'excluded-evidence-' + backend, 'TEST_TOOL_EVIDENCE',
                 {displayUserText: '测试附件', expectExcludedEvidence: true});
         }

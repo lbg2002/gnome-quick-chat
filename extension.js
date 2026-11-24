@@ -1511,7 +1511,6 @@ export default class QuickChat extends Extension {
             });
             if (!draftIsCurrent()) return;
             this._panel.setEntryTextProgrammatically('', {focus: false});
-            this._chatController?.client?.recordBrowserLaunch();
             this._panel.setStatusIndicator('ready', '已向桌面提交默认浏览器启动请求');
             this._dateIntegration?.menu?.close();
         } catch (err) {
