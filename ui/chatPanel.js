@@ -14,6 +14,7 @@ import {
     DEFAULT_INITIAL_HISTORY_COUNT,
     DEFAULT_MAX_MOUNTED_ACTORS,
     HistoryWindowController,
+    formatMemoryReceipt,
 } from '../core/renderScheduler.js';
 import {H, V, createStButton, createWrapLabel} from './tracePanel.js';
 
@@ -398,6 +399,7 @@ export class ChatPanelView {
         this.buildEmptyState();
         this._buildContextAndSlashBars();
 
+        this._memoryReceipts = new Map();
         this._memoryReceipt = createWrapLabel('', 'qc-inline-banner');
         this._memoryReceipt.hide();
         this.chatBox.add_child(this._memoryReceipt);
@@ -447,10 +449,18 @@ export class ChatPanelView {
         this.chatBox.add_child(inputRow);
     }
 
-    setMemoryReceipt(message) {
+    setMemoryReceipt(event = null) {
         if (!this._memoryReceipt) return;
-        this._memoryReceipt.text = message;
-        this._memoryReceipt.visible = Boolean(message);
+        if (!event) {
+            this._memoryReceipts.clear();
+        } else {
+            const key = event.memoryTurnId || '';
+            this._memoryReceipts.delete(key);
+            this._memoryReceipts.set(key, formatMemoryReceipt(event));
+            if (this._memoryReceipts.size > 3) this._memoryReceipts.delete(this._memoryReceipts.keys().next().value);
+        }
+        this._memoryReceipt.text = [...this._memoryReceipts.values()].join('\n');
+        this._memoryReceipt.visible = this._memoryReceipts.size > 0;
     }
 
     _buildContextAndSlashBars() {
@@ -1614,7 +1624,7 @@ export class ChatPanelView {
     }
 
     clearMessages({buildEmpty = true} = {}) {
-        this.setMemoryReceipt('');
+        this.setMemoryReceipt();
         for (const c of this.mountedCards) {
             this._cardFactory.destroyCardActor(c);
         }

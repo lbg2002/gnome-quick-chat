@@ -95,6 +95,14 @@ function demoteMessageToIndexEntry(msg, compactPreviewBytes = 1024) {
     return capped;
 }
 
+export function formatMemoryReceipt({message, memoryTurnId, memoryPrompt} = {}) {
+    if (!message || !memoryTurnId) return message || '';
+    const prompt = [...String(memoryPrompt || '').replace(/\s+/g, ' ').trim()];
+    const brief = prompt.slice(0, 24).join('') + (prompt.length > 24 ? '…' : '');
+    const turn = '回合 ' + memoryTurnId.slice(-8);
+    return (brief ? `「${brief}」 · ${turn}` : turn) + '\n' + message;
+}
+
 /**
  * Releases all Actor, trace node, renderState, closure, and timer references on an evicted or destroyed card (Stage R8).
  */

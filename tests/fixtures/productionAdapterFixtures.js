@@ -355,6 +355,8 @@ const serverA = http.createServer((req, res) => {
             if (lastUserContent.startsWith('总结可跨会话复用')) {
                 if (lastUserContent.includes('TEST_MEMORY_FAIL')) {
                     memoryAnswer = 'invalid model response';
+                } else if (lastUserContent.includes('TEST_MEMORY_UNINDEX')) {
+                    memoryAnswer = JSON.stringify([{scope: 'computer', name: 'MEMORY.md', markdown: ''}]);
                 } else if (lastUserContent.includes('TEST_MEMORY_FORGET')) {
                     memoryAnswer = JSON.stringify([
                         {scope: 'computer', name: 'MEMORY.md', markdown: ''},

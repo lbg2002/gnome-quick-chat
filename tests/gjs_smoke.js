@@ -29,7 +29,7 @@ import {SessionStore} from '../core/sessionStore.js';
 import {TurnController} from '../core/turnController.js';
 import {requireWorkspaceDirectory, writePrivateFileAsync, removeFileQuietly} from '../core/paths.js';
 import {StreamingMarkdownParser} from '../core/markdownStreamParser.js';
-import {HistoryWindowController, computeAdaptiveRenderDelayMs} from '../core/renderScheduler.js';
+import {HistoryWindowController, computeAdaptiveRenderDelayMs, formatMemoryReceipt} from '../core/renderScheduler.js';
 import {matchSlashCommands, applyQuickActionToDraft} from '../core/quickActions.js';
 import {AttachmentManager, extractCopiedFilePaths} from '../core/attachmentManager.js';
 import {BackgroundNotificationGate, resolveNotificationClickTarget} from '../core/notificationPolicy.js';
@@ -538,6 +538,20 @@ let mockHttpProc = null;
             assert(failure.status === 'failed' && success.status === 'committed' &&
                 (await sharedMemory.snapshot()).notes.has('memory://computer/preview.md'),
             'A fails independently and B actually writes its topic');
+            await memoryReader.request('prompt', {message: '从索引移出测试笔记 TEST_MEMORY_UNINDEX',
+                turnId: 'unindex-b'});
+            const unindexed = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'unindex-b');
+            const file = sharedMemory.path('computer', 'preview.md');
+            assert(unindexed.status === 'committed' && unindexed.message.includes('文件仍保留') &&
+                Decoder.decode(GLib.file_get_contents(file)[1]) === 'Verified shared-memory note' &&
+                !(await sharedMemory.snapshot()).notes.has('memory://computer/preview.md'),
+            'Unindex receipt confirms the same note remains on disk');
+            const deletedLine = formatMemoryReceipt(receipt);
+            const unindexedLine = formatMemoryReceipt(unindexed);
+            assert(deletedLine.includes('forget-a') && deletedLine.includes('忘记测试笔记') &&
+                deletedLine.includes('已删除：preview.md') && unindexedLine.includes('nindex-b') &&
+                unindexedLine.includes('从索引移出测试笔记') && unindexedLine.includes('文件仍保留：preview.md'),
+            'User-visible receipts attribute same-name notes to their original turns and actions');
         } finally {
             memoryWriter.close();
             memoryReader.close();

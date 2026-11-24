@@ -120,9 +120,11 @@ try {
         return bytes.length === invalidUtf8.length && bytes.every((byte, index) => byte === invalidUtf8[index]);
     }), 'Invalid UTF-8 journal archived byte for byte');
 
-    await computer.edit(await computer.snapshot(), current, JSON.stringify([
+    const forget = await computer.edit(await computer.snapshot(), current, JSON.stringify([
         {...edits[0], markdown: ''}, {...edits[1], markdown: null},
     ]), () => true);
+    assert(forget.some(change => change.address === topic && change.kind === 'deleted') &&
+        !forget.some(change => change.kind === 'unindexed'), 'Explicit deletion reported exactly once');
     assert(!(await computer.snapshot()).notes.has(topic) &&
         !GLib.file_test(computer.path('computer', 'desktop-apps.md'), GLib.FileTest.EXISTS), 'Forgotten topic deleted');
 } finally {

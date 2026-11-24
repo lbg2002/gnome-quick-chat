@@ -102,7 +102,7 @@ export class MarkdownMemory {
             if (typeof projectId !== 'string' || !/^[a-f0-9]{64}$/.test(projectId) ||
                 !Array.isArray(edits) || !edits.length || edits.length > MAX_CHANGES ||
                 edits.some(edit => !edit || !SCOPES.includes(edit.scope) ||
-                    typeof edit.name !== 'string' || !TOPIC.test(edit.name) ||
+                    typeof edit.name !== 'string' || !TOPIC.test(edit.name) || edit.markdown === '' ||
                     [edit.before, edit.markdown].some(value => value !== null &&
                         (typeof value !== 'string' || value.includes('\0') || encoder.encode(value).length > MAX_NOTE_BYTES))) ||
                 new Set(edits.map(({scope, name}) => scope + '/' + name)).size !== edits.length) {
@@ -224,7 +224,23 @@ export class MarkdownMemory {
             if (await this.recover() === false) {
                 throw new MemoryEditError('记忆提交遇到冲突或损坏，待恢复内容已归档');
             }
-            return edits.map(({scope, name}) => `memory://${scope}/${name}`);
+            const committed = edits.map(({scope, name, markdown}) => ({
+                address: `memory://${scope}/${name}`,
+                kind: markdown === null ? 'deleted' : 'updated',
+            }));
+            const deleted = new Set(committed.filter(change => change.kind === 'deleted').map(change => change.address));
+            for (const {scope, name, before, markdown} of edits) {
+                if (name !== INDEX) continue;
+                const remaining = topicLinks(markdown);
+                for (const topic of topicLinks(before)) {
+                    const address = `memory://${scope}/${topic}`;
+                    if (!remaining.has(topic) && !deleted.has(address) &&
+                        GLib.file_test(this.path(scope, topic), GLib.FileTest.EXISTS)) {
+                        committed.push({address, kind: 'unindexed'});
+                    }
+                }
+            }
+            return committed;
         });
     }
 }

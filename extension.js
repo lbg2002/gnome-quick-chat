@@ -1979,7 +1979,7 @@ export default class QuickChat extends Extension {
         this._capsule?.recordEvent(event);
 
         if (event.type === 'memory_notice') {
-            this._panel?.setMemoryReceipt(event.message);
+            this._panel?.setMemoryReceipt(event);
             return;
         }
 
