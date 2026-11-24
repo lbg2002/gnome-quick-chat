@@ -426,3 +426,51 @@ process.on('SIGTERM', () => {
 });
 `;
 }
+
+export function buildMemoryCliScriptSource(backend, logPath) {
+    return `#!/usr/bin/env node
+const fs = require('node:fs');
+const backend = ${JSON.stringify(backend)};
+const args = process.argv.slice(2);
+let stdin = '';
+function respond() {
+    const prompt = backend === 'zcode'
+        ? (args.find(arg => arg.startsWith('--prompt=')) || '').slice('--prompt='.length)
+        : stdin;
+    const recall = prompt.includes('只返回与当前任务最相关');
+    const update = prompt.includes('总结可跨会话复用');
+    const hasMemory = prompt.includes('Verified shared-memory note');
+    const expected = recall || update;
+    const readonly = backend === 'codex' ? args.includes('sandbox_mode="read-only"')
+        : backend === 'zcode' ? args.includes('plan')
+        : args[args.indexOf('--permission-mode') + 1] === 'read-only';
+    fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({recall, update, readonly, hasMemory}) + '\\n');
+    if (expected !== readonly) process.exit(2);
+    let answer = 'CLI main turn';
+    if (recall) answer = JSON.stringify(['memory://computer/preview.md']);
+    else if (update) answer = prompt.includes('TEST_MEMORY_WRITE') ? JSON.stringify([
+        {scope: 'computer', name: 'MEMORY.md', markdown: '[测试笔记](preview.md)'},
+        {scope: 'computer', name: 'preview.md', markdown: 'Verified shared-memory note'},
+    ]) : '[]';
+    else if (prompt.includes('TEST_MEMORY_RECALL')) answer = hasMemory ? 'RECALL_OK' : 'RECALL_MISSING';
+    const emit = obj => console.log(JSON.stringify(obj));
+    if (backend === 'codex') {
+        emit({type: 'thread.started', thread_id: 'memory-thread'});
+        emit({type: 'item.completed', item: {id: 'result', type: 'agent_message', text: answer}});
+        emit({type: 'turn.completed'});
+    } else if (backend === 'zcode') {
+        emit({type: 'result', sessionId: 'memory-zcode', response: answer, is_error: false});
+        emit({type: 'turn.completed'});
+    } else {
+        emit({type: 'session', sessionId: 'memory-dsh'});
+        emit({type: 'final', reason: {kind: 'completed'}, sessionId: 'memory-dsh', text: answer});
+    }
+}
+if (backend === 'zcode') respond();
+else {
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { stdin += chunk; });
+    process.stdin.on('end', respond);
+}
+`;
+}

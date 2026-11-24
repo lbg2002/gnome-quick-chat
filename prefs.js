@@ -1038,16 +1038,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         const refreshMemoryRow = () => {
             if (!hasKey('shared-memory-backends')) return;
-            memoryRow.active = s.get_strv('shared-memory-backends')
-                .includes(registry.getMemoryDestination(getEffectiveBackend()));
+            memoryRow.active = registry.isMemoryEnabled(getEffectiveBackend());
         };
         memoryRow.connect('notify::active', () => {
             if (!hasKey('shared-memory-backends')) return;
-            const target = registry.getMemoryDestination(getEffectiveBackend());
-            const destinations = s.get_strv('shared-memory-backends');
-            if (destinations.includes(target) === memoryRow.active) return;
-            s.set_strv('shared-memory-backends', memoryRow.active
-                ? [...destinations, target] : destinations.filter(value => value !== target));
+            registry.setMemoryEnabled(getEffectiveBackend(), memoryRow.active);
         });
         privacyGroup.add(memoryRow);
         const memoryLocation = new Adw.ActionRow({title: '我的电脑 · Markdown 记忆', subtitle: getMemoryDirectory()});

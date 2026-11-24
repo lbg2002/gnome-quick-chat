@@ -51,6 +51,7 @@ import {buildAskUserModifiedInput, getBackendCapabilities} from '../protocol.js'
 import {
     buildFakeCodexCliScriptSource,
     buildFakeZCodeCliScriptSource,
+    buildMemoryCliScriptSource,
     buildMockOpenAiDualOriginServerScriptSource,
 } from './fixtures/productionAdapterFixtures.js';
 
@@ -522,6 +523,82 @@ let mockHttpProc = null;
         } finally {
             memoryWriter.close();
             memoryReader.close();
+        }
+
+        // All four adapters participate in the same cross-backend memory protocol.
+        const schemaDir = Gio.File.new_for_uri(import.meta.url).get_parent().get_parent().get_child('schemas').get_path();
+        Gio.Subprocess.new(['glib-compile-schemas', '--strict', '--targetdir', tmpRoot, schemaDir],
+            Gio.SubprocessFlags.NONE).wait_check(null);
+        const schema = Gio.SettingsSchemaSource.new_from_directory(tmpRoot, null, false)
+            .lookup('org.gnome.shell.extensions.quick-chat', false);
+        const routeSettings = Gio.Settings.new_full(schema, Gio.memory_settings_backend_new(), null);
+        const routeRegistry = new BackendRegistry(routeSettings);
+        routeSettings.set_string('openai-base-url', originABase);
+        routeSettings.set_string('openai-model', 'gpt-4o-mini');
+        routeSettings.set_string('dsh-model', 'deepseek-v4-pro');
+        const memoryBackends = ['codex', 'zcode', 'dsh', 'openai'];
+        const runtimes = {openai: memoryRuntime};
+        const cliLogs = {};
+        for (const backend of memoryBackends) {
+            if (backend !== 'openai') {
+                const executable = GLib.build_filenamev([tmpRoot, 'memory-' + backend]);
+                cliLogs[backend] = executable + '.log';
+                writeExecutableScriptSync(executable, buildMemoryCliScriptSource(backend, cliLogs[backend]));
+                routeSettings.set_string(backend + '-path', executable);
+                routeSettings.set_string(backend + '-agent-mode', 'full');
+                runtimes[backend] = {backend, executable, pathEnv: GLib.getenv('PATH')};
+            }
+            assert(!routeRegistry.buildRuntimeConfig(backend).autoMemory, 'Memory starts off for ' + backend);
+            routeRegistry.setMemoryEnabled(backend, true);
+            assert(routeRegistry.buildRuntimeConfig(backend).autoMemory, 'Settings enable ' + backend);
+        }
+        routeSettings.set_string('openai-base-url', originABase + '/other');
+        assert(!routeRegistry.buildRuntimeConfig('openai').autoMemory, 'API destination change requires its own opt-in');
+        routeSettings.set_string('openai-base-url', originABase);
+
+        async function runMemoryTurn(backend, memory, id, message, options = {}) {
+            const events = [];
+            const client = new BackendClient(event => events.push(event), () => {});
+            const config = routeRegistry.buildRuntimeConfig(backend);
+            client._initWithRuntime({...runtimes[backend]}, config, tmpRoot, tmpRoot, id);
+            if (client._memory) client._memory = memory;
+            try {
+                await client.request('prompt', {message, turnId: id, ...options});
+                const done = await waitForEventGjs(events, event => event.type === 'agent_settled');
+                assert(done.status === 'completed', id + ' main turn completed: ' + done.errorMessage);
+                if (options.expectWrite) {
+                    const receipt = await waitForEventGjs(events, event => event.type === 'memory_notice');
+                    assert(receipt.status === 'committed', id + ' memory committed: ' + receipt.message);
+                } else {
+                    assert(client._memoryUpdates.size === 0, id + ' did not schedule learning');
+                }
+                return events.filter(event => event.type === 'message_end')
+                    .flatMap(event => event.message?.content || []).map(part => part.text || '').join('');
+            } catch (error) {
+                throw new Error(id + ": " + error.message);
+            } finally {
+                client.close();
+            }
+        }
+
+        for (const writer of memoryBackends) {
+            const memory = new MarkdownMemory(tmpRoot, GLib.build_filenamev([tmpRoot, 'from-' + writer]));
+            await runMemoryTurn(writer, memory, 'writer-' + writer, 'TEST_MEMORY_WRITE', {expectWrite: true});
+            for (const reader of memoryBackends.filter(backend => backend !== writer)) {
+                const text = await runMemoryTurn(reader, memory, writer + '-to-' + reader, 'TEST_MEMORY_RECALL',
+                    {displayUserText: '测试对话中的附件显示文本'});
+                assert(text === 'RECALL_OK', writer + ' to ' + reader + ' recalls its model-written topic: ' + text);
+            }
+            routeRegistry.setMemoryEnabled(writer, false);
+            const text = await runMemoryTurn(writer, memory, 'disabled-' + writer, 'TEST_MEMORY_RECALL');
+            assert(text === 'RECALL_MISSING', writer + ' receives no Markdown when memory is disabled');
+            routeRegistry.setMemoryEnabled(writer, true);
+        }
+        for (const [backend, log] of Object.entries(cliLogs)) {
+            const calls = Decoder.decode(GLib.file_get_contents(log)[1]).trim().split('\n').map(line => JSON.parse(line));
+            assert(calls.filter(call => call.update).length === 1 && calls.every(call =>
+                call.recall || call.update ? call.readonly : !call.readonly),
+            backend + ' only uses read-only for auxiliary calls and skips learning on attachment turns');
         }
 
         // 5D2. Real DSH Headless JSONL → Gio.Subprocess → shared TurnController.

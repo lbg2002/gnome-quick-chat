@@ -574,7 +574,6 @@ export class BackendClient {
     _initWithRuntime(runtime, config, workspace, sessionDir, sessionId, options = {}) {
         this._config = config;
         this._workspace = workspace;
-        this._sessionDir = sessionDir;
         this._sessionId = sessionId;
         this._clientGeneration = Number(options.clientGeneration || 0);
         this._specialDirs = getUserSpecialDirs();
@@ -583,6 +582,7 @@ export class BackendClient {
         this._backend = this._runtime.backend;
 
         this._store = new SessionStore(sessionId, {
+            sessionsRootDir: sessionDir,
             onSaveError: errInfo => {
                 if (!this._closed) {
                     this._event({

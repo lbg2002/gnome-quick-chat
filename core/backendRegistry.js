@@ -447,6 +447,18 @@ export class BackendRegistry {
         return JSON.stringify([backend, endpoint, profile.provider || '']);
     }
 
+    isMemoryEnabled(backend) {
+        return readStrv(this._settings, 'shared-memory-backends').includes(this.getMemoryDestination(backend));
+    }
+
+    setMemoryEnabled(backend, enabled) {
+        const key = 'shared-memory-backends';
+        const target = this.getMemoryDestination(backend);
+        const destinations = readStrv(this._settings, key).filter(value => value !== target);
+        if (enabled) destinations.push(target);
+        return writeStrv(this._settings, key, destinations);
+    }
+
     buildRuntimeConfig(effectiveBackend, {apiKey = ''} = {}) {
         const profile = this.getBackendProfile(effectiveBackend);
         const configuredBackend = this.getConfiguredBackend();
@@ -467,8 +479,7 @@ export class BackendRegistry {
             assistantInstructions: readString(this._settings, 'desktop-assistant-prompt', '').trim(),
             dshAutoReview: effectiveBackend === 'dsh'
                 ? readBoolean(this._settings, 'dsh-auto-review', false) : false,
-            autoMemory: readStrv(this._settings, 'shared-memory-backends').includes(
-                this.getMemoryDestination(effectiveBackend)),
+            autoMemory: this.isMemoryEnabled(effectiveBackend),
             mode: profile.mode || 'readonly',
             workspace: profile.workspace || '',
             configGeneration: this._generation,
