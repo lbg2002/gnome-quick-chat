@@ -8,7 +8,7 @@ import {
     resolveAssistantDisplayModel,
 } from '../core/renderScheduler.js';
 import {renderCardBodyIncremental} from './markdownRenderer.js';
-import {H, V, createStButton} from './tracePanel.js';
+import {H, V, createStButton, createWrapLabel} from './tracePanel.js';
 
 /**
  * Factory and lifecycle helper for user & assistant message cards (Stage E).
@@ -22,7 +22,6 @@ export class MessageCardFactory {
         isMarkdownEnabled,
         isAnimEnabled,
         isCardStreaming,
-        getFallbackModelLabel,
         scheduleTimeout,
         clearTimer,
         easeActor,
@@ -30,6 +29,7 @@ export class MessageCardFactory {
         onScrollBottom,
         onRetryAssistantCard,
         onContinueAssistantCard = null,
+        onChooseTask = null,
         onEditUserCard = null,
     }) {
         this._tracePanel = tracePanel;
@@ -37,7 +37,6 @@ export class MessageCardFactory {
         this._isMarkdownEnabled = isMarkdownEnabled;
         this._isAnimEnabled = isAnimEnabled;
         this._isCardStreaming = isCardStreaming;
-        this._getFallbackModelLabel = getFallbackModelLabel;
         this._scheduleTimeout = scheduleTimeout;
         this._clearTimer = clearTimer;
         this._easeActor = easeActor;
@@ -45,6 +44,7 @@ export class MessageCardFactory {
         this._onScrollBottom = onScrollBottom;
         this._onRetryAssistantCard = onRetryAssistantCard;
         this._onContinueAssistantCard = onContinueAssistantCard;
+        this._onChooseTask = onChooseTask;
         this._onEditUserCard = onEditUserCard;
     }
 
@@ -103,6 +103,44 @@ export class MessageCardFactory {
         });
     }
 
+    setReplyDetails(card, {memoryReferences = [], memoryReason = '', taskChoices = [], taskProgress = null} = {}) {
+        card.memoryReferences = memoryReferences;
+        card.memoryReason = memoryReason;
+        card.taskChoices = taskChoices;
+        card.taskProgress = taskProgress;
+        card.replyDetails?.destroy();
+        card.replyDetails = null;
+        if (!memoryReferences.length && !taskChoices.length && !taskProgress) return;
+
+        const details = new St.BoxLayout({orientation: V, x_expand: true});
+        if (memoryReferences.length) {
+            const names = memoryReferences.map(address => {
+                const [scope, name] = address.slice('memory://'.length).split('/');
+                return (scope === 'project' ? '项目 / ' : '电脑 / ') + name;
+            }).join('、');
+            const sources = createWrapLabel([memoryReason, names].filter(Boolean).join('\n'), 'qc-time');
+            sources.hide();
+            const toggle = createStButton('参考了记忆 ▾', () => {
+                sources.visible = !sources.visible;
+                toggle.label = sources.visible ? '参考了记忆 ▴' : '参考了记忆 ▾';
+            }, 'qc-copy-btn', '查看这条回答参考的记忆');
+            details.add_child(toggle);
+            details.add_child(sources);
+        }
+        if (taskProgress) {
+            const lines = [];
+            if (taskProgress.completed.length) lines.push('已完成的工具调用 · ' + taskProgress.completed.join('、'));
+            if (taskProgress.blocked.length) lines.push('遇到问题 · ' + taskProgress.blocked.join('、'));
+            if (taskProgress.unconfirmed?.length) lines.push('结果未确认 · ' + taskProgress.unconfirmed.join('、'));
+            details.add_child(createWrapLabel(lines.join('\n'), 'qc-time'));
+        }
+        for (const choice of taskChoices) {
+            details.add_child(createStButton(choice, () => this._onChooseTask?.(card, choice), 'qc-copy-btn'));
+        }
+        card.box.add_child(details);
+        card.replyDetails = details;
+    }
+
     destroyCardActor(card) {
         if (!card) return;
         releaseCardRuntimeReferences(card, {clearTimer: this._clearTimer});
@@ -118,6 +156,8 @@ export class MessageCardFactory {
             createdAt = '',
             ts = 0,
             modelId = '',
+            selectedModelId = '',
+            reportedModelId = '',
             backend = '',
             status = 'completed',
             partial = false,
@@ -131,10 +171,9 @@ export class MessageCardFactory {
             x_expand: true,
         });
 
-        const fallbackLabel = this._getFallbackModelLabel() || '随问';
         const displayModel = role === 'user'
             ? '我'
-            : resolveAssistantDisplayModel({modelId, backend}, fallbackLabel);
+            : resolveAssistantDisplayModel({modelId, selectedModelId, reportedModelId, backend});
         const effectiveTs = ts > 0 ? ts : (createdAt ? Date.parse(createdAt) || Date.now() : Date.now());
         const displayTime = formatMessageTimestamp({ts: effectiveTs, createdAt});
 
@@ -169,7 +208,9 @@ export class MessageCardFactory {
             turnId: String(turnId || ''),
             messageId: effectiveMsgId,
             replyTo: String(replyTo || ''),
-            modelId: String(modelId || (role === 'assistant' ? fallbackLabel : '')),
+            modelId,
+            selectedModelId,
+            reportedModelId,
             backend: String(backend || ''),
             effectiveTs,
             createdAt: createdAt || new Date(effectiveTs).toISOString(),
@@ -264,6 +305,7 @@ export class MessageCardFactory {
         });
         box.add_child(bodyBox);
         card.bodyBox = bodyBox;
+        if (role === 'assistant') this.setReplyDetails(card, options);
 
         const executeFlushPass = (forceAll = false) => {
             const t0 = GLib.get_monotonic_time();

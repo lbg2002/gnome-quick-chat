@@ -54,6 +54,7 @@ import {
 import {
     appendBoundedInMemoryText,
     applyToolTraceEventToCard,
+    resolveAssistantDisplayModel,
 } from './core/renderScheduler.js';
 import {
     loadOpenAIApiKey,
@@ -164,7 +165,6 @@ export default class QuickChat extends Extension {
                 isMarkdownEnabled: () => this._markdownEnabled(),
                 isAnimEnabled: () => this._animEnabled(),
                 isCardStreaming: card => Boolean(card === this._live && this._chatController?.busy),
-                getFallbackModelLabel: () => this._modelLabel || '随问',
                 scheduleTimeout: (ms, fn) => this._scheduleTimeout(ms, fn),
                 clearTimer: id => this._clearTimer(id),
                 easeActor: (actor, params) => this._easeActor(actor, params),
@@ -177,6 +177,7 @@ export default class QuickChat extends Extension {
                 onScrollBottom: (force, animate) => this._panel?.scrollBottom(force, animate),
                 onRetryAssistantCard: card => this._retryForAssistantCard(card),
                 onContinueAssistantCard: card => this._continueForAssistantCard(card),
+                onChooseTask: (card, choice) => this._chooseTask(card, choice),
                 onEditUserCard: card => this._beginEditUserCard(card),
             });
 
@@ -1018,6 +1019,14 @@ export default class QuickChat extends Extension {
                 this._observedSessionId = sessionId;
             }
             this._registry?.bumpGeneration();
+            if (keyName === 'backend' || keyName === 'model' || keyName.endsWith('-model')) {
+                const configured = this._registry?.getConfiguredBackend();
+                const backend = configured === 'auto' ? this._getEffectiveBackend() : configured;
+                const model = this._registry?.getBackendProfile(backend).model || '';
+                this._panel?.setModelSelection(resolveAssistantDisplayModel({
+                    backend, modelId: model || '待确认模型',
+                }));
+            }
             if (cacheInvalidateKeys.has(keyName)) {
                 invalidateBackendDetectionCaches();
                 this._refreshAvailableBackendsAsync();
@@ -1194,6 +1203,7 @@ export default class QuickChat extends Extension {
         if (state.unconfigured || state.backend === 'unconfigured') {
             this._modelLabel = '未配置后端';
             this._idleStatus = '未配置后端';
+            this._panel?.setModelSelection('未配置后端');
             const reason = state.reason || '未检测到可用后端，请在设置（⚙）中配置';
             this._panel?.setStatusIndicator('error', reason);
             this._syncDiagnosticsSnapshot({
@@ -1222,13 +1232,16 @@ export default class QuickChat extends Extension {
                 : state.backend === 'dsh'
                     ? 'DeepSeek Harness'
                     : 'ZCode';
-        this._modelLabel = state.model?.id || config.model || backendTag;
+        this._modelLabel = state.model?.modelId || config.model || '';
+        this._panel?.setModelSelection(resolveAssistantDisplayModel({
+            backend: state.backend, modelId: this._modelLabel || '待确认模型',
+        }, backendTag));
 
         const effectiveMode = state.effectiveMode || config.mode;
         const caps = state.capabilities || getBackendCapabilities(state.backend, effectiveMode);
         const badge = caps.modeBadges?.[effectiveMode] || caps.modeBadges?.[config.mode] || '';
         const httpWarnSuffix = state.endpointSecurity?.isRemotePlaintextHttp ? ' · ⚠️明文HTTP' : '';
-        this._idleStatus = (badge ? `${this._modelLabel} · ${badge}` : this._modelLabel) + httpWarnSuffix;
+        this._idleStatus = (badge || '就绪') + httpWarnSuffix;
 
         const defaultBridgeDiag = state.backend === 'zcode'
             ? (this._diagState?.bridgeHandshake ||
@@ -1300,6 +1313,14 @@ export default class QuickChat extends Extension {
             clearEntry: false,
             recordHistoryText: '',
         });
+    }
+
+    _chooseTask(card, choice) {
+        if (!this._isSessionUnlockedAndAlive() || this._isBusyOrMutating() ||
+            !card.taskChoices?.includes(choice) ||
+            this._panel?.historyWindow?.allMessages?.at(-1)?.id !== card.messageId) return;
+        const prompt = '继续刚才的任务，我选「' + choice + '」。';
+        return this._executePromptTurn({promptText: prompt, clearEntry: false, recordHistoryText: prompt});
     }
 
     _continueForAssistantCard(assistantCard) {
@@ -1743,8 +1764,10 @@ export default class QuickChat extends Extension {
                 turnId: event?.turnId || activeTurn?.turnId || '',
                 messageId: event?.messageId || activeTurn?.messageId || '',
                 replyTo: event?.replyTo || activeTurn?.userMessageId || '',
-                modelId: event?.modelId || this._modelLabel || '',
-                backend: this._getEffectiveBackend(),
+                modelId: event?.message?.modelId || event?.modelId || this._modelLabel || '',
+                selectedModelId: event?.message?.selectedModelId || this._modelLabel || '',
+                reportedModelId: event?.message?.reportedModelId || '',
+                backend: event?.message?.backend || this._chatController?.lastState?.backend || '',
             });
         } else {
             if (event?.turnId && !this._live.turnId) this._live.turnId = event.turnId;
@@ -2014,18 +2037,10 @@ export default class QuickChat extends Extension {
 
         if (event.type === 'message_start' && event.message?.role === 'assistant') {
             if (event.modelId) {
-                const suffix = (this._idleStatus || '').includes(' · ')
-                    ? ` · ${(this._idleStatus || '').split(' · ').slice(1).join(' · ')}`
-                    : '';
-                this._modelLabel = event.modelId;
-                this._idleStatus = `${event.modelId}${suffix}`;
+                const card = this._ensureLiveCard(event);
+                card.modelId = event.modelId;
+                if (card.roleLabel) card.roleLabel.text = resolveAssistantDisplayModel(card);
                 this._syncDiagnosticsSnapshot({activeModel: event.modelId});
-                if (this._live) {
-                    this._live.modelId = event.modelId;
-                    if (this._live.roleLabel) {
-                        this._live.roleLabel.text = event.modelId;
-                    }
-                }
             }
             if (activeTurn && !this._tracePanel.hasPendingApprovalNodes(this._live)) {
                 activeTurn.state = 'streaming';
@@ -2224,9 +2239,15 @@ export default class QuickChat extends Extension {
             const finishReason = String(event.finishReason || event.message?.finishReason || '');
             const isPartial = Boolean(event.partial || event.message?.partial || finishReason === 'length');
             const usage = event.usage || event.message?.usage || null;
-            if (text || thinking || event.message.errorMessage) {
+            if (text || thinking || event.message.errorMessage || event.message.taskChoices?.length ||
+                event.message.taskProgress || event.message.memoryReferences?.length) {
                 const card = this._ensureLiveCard(event);
-                if (text && card.text !== text) {
+                for (const field of ['backend', 'modelId', 'selectedModelId', 'reportedModelId']) {
+                    if (event.message[field]) card[field] = event.message[field];
+                }
+                if (card.roleLabel) card.roleLabel.text = resolveAssistantDisplayModel(card);
+                this._cardFactory.setReplyDetails(card, event.message);
+                if (card.text !== text) {
                     card.text = text;
                     card.dirty.text = true;
                 }
@@ -2248,7 +2269,14 @@ export default class QuickChat extends Extension {
                 this._panel.historyWindow?.updateStoredMessageById(card.messageId, {
                     text: card.text,
                     thinking: card.thinking,
-                    modelId: card.modelId || this._modelLabel || '',
+                    backend: card.backend,
+                    modelId: card.modelId,
+                    selectedModelId: card.selectedModelId,
+                    reportedModelId: card.reportedModelId,
+                    memoryReferences: card.memoryReferences,
+                    memoryReason: card.memoryReason,
+                    taskChoices: card.taskChoices,
+                    taskProgress: card.taskProgress,
                     ...(finishReason ? {finishReason} : {}),
                     ...(isPartial ? {partial: true} : {}),
                     ...(usage ? {usage} : {}),
@@ -2303,7 +2331,7 @@ export default class QuickChat extends Extension {
                 this._panel.historyWindow?.updateStoredMessageById(settledCard.messageId, {
                     text: settledCard.text,
                     thinking: settledCard.thinking,
-                    modelId: settledCard.modelId || this._modelLabel || '',
+                    modelId: settledCard.modelId,
                     status: terminalStatus,
                     partial: isPartial,
                     ...(settledCard.finishReason ? {finishReason: settledCard.finishReason} : {}),

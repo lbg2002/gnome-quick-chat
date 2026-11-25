@@ -163,5 +163,6 @@ test('DSH checks the route in the live request header before accepting answer ev
     sdk.read(frame({id: 'qc-init', result: {serverInfo: {name: 'deepseek-harness-sdk-runtime'}}}));
     const header = model => event('request/header', {header: {config: {provider: 'codex', model}}});
     assert.equal(sdk.read(header('gpt-6.1-terra')), null);
-    assert.throws(() => sdk.read(header('gpt-6-astra')), /gpt-6\.1-terra.*gpt-6-astra/);
+    assert.throws(() => sdk.read(header('gpt-6-astra')), error =>
+        /gpt-6\.1-terra.*gpt-6-astra/.test(error.message) && error.reportedModelId === 'gpt-6-astra');
 });

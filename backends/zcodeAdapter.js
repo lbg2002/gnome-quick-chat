@@ -128,6 +128,8 @@ export class ZCodeAdapter extends BaseBackendAdapter {
 
         const cancellable = new Gio.Cancellable();
         const turn = this._turns.beginTurn({
+            replyMarker: turnMeta.replyMarker,
+            allowedMemoryReferences: turnMeta.allowedMemoryReferences,
             turnId: turnMeta.turnId,
             messageId: turnMeta.messageId,
             replyTo: turnMeta.userMessageId || '',
@@ -174,7 +176,7 @@ export class ZCodeAdapter extends BaseBackendAdapter {
                 this._runtime.resolvedProvider = zcodeIsolated.resolvedProvider || this._runtime.resolvedProvider;
                 this._runtime.resolvedModel = zcodeIsolated.resolvedModel;
                 this._runtime.label = zcodeIsolated.resolvedModel;
-                turn.modelId = zcodeIsolated.resolvedModel;
+                turn.selectedModelId = turn.modelId = zcodeIsolated.resolvedModel;
             }
             if (useZCodePromptFile) {
                 const runtimeDir = getPrivateRuntimeDir();

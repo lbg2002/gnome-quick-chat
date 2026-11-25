@@ -142,3 +142,43 @@ test('Approval state pauses watchdog and only resumes watchdog once all pending 
     assert.equal(turn.state, 'streaming');
     assert.equal(resetCount, 1);
 });
+
+test('Assistant replies keep model identity, selected references and partial tool progress', () => {
+    const events = [];
+    const persisted = [];
+    const controller = new TurnController(event => events.push(event));
+    const marker = '[随问回执 test]';
+    const address = 'memory://computer/project.md';
+    const first = controller.beginTurn({
+        backend: 'dsh', modelId: 'Terra', replyMarker: marker,
+        allowedMemoryReferences: new Set([address]),
+    });
+    controller.appendText(first, '找到两个项目。\n[随问回');
+    controller.appendText(first, '执 test]' + JSON.stringify({
+        used: [address, 'memory://computer/not-read.md'],
+        reason: '上次确认了项目',
+        choices: ['项目 A', '项目 B'],
+    }));
+    controller.finalizeTurn(first, {status: 'completed', onPersistAssistant: message => persisted.push(message)});
+
+    const second = controller.beginTurn({backend: 'dsh', modelId: 'Astra'});
+    second.reportedModelId = 'Terra';
+    controller.finalizeTurn(second, {status: 'failed', errorText: '模型不匹配',
+        onPersistAssistant: message => persisted.push(message)});
+
+    const retry = controller.beginTurn({backend: 'zcode', modelId: 'Astra'});
+    controller.recordToolEnd(retry, {toolCallId: 'step-1', toolName: 'Read', executionOutcome: 'succeeded'});
+    controller.recordToolEnd(retry, {toolCallId: 'step-2', toolName: 'Check', executionOutcome: 'failed'});
+    controller.finalizeTurn(retry, {status: 'failed', errorText: '无法完成最后一步',
+        onPersistAssistant: message => persisted.push(message)});
+
+    assert.equal(persisted[0].modelId, 'Terra');
+    assert.equal(persisted[0].backend, 'dsh');
+    assert.deepEqual(persisted[0].memoryReferences, [address]);
+    assert.deepEqual(persisted[0].taskChoices, ['项目 A', '项目 B']);
+    assert.equal(persisted[0].content[0].text, '找到两个项目。');
+    assert.ok(!JSON.stringify(events).includes('not-read.md'));
+    assert.equal(persisted[1].selectedModelId, 'Astra');
+    assert.equal(persisted[1].reportedModelId, 'Terra');
+    assert.deepEqual(persisted[2].taskProgress, {completed: ['Read'], blocked: ['Check'], unconfirmed: []});
+});

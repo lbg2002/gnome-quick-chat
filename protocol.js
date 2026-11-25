@@ -96,12 +96,17 @@ export function detailedMessages(messages) {
             ...(typeof m.ts === 'number' && m.ts > 0 ? {ts: m.ts} : {}),
             ...(m.backend ? {backend: m.backend} : {}),
             modelId: m.modelId || '',
+            ...(m.selectedModelId ? {selectedModelId: m.selectedModelId} : {}),
+            ...(m.reportedModelId ? {reportedModelId: m.reportedModelId} : {}),
+            ...(m.memoryReferences?.length ? {memoryReferences: m.memoryReferences, memoryReason: m.memoryReason || ''} : {}),
+            ...(m.taskChoices?.length ? {taskChoices: m.taskChoices} : {}),
+            ...(m.taskProgress ? {taskProgress: m.taskProgress} : {}),
             status: m.status || 'completed',
             ...(m.partial ? {partial: true} : {}),
             ...(typeof m.finishReason === 'string' && m.finishReason ? {finishReason: m.finishReason} : {}),
             ...(m.errorMessage ? {errorMessage: m.errorMessage} : {}),
         }))
-        .filter(m => m.text.length > 0 || m.thinking.length > 0 || Boolean(m.errorMessage));
+        .filter(m => m.text.length > 0 || m.thinking.length > 0 || Boolean(m.errorMessage || m.taskChoices?.length || m.taskProgress));
 }
 
 /**

@@ -47,6 +47,8 @@ export class DshAdapter extends BaseBackendAdapter {
         if (!budgetCheck.ok) throw new Error(budgetCheck.warning || '当前提问超过输入上限');
 
         const turn = this._turns.beginTurn({
+            replyMarker: turnMeta.replyMarker,
+            allowedMemoryReferences: turnMeta.allowedMemoryReferences,
             turnId: turnMeta.turnId,
             messageId: turnMeta.messageId,
             replyTo: turnMeta.userMessageId || '',
@@ -130,7 +132,7 @@ export class DshAdapter extends BaseBackendAdapter {
                 }, remoteId, {overlayPath});
             }
             if (model && cleanDshModelId(model)) {
-                turn.modelId = model;
+                turn.selectedModelId = turn.modelId = model;
             }
         } catch (err) {
             turn.tempFiles.splice(0).forEach(removeFileQuietly);

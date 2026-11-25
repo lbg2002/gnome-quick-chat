@@ -59,6 +59,8 @@ export class CodexAdapter extends BaseBackendAdapter {
 
         const cancellable = new Gio.Cancellable();
         const turn = this._turns.beginTurn({
+            replyMarker: turnMeta.replyMarker,
+            allowedMemoryReferences: turnMeta.allowedMemoryReferences,
             turnId: turnMeta.turnId,
             messageId: turnMeta.messageId,
             replyTo: turnMeta.userMessageId || '',

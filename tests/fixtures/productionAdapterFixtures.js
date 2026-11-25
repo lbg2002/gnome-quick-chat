@@ -353,7 +353,14 @@ const serverA = http.createServer((req, res) => {
 
             let memoryAnswer = '';
             if (lastUserContent.startsWith('总结可跨会话复用')) {
-                if (lastUserContent.includes('TEST_MIXED_RECEIPT')) {
+                if (lastUserContent.includes('TEST_REFERENCED_CORRECTION')) {
+                    const context = JSON.parse(lastUserContent.split('\\n').at(-1));
+                    const address = 'memory://computer/preview.md';
+                    memoryAnswer = JSON.stringify(context.previousReferences?.includes(address) &&
+                        context.notes[address] === '最近确认过项目 A' ? [
+                            {scope: 'computer', name: 'preview.md', markdown: '以后优先继续项目 B'},
+                        ] : []);
+                } else if (lastUserContent.includes('TEST_MIXED_RECEIPT')) {
                     memoryAnswer = JSON.stringify([
                         {scope: 'computer', name: 'MEMORY.md', markdown: '[更新](preview.md)'},
                         {scope: 'computer', name: 'preview.md', markdown: 'Updated'},
@@ -393,7 +400,20 @@ const serverA = http.createServer((req, res) => {
                 }
             } else if (lastUserContent.startsWith('只返回与当前任务最相关')) {
                 memoryAnswer = JSON.stringify(lastUserContent.includes('TEST_MIXED_RECEIPT')
-                    ? ['memory://computer/preview.md', 'memory://project/preview.md'] : ['memory://computer/preview.md']);
+                    ? ['memory://computer/preview.md', 'memory://project/preview.md']
+                    : lastUserContent.includes('TEST_RESUME_CHOICES')
+                        ? ['memory://computer/preview.md', 'memory://computer/other.md'] : ['memory://computer/preview.md']);
+            } else if (lastUserContent.includes('TEST_RESUME_CHOICES') || lastUserContent.includes('我选「项目 A」')) {
+                const marker = lastUserContent.match(/\\[随问回执 [a-f0-9-]+\\]/)?.[0];
+                if (marker && lastUserContent.includes('最近确认过项目 A')) {
+                    const choosing = lastUserContent.includes('我选「项目 A」');
+                    memoryAnswer = (choosing ? '我会先核实项目 A。' : '你要继续哪个项目？') + '\\n' +
+                        marker + (choosing
+                            ? JSON.stringify({used: ['memory://computer/preview.md', 'memory://computer/not-loaded.md'],
+                                reason: '上次确认了项目 A'})
+                            : lastUserContent.includes('最近确认过项目 B')
+                                ? JSON.stringify({choices: ['项目 A', '项目 B']}) : '{}');
+                }
             } else if (lastUserContent.includes('TEST_MEMORY_RECALL')) {
                 memoryAnswer = lastUserContent.includes('Verified shared-memory note')
                     ? 'RECALL_OK' : 'RECALL_MISSING';

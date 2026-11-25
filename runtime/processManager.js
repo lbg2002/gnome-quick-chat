@@ -918,7 +918,7 @@ export function spawnManagedCliTurn({
                     store?.setRemoteSessionId(norm.sessionId, backend, segCfg, {markSynced: false});
                 }
                 if (norm.type === 'message_start' && norm.modelId) {
-                    turn.modelId = norm.modelId;
+                    turn.reportedModelId = turn.modelId = norm.modelId;
                 }
                 turns.emitForTurn(turn, norm);
             }
@@ -984,6 +984,7 @@ export function spawnManagedCliTurn({
                 readStdoutLoop();
             } catch (err) {
                 if (turn.aborted || turn.timedOut) return;
+                if (backend === 'dsh' && err.reportedModelId) turn.reportedModelId = err.reportedModelId;
                 monitor.fatalError = err.message;
                 abortTurnForFatalMonitorError();
             }

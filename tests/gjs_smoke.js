@@ -600,6 +600,37 @@ let mockHttpProc = null;
             await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'read-error');
             assert(readReceipt.status === 'failed' && formatMemoryReceipt(readReceipt).includes('测试读取失败时的原问题'),
                 'Read failure is visibly attributed to its original prompt while the main turn completes');
+            const taskMemory = new MarkdownMemory(tmpRoot, GLib.build_filenamev([tmpRoot, 'task-recall']));
+            await taskMemory.edit(await taskMemory.snapshot(), new Map(), JSON.stringify([
+                {scope: 'computer', name: 'MEMORY.md', markdown: '[项目 A](preview.md) [项目 B](other.md)'},
+                {scope: 'computer', name: 'preview.md', markdown: '最近确认过项目 A'},
+                {scope: 'computer', name: 'other.md', markdown: '最近确认过项目 B'},
+            ]), () => true);
+            memoryReader._memory = taskMemory;
+            await memoryReader.request('prompt', {message: '继续上次那个项目 TEST_RESUME_CHOICES', turnId: 'task-choices'});
+            const choices = await waitForEventGjs(memoryReaderEvents, e => e.type === 'message_end' && e.turnId === 'task-choices');
+            await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'task-choices');
+            assert(choices.message.taskChoices?.join('/') === '项目 A/项目 B', 'Ambiguous continuation returns two choices');
+            await memoryReader.request('prompt', {message: '继续刚才的任务，我选「项目 A」。', turnId: 'task-selected'});
+            const selected = await waitForEventGjs(memoryReaderEvents, e => e.type === 'message_end' && e.turnId === 'task-selected');
+            await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'task-selected');
+            assert(selected.message.memoryReferences?.join('/') === 'memory://computer/preview.md' &&
+                selected.message.memoryReason === '上次确认了项目 A' &&
+                !selected.message.content.some(part => part.text?.includes('随问回执')),
+            'Only supplied memory can be cited and the control line is hidden');
+            await memoryReader.request('prompt', {message: '以后改用项目 B TEST_REFERENCED_CORRECTION', turnId: 'task-correction'});
+            const correction = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'task-correction');
+            assert(correction.status === 'committed' && Decoder.decode(GLib.file_get_contents(
+                taskMemory.path('computer', 'preview.md'))[1]) === '以后优先继续项目 B',
+            'A correction rewrites the note used in the preceding answer');
+            assert((await memoryReader.request('flush_session')).ok, 'Task history written to disk');
+            const reloadedTaskSession = new SessionStore('memory-reader', {sessionsRootDir: tmpRoot});
+            await reloadedTaskSession.load('openai', {});
+            const reopened = reloadedTaskSession.messages.find(message => message.turnId === 'task-selected' &&
+                message.role === 'assistant');
+            assert(reopened?.backend === 'openai' && reopened?.modelId &&
+                reopened.memoryReferences?.[0] === 'memory://computer/preview.md',
+            'Answer identity and used reference survive session reload');
         } finally {
             memoryWriter.close();
             memoryReader.close();

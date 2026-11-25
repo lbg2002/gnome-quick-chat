@@ -1,3 +1,4 @@
+import {cleanMemoryReason, cleanReplyChoices, cleanReplyReferences, cleanTaskProgress} from './assistantReply.js';
 /**
  * Pure-JS SessionStore persistence engine (Stage C1, zero GJS dependencies).
  *
@@ -233,8 +234,15 @@ export function normalizeStoredMessage(raw, {
         ? raw.rewindRevision
         : 0;
 
+    const memoryReferences = cleanReplyReferences(raw.memoryReferences);
+    const memoryReason = cleanMemoryReason(raw.memoryReason);
+    const taskChoices = cleanReplyChoices(raw.taskChoices);
+    const taskProgress = cleanTaskProgress(raw.taskProgress);
     const record = {
         id,
+        ...(memoryReferences.length ? {memoryReferences, ...(memoryReason ? {memoryReason} : {})} : {}),
+        ...(taskChoices.length >= 2 ? {taskChoices} : {}),
+        ...(taskProgress ? {taskProgress} : {}),
         ...(turnId ? {turnId} : {}),
         revision,
         role,
@@ -244,6 +252,8 @@ export function normalizeStoredMessage(raw, {
         ts,
         backend,
         modelId,
+        ...(typeof raw.selectedModelId === 'string' && raw.selectedModelId ? {selectedModelId: raw.selectedModelId.slice(0, 160)} : {}),
+        ...(typeof raw.reportedModelId === 'string' && raw.reportedModelId ? {reportedModelId: raw.reportedModelId.slice(0, 160)} : {}),
         ...(endpoint ? {endpoint} : {}),
         replyTo,
         status,
@@ -2333,6 +2343,8 @@ export function exportSessionFormatted(messagesOrOptions = [], meta = {}, option
                 createdAt: m.createdAt || '',
                 backend: m.backend || '',
                 modelId: m.modelId || '',
+                ...(m.selectedModelId ? {selectedModelId: m.selectedModelId} : {}),
+                ...(m.reportedModelId ? {reportedModelId: m.reportedModelId} : {}),
                 status: m.status || 'completed',
                 ...(m.partial ? {partial: true} : {}),
                 ...(m.finishReason ? {finishReason: m.finishReason} : {}),

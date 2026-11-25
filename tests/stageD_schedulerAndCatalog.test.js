@@ -217,9 +217,13 @@ test('D3: formatMessageTimestamp & resolveAssistantDisplayModel preserve real hi
     assert.equal(formatMessageTimestamp({ts: earlierMonth}, fixedNow), '10-03 21:18');
     assert.equal(formatMessageTimestamp({createdAt: new Date(prevYear).toISOString()}, fixedNow), '2025-05-20 08:00');
 
-    assert.equal(resolveAssistantDisplayModel({modelId: 'claude-sonnet-4-5', backend: 'zcode'}, 'gpt-5'), 'claude-sonnet-4-5');
+    assert.equal(resolveAssistantDisplayModel({modelId: 'claude-sonnet-4-5', backend: 'zcode'}, 'gpt-5'), 'ZCode · claude-sonnet-4-5');
     assert.equal(resolveAssistantDisplayModel({modelId: '', backend: 'codex'}, 'gpt-5'), 'Codex');
     assert.equal(resolveAssistantDisplayModel({}, 'deepseek-chat'), 'deepseek-chat');
+    assert.equal(resolveAssistantDisplayModel({backend: 'dsh', modelId: 'Terra'}), 'DSH · Terra');
+    assert.equal(resolveAssistantDisplayModel({
+        backend: 'dsh', modelId: 'Terra', selectedModelId: 'Terra', reportedModelId: 'Astra',
+    }), 'DSH · 实报 Astra（所选 Terra）');
 });
 
 test('D4: ExpiringResourceCache single-flight async load, invalidation, secret scrubbing, and 75-model search/favorites/pagination', async () => {

@@ -152,7 +152,9 @@ export class DshSdkTurn {
                 if (route?.provider !== expected.provider || route?.model !== expected.model) {
                     const actualProvider = safeText(route?.provider, 128) || '未知 Provider';
                     const actualModel = safeText(route?.model, 128) || '未知模型';
-                    throw new Error(`DSH 请求模型不匹配：已选 ${expected.provider}/${expected.model}，请求报告 ${actualProvider}/${actualModel}`);
+                    const error = new Error(`DSH 请求模型不匹配：已选 ${expected.provider}/${expected.model}，请求报告 ${actualProvider}/${actualModel}`);
+                    error.reportedModelId = actualModel;
+                    throw error;
                 }
                 return null;
             }

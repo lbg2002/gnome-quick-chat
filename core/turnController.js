@@ -7,6 +7,7 @@
  *   -> completed | cancelled | failed | interrupted | timed_out
  */
 
+import {cleanTaskProgress, splitAssistantReply, stripStreamingReplyMetadata} from './assistantReply.js';
 import {getToolBatchStatus, getToolEndStatus} from '../protocol.js';
 
 export const TURN_STATES = Object.freeze([
@@ -121,6 +122,10 @@ export class TurnController {
             state: 'starting',
             backend: meta.backend || '',
             modelId: String(meta.modelId || ''),
+            selectedModelId: String(meta.modelId || ''),
+            reportedModelId: '',
+            replyMarker: meta.replyMarker || '',
+            allowedMemoryReferences: meta.allowedMemoryReferences || null,
             replyTo: String(meta.replyTo || ''),
             promptText: meta.promptText || '',
             cancellable: meta.cancellable || null,
@@ -609,9 +614,11 @@ export class TurnController {
 
     _applyAggregatedText(turn, nextAggregated) {
         if (nextAggregated === turn.text) return true;
-        if (nextAggregated.startsWith(turn.text)) {
-            const delta = nextAggregated.slice(turn.text.length);
-            turn.text = nextAggregated;
+        const previous = stripStreamingReplyMetadata(turn.text, turn.replyMarker);
+        const visible = stripStreamingReplyMetadata(nextAggregated, turn.replyMarker);
+        turn.text = nextAggregated;
+        if (visible.startsWith(previous)) {
+            const delta = visible.slice(previous.length);
             if (delta) {
                 this._onEvent?.({
                     turnId: turn.id,
@@ -624,14 +631,13 @@ export class TurnController {
             }
             return true;
         }
-        turn.text = nextAggregated;
         this._onEvent?.({
             turnId: turn.id,
             messageId: turn.messageId,
             sessionId: turn.sessionId,
             clientGeneration: turn.clientGeneration,
             type: 'message_update',
-            assistantMessageEvent: {type: 'text_replace', text: nextAggregated},
+            assistantMessageEvent: {type: 'text_replace', text: visible},
         });
         return true;
     }
@@ -965,8 +971,30 @@ export class TurnController {
         }
 
         const isPartial = turn.state !== 'completed' || turn.finishReason === 'length';
+        const reply = splitAssistantReply(turn.text, turn.replyMarker, turn.allowedMemoryReferences, {partial: isPartial});
+        turn.text = reply.text;
+        const taskProgress = {completed: [], blocked: [], unconfirmed: []};
+        for (const tool of turn.toolExecutions.values()) {
+            if (tool.syntheticId) continue;
+            if (tool.status === 'done') taskProgress.completed.push(tool.toolName);
+            if (['error', 'denied', 'interrupted'].includes(tool.status)) taskProgress.blocked.push(tool.toolName);
+            if (tool.status === 'unknown') taskProgress.unconfirmed.push(tool.toolName);
+        }
+        const progress = isPartial || taskProgress.blocked.length || taskProgress.unconfirmed.length ? cleanTaskProgress(taskProgress) : null;
+        const replyMetadata = {
+            ...(reply.memoryReferences?.length ? {memoryReferences: reply.memoryReferences, memoryReason: reply.memoryReason} : {}),
+            ...(reply.taskChoices?.length ? {taskChoices: reply.taskChoices} : {}),
+            ...(progress ? {taskProgress: progress} : {}),
+        };
 
-        if (turn.text) {
+
+        const modelMetadata = {
+            ...(turn.backend ? {backend: turn.backend} : {}),
+            ...(turn.modelId ? {modelId: turn.modelId} : {}),
+            ...(turn.selectedModelId ? {selectedModelId: turn.selectedModelId} : {}),
+            ...(turn.reportedModelId ? {reportedModelId: turn.reportedModelId} : {}),
+        };
+        if (turn.text || reply.taskChoices?.length || progress || (turn.reportedModelId && turn.error && !turn.aborted)) {
             const contentParts = [];
             if (turn.thinking) contentParts.push({type: 'thinking', thinking: turn.thinking});
             contentParts.push({type: 'text', text: turn.text});
@@ -974,7 +1002,8 @@ export class TurnController {
                 id: turn.messageId,
                 turnId: turn.id,
                 ...(turn.replyTo ? {replyTo: turn.replyTo} : {}),
-                ...(turn.modelId ? {modelId: turn.modelId} : {}),
+                ...modelMetadata,
+                ...replyMetadata,
                 role: 'assistant',
                 content: contentParts,
                 status: turn.state,
@@ -1002,6 +1031,8 @@ export class TurnController {
                     ...(turn.reasoningEffort ? {reasoningEffort: turn.reasoningEffort} : {}),
                     message: {
                         id: turn.messageId,
+                        ...modelMetadata,
+                        ...replyMetadata,
                         role: 'assistant',
                         content: contentParts,
                         status: turn.state,
@@ -1026,6 +1057,7 @@ export class TurnController {
                 partial: true,
                 message: {
                     id: turn.messageId,
+                    ...modelMetadata,
                     role: 'assistant',
                     content: '',
                     status: turn.state,

@@ -280,7 +280,13 @@ export class ChatPanelView {
         this._status.clutter_text.line_wrap = false;
         this._status.clutter_text.ellipsize = Pango.EllipsizeMode.END;
         this._status.y_align = Clutter.ActorAlign.CENTER;
-        statusBox.add_child(this._status);
+        const statusLines = new St.BoxLayout({orientation: V, x_expand: true});
+        this._modelSelection = new St.Label({text: '正在检测模型…', style_class: 'qc-role'});
+        this._modelSelection.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        this._modelSelection.set_width(160);
+        statusLines.add_child(this._modelSelection);
+        statusLines.add_child(this._status);
+        statusBox.add_child(statusLines);
 
         const chevron = new St.Label({
             text: '▾',
@@ -1148,6 +1154,10 @@ export class ChatPanelView {
         }
     }
 
+    setModelSelection(label) {
+        if (this._modelSelection) this._modelSelection.text = label;
+    }
+
     setStatusIndicator(state, text) {
         if (!this._status || !this._statusDot) return;
         const nextText = String(text ?? '');
@@ -1301,6 +1311,12 @@ export class ChatPanelView {
                 ts: card.effectiveTs,
                 backend: card.backend,
                 modelId: card.modelId,
+                selectedModelId: card.selectedModelId,
+                reportedModelId: card.reportedModelId,
+                memoryReferences: card.memoryReferences,
+                memoryReason: card.memoryReason,
+                taskChoices: card.taskChoices,
+                taskProgress: card.taskProgress,
                 status: card.status || 'completed',
                 ...(card.partial ? {partial: true} : {}),
                 ...(card.finishReason ? {finishReason: card.finishReason} : {}),
@@ -1387,6 +1403,12 @@ export class ChatPanelView {
             createdAt: msg.createdAt || '',
             ts: msg.ts || 0,
             modelId: msg.modelId || '',
+            selectedModelId: msg.selectedModelId || '',
+            reportedModelId: msg.reportedModelId || '',
+            memoryReferences: msg.memoryReferences,
+            memoryReason: msg.memoryReason,
+            taskChoices: msg.taskChoices,
+            taskProgress: msg.taskProgress,
             backend: msg.backend || '',
             status: msg.status || 'completed',
             partial: Boolean(msg.partial),
@@ -1505,6 +1527,12 @@ export class ChatPanelView {
             createdAt: msg.createdAt || '',
             ts: msg.ts || 0,
             modelId: msg.modelId || '',
+            selectedModelId: msg.selectedModelId || '',
+            reportedModelId: msg.reportedModelId || '',
+            memoryReferences: msg.memoryReferences,
+            memoryReason: msg.memoryReason,
+            taskChoices: msg.taskChoices,
+            taskProgress: msg.taskProgress,
             backend: msg.backend || '',
             status: msg.status || 'completed',
             partial: Boolean(msg.partial),
@@ -1579,6 +1607,12 @@ export class ChatPanelView {
                 createdAt: msg.createdAt || '',
                 ts: msg.ts || 0,
                 modelId: msg.modelId || '',
+                selectedModelId: msg.selectedModelId || '',
+                reportedModelId: msg.reportedModelId || '',
+                memoryReferences: msg.memoryReferences,
+                memoryReason: msg.memoryReason,
+                taskChoices: msg.taskChoices,
+                taskProgress: msg.taskProgress,
                 backend: msg.backend || '',
                 status: msg.status || 'completed',
                 partial: Boolean(msg.partial),
@@ -1604,6 +1638,12 @@ export class ChatPanelView {
                 createdAt: msg.createdAt || '',
                 ts: msg.ts || 0,
                 modelId: msg.modelId || '',
+                selectedModelId: msg.selectedModelId || '',
+                reportedModelId: msg.reportedModelId || '',
+                memoryReferences: msg.memoryReferences,
+                memoryReason: msg.memoryReason,
+                taskChoices: msg.taskChoices,
+                taskProgress: msg.taskProgress,
                 backend: msg.backend || '',
                 status: msg.status || 'completed',
                 partial: Boolean(msg.partial),

@@ -735,6 +735,8 @@ export class OpenAIAdapter extends BaseBackendAdapter {
 
         const cancellable = new Gio.Cancellable();
         const turn = this._turns.beginTurn({
+            replyMarker: turnMeta.replyMarker,
+            allowedMemoryReferences: turnMeta.allowedMemoryReferences,
             turnId: turnMeta.turnId,
             messageId: turnMeta.messageId,
             replyTo: turnMeta.userMessageId || '',
@@ -762,7 +764,7 @@ export class OpenAIAdapter extends BaseBackendAdapter {
         let modelId;
         try {
             modelId = await this._discoverModelIfNeeded(turn.cancellable);
-            turn.modelId = modelId;
+            turn.selectedModelId = turn.modelId = modelId;
         } catch (err) {
             const cleanErr = redactSensitiveText(err?.message || String(err), {apiKey: this._runtime.apiKey});
             this._turns.finalizeTurn(turn, {status: 'failed', errorText: cleanErr});
@@ -1029,7 +1031,7 @@ export class OpenAIAdapter extends BaseBackendAdapter {
                     return false;
                 }
                 if (evt.type === 'delta') {
-                    if (evt.model && !turn.modelId) turn.modelId = evt.model;
+                    if (evt.model) turn.reportedModelId = turn.modelId = String(evt.model).slice(0, 160);
                     if (evt.finishReason) turn.finishReason = evt.finishReason;
                     if (evt.thinkingDelta) this._turns.appendThinking(turn, evt.thinkingDelta);
                     if (evt.textDelta) this._turns.appendText(turn, evt.textDelta);
@@ -1172,7 +1174,7 @@ export class OpenAIAdapter extends BaseBackendAdapter {
                         }
                         if (!applyParsedSseEvents(fin.events)) return;
                         if (fin.isNonSseJson) {
-                            if (fin.model && !turn.modelId) turn.modelId = fin.model;
+                            if (fin.model) turn.reportedModelId = turn.modelId = String(fin.model).slice(0, 160);
                             if (fin.finishReason) turn.finishReason = fin.finishReason;
                             if (fin.nonSseThinking) this._turns.replaceThinking(turn, fin.nonSseThinking);
                             if (fin.nonSseText) this._turns.replaceText(turn, fin.nonSseText);

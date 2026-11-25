@@ -81,6 +81,12 @@ function demoteMessageToIndexEntry(msg, compactPreviewBytes = 1024) {
             ts: Number(msg.ts || 0),
             backend: String(msg.backend || ''),
             modelId: String(msg.modelId || ''),
+            selectedModelId: msg.selectedModelId || '',
+            reportedModelId: msg.reportedModelId || '',
+            memoryReferences: msg.memoryReferences,
+            memoryReason: msg.memoryReason,
+            taskChoices: msg.taskChoices,
+            taskProgress: msg.taskProgress,
             status: String(msg.status || 'completed'),
             ...(msg.partial ? {partial: true} : {}),
             ...(msg.finishReason ? {finishReason: String(msg.finishReason)} : {}),
@@ -163,6 +169,7 @@ export function releaseCardRuntimeReferences(card, {clearTimer = null} = {}) {
 const BACKEND_FALLBACK_LABELS = Object.freeze({
     zcode: 'ZCode',
     codex: 'Codex',
+    dsh: 'DSH',
     openai: 'OpenAI API',
 });
 
@@ -868,13 +875,14 @@ export function formatMessageTimestamp(msgOrRaw, nowMs = Date.now()) {
 }
 
 export function resolveAssistantDisplayModel(msg, fallbackModelLabel = '随问') {
-    if (msg && typeof msg === 'object') {
-        const explicit = String(msg.modelId || '').trim();
-        if (explicit) return explicit;
-        const backend = String(msg.backend || '').trim().toLowerCase();
-        if (BACKEND_FALLBACK_LABELS[backend]) return BACKEND_FALLBACK_LABELS[backend];
-    }
-    return String(fallbackModelLabel || '随问');
+    const model = String(msg?.modelId || '').trim();
+    const selected = String(msg?.selectedModelId || '').trim();
+    const reported = String(msg?.reportedModelId || '').trim();
+    const backend = BACKEND_FALLBACK_LABELS[String(msg?.backend || '').trim().toLowerCase()] || '';
+    const actual = reported || model;
+    const label = reported && selected && selected !== reported
+        ? `实报 ${reported}（所选 ${selected}）` : actual || selected;
+    return [backend, label].filter(Boolean).join(' · ') || String(fallbackModelLabel || '随问');
 }
 
 /**
@@ -978,6 +986,12 @@ export class HistoryWindowController {
                     createdAt: msg.createdAt || '',
                     ts: Number(msg.ts || 0),
                     modelId: msg.modelId || '',
+                    selectedModelId: msg.selectedModelId || '',
+                    reportedModelId: msg.reportedModelId || '',
+                    memoryReferences: msg.memoryReferences,
+                    memoryReason: msg.memoryReason,
+                    taskChoices: msg.taskChoices,
+                    taskProgress: msg.taskProgress,
                     backend: msg.backend || '',
                     status: msg.status || 'completed',
                     isHotCached: !isPaged,
