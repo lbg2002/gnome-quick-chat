@@ -38,7 +38,9 @@ function topicLinks(markdown) {
         .map(match => match[1]).filter(name => name !== INDEX && TOPIC.test(name)));
 }
 
-const segmenter = new Intl.Segmenter('zh', {granularity: 'word'});
+const segmenter = typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter('zh', {granularity: 'word'})
+    : null;
 const searchStopWords = new Set(['继续', '上次', '那个', '这个', '一下', '最近', '帮我', '记住', '忘记', '以后',
     '请问', 'the', 'and', 'that', 'this', 'with', 'please', 'test']);
 
@@ -46,9 +48,14 @@ function memorySearchTerms(query) {
     const text = String(query || '').normalize('NFKC').toLowerCase().replace(/_/g, ' ');
     const terms = new Set();
     let previousHan = '';
-    for (const {segment} of segmenter.segment(text)) {
+    // Older GJS has no Intl.Segmenter. Keep Latin words and treat adjacent Han characters as search terms.
+    const segments = segmenter
+        ? [...segmenter.segment(text)].map(({segment}) => segment)
+        : text.match(/\p{Script=Han}|(?:(?!\p{Script=Han})[\p{L}\p{N}])+|[^\p{L}\p{N}]/gu) || [];
+    for (const segment of segments) {
         if (/^\p{Script=Han}$/u.test(segment)) {
-            if (previousHan) terms.add(previousHan + segment);
+            const pair = previousHan + segment;
+            if (previousHan && !searchStopWords.has(pair)) terms.add(pair);
             previousHan = segment;
             continue;
         }
