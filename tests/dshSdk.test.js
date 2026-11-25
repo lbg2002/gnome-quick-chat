@@ -153,3 +153,15 @@ test('browser action accepts only a direct instruction with no arbitrary command
         assert.equal(isDefaultBrowserLaunchRequest(phrase), false, phrase);
     }
 });
+
+test('DSH checks the route in the live request header before accepting answer events', () => {
+    const sdk = new DshSdkTurn({sessionId: 'local-turn', workspace: '/tmp', provider: 'codex',
+        model: 'gpt-6.1-terra', prompt: 'question'});
+    const sent = [];
+    sdk.start(async message => sent.push(message));
+    assert.equal(sent[0].params.model, 'gpt-6.1-terra');
+    sdk.read(frame({id: 'qc-init', result: {serverInfo: {name: 'deepseek-harness-sdk-runtime'}}}));
+    const header = model => event('request/header', {header: {config: {provider: 'codex', model}}});
+    assert.equal(sdk.read(header('gpt-6.1-terra')), null);
+    assert.throws(() => sdk.read(header('gpt-6-astra')), /gpt-6\.1-terra.*gpt-6-astra/);
+});

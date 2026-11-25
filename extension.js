@@ -1594,6 +1594,7 @@ export default class QuickChat extends Extension {
                 });
             }
 
+            if (!this._chatController.ready) return;
             if (this._panel.historyWindow?.hasNewer) {
                 this._panel.restoreLatestHistoryWindow();
             }
@@ -2366,7 +2367,6 @@ export default class QuickChat extends Extension {
 
             this._updateAiTabBadge();
             if (this._chatController.needsReconnect) {
-                this._chatController.needsReconnect = false;
                 this._reconnectNow();
             }
         }

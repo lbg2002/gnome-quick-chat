@@ -63,6 +63,7 @@ export class ChatController {
         this._busy = false;
         this._needsReconnect = false;
         this._ensurePromise = null;
+        this._reconnectPromise = null;
         this._connectCancellable = null;
         this._cancelReconnectTimer = null;
         this._lastSecurityContextKey = '';
@@ -76,7 +77,7 @@ export class ChatController {
     }
 
     get ready() {
-        return this._ready;
+        return this._ready && !this._needsReconnect;
     }
 
     get busy() {
@@ -115,10 +116,6 @@ export class ChatController {
         return this._needsReconnect;
     }
 
-    set needsReconnect(val) {
-        this._needsReconnect = Boolean(val);
-    }
-
     beginLifecycle(lifeGen) {
         this._disposed = false;
         this._lifecycleGeneration = Number(lifeGen) || (this._lifecycleGeneration + 1);
@@ -129,10 +126,8 @@ export class ChatController {
         if (revokeScopes) {
             this._client?.revokeApprovedScopes?.();
         }
-        if (this._busy) {
-            this._needsReconnect = true;
-            return;
-        }
+        this._needsReconnect = true;
+        if (this._busy) return;
         if (this._cancelReconnectTimer) {
             this._cancelReconnectTimer();
             this._cancelReconnectTimer = null;
@@ -151,6 +146,17 @@ export class ChatController {
 
     async reconnectNow({canConnect = () => true} = {}) {
         if (this._disposed || this._busy || !canConnect()) return null;
+        if (this._reconnectPromise) return this._reconnectPromise;
+        const task = this._replaceConnection(canConnect);
+        this._reconnectPromise = task;
+        try {
+            return await task;
+        } finally {
+            if (this._reconnectPromise === task) this._reconnectPromise = null;
+        }
+    }
+
+    async _replaceConnection(canConnect) {
         const generation = this._clientGeneration;
         const isCurrent = () => !this._disposed && !this._busy &&
             generation === this._clientGeneration && canConnect();
@@ -191,6 +197,7 @@ export class ChatController {
         if (this._disposed || !canConnect()) {
             return Promise.resolve(null);
         }
+        if (this._needsReconnect) return this.reconnectNow({canConnect});
         if (this._client && this._ready) {
             return Promise.resolve({state: this._lastState, reused: true});
         }
@@ -317,6 +324,7 @@ export class ChatController {
     }
 
     stopClient() {
+        this._reconnectPromise = null;
         ++this._clientGeneration;
         this._cancelReconnectTimer?.();
         this._cancelReconnectTimer = null;

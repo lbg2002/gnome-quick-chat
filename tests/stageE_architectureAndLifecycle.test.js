@@ -738,3 +738,32 @@ fi
         fs.rmSync(tmpRoot, {recursive: true, force: true});
     }
 });
+
+test('immediate send after a DSH model change waits for the selected model', async () => {
+    let model = 'astra';
+    let flushOK = false;
+    const controller = new ChatController({
+        loadRuntimeEnvironment: async () => ({config: {model}, sessionId: 'same-session'}),
+        createClient: () => {
+            let selected;
+            return {
+                start(config) { selected = config.model; },
+                async request(method) {
+                    if (method === 'flush_session') return {ok: flushOK};
+                    if (method === 'get_state') return {backend: 'dsh', model: {id: selected}};
+                    return {};
+                },
+            };
+        },
+    });
+    await controller.ensureConnected();
+    model = 'terra';
+    controller.scheduleConfigReconnect({debounceMs: 1000});
+    assert.equal(controller.ready, false);
+    assert.equal(await controller.ensureConnected(), null);
+    assert.equal(controller.ready, false);
+    flushOK = true;
+    const results = await Promise.all([controller.ensureConnected(), controller.ensureConnected()]);
+    assert.ok(results.every(result => result?.state.model.id === 'terra'));
+    controller.dispose();
+});

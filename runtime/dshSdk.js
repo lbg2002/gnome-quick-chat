@@ -146,6 +146,16 @@ export class DshSdkTurn {
         }
         if (this.phase !== 'running') return null;
         switch (event.type) {
+            case 'request/header': {
+                const route = data.header?.config;
+                const expected = this.initialize;
+                if (route?.provider !== expected.provider || route?.model !== expected.model) {
+                    const actualProvider = safeText(route?.provider, 128) || '未知 Provider';
+                    const actualModel = safeText(route?.model, 128) || '未知模型';
+                    throw new Error(`DSH 请求模型不匹配：已选 ${expected.provider}/${expected.model}，请求报告 ${actualProvider}/${actualModel}`);
+                }
+                return null;
+            }
             case 'assistant/message': {
                 const blocks = data.message?.content;
                 if (!Array.isArray(blocks)) return null;
