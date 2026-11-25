@@ -712,8 +712,10 @@ export class OpenAIAdapter extends BaseBackendAdapter {
             timeouts = null,
         } = opts;
         const promptText = rawPromptText ?? fallbackText ?? '';
-        const baseSystemPrompt = this._runtime.systemPrompt ||
-            '你是 Ubuntu 26 / GNOME 50 桌面顶栏中的「随问」AI 助手。请用清晰、简明、准确的中文回答问题。';
+        const baseSystemPrompt = [
+            this._runtime.systemPrompt || '你是 Ubuntu 26 / GNOME 50 桌面顶栏中的「随问」AI 助手。请用清晰、简明、准确的中文回答问题。',
+            turnMeta.memoryInstructions,
+        ].filter(Boolean).join('\n');
         const initialModelId = this._hasExplicitUserModel
             ? this._userConfiguredModelId
             : String(this._runtime?.modelId || '').trim();

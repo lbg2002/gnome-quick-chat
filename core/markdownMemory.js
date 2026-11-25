@@ -38,6 +38,53 @@ function topicLinks(markdown) {
         .map(match => match[1]).filter(name => name !== INDEX && TOPIC.test(name)));
 }
 
+const segmenter = new Intl.Segmenter('zh', {granularity: 'word'});
+const searchStopWords = new Set(['继续', '上次', '那个', '这个', '一下', '最近', '帮我', '记住', '忘记', '以后',
+    '请问', 'the', 'and', 'that', 'this', 'with', 'please', 'test']);
+
+function memorySearchTerms(query) {
+    const text = String(query || '').normalize('NFKC').toLowerCase().replace(/_/g, ' ');
+    const terms = new Set();
+    let previousHan = '';
+    for (const {segment} of segmenter.segment(text)) {
+        if (/^\p{Script=Han}$/u.test(segment)) {
+            if (previousHan) terms.add(previousHan + segment);
+            previousHan = segment;
+            continue;
+        }
+        previousHan = '';
+        if (/[\p{L}\p{N}]/u.test(segment) && segment.length >= 2 && !searchStopWords.has(segment)) {
+            terms.add(segment);
+        }
+    }
+    return [...terms].slice(0, 24);
+}
+
+function countMatches(text, terms) {
+    const normalized = text.normalize('NFKC').toLowerCase();
+    return terms.filter(term => normalized.includes(term)).length;
+}
+
+export function excerptMemoryNote(markdown, query) {
+    const limit = 1000;
+    if (markdown.length <= limit) return markdown;
+    const terms = memorySearchTerms(query);
+    const lines = markdown.split('\n');
+    let start = 0;
+    let offset = 0;
+    let best = 0;
+    for (const line of lines) {
+        const score = countMatches(line, terms);
+        if (score > best) {
+            start = Math.max(0, offset - 150);
+            best = score;
+        }
+        offset += line.length + 1;
+    }
+    return (start ? '…\n' : '') + markdown.slice(start, start + limit) +
+        (start + limit < markdown.length ? '\n…' : '');
+}
+
 async function read(path, limit = MAX_NOTE_BYTES) {
     if (GLib.file_test(path, GLib.FileTest.IS_SYMLINK)) throw new Error('记忆文件不能是符号链接');
     const result = await readFileBytesBoundedAsync(path, limit);
@@ -160,6 +207,37 @@ export class MarkdownMemory {
                 if (markdown !== null) result.set(address, markdown);
             }
             return result;
+        });
+    }
+
+    search(snapshot, query, {previousReferences = [], isCurrent = () => true} = {}) {
+        const terms = memorySearchTerms(query);
+        const followup = /这次|临时|以后|改用|纠正|忘掉|记错|上条|temporar|correct|instead|forget/i.test(query);
+        const prior = new Set(followup ? previousReferences : []);
+        if (!terms.length && !prior.size) return Promise.resolve(new Map());
+
+        return serial(async () => {
+            await this.recover();
+            const matches = [];
+            const indexLines = Object.fromEntries(SCOPES.map(scope =>
+                [scope, (snapshot.indexes[scope] || '').split('\n')]));
+            for (const [address, {scope, name}] of snapshot.notes) {
+                if (!isCurrent()) return new Map();
+                const subject = [name, ...indexLines[scope].filter(line => line.includes('](' + name + ')'))].join(' ');
+                let markdown;
+                try {
+                    markdown = await read(this.path(scope, name));
+                } catch (error) {
+                    if (prior.has(address) || countMatches(subject, terms)) throw error;
+                    continue;
+                }
+                if (markdown === null) continue;
+                const score = (prior.has(address) ? 100 : 0) + countMatches(subject, terms) * 2 +
+                    countMatches(markdown, terms);
+                if (score) matches.push({address, markdown, score});
+            }
+            matches.sort((a, b) => b.score - a.score);
+            return new Map(matches.slice(0, 3).map(({address, markdown}) => [address, markdown]));
         });
     }
 

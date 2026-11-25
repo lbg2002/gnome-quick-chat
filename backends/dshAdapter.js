@@ -76,7 +76,8 @@ export class DshAdapter extends BaseBackendAdapter {
         let rawArgv;
         try {
             validateCliPromptLength(cliPrompt, {viaArgv: false});
-            const persona = resolveDesktopAssistantPrompt(this._config?.assistantInstructions);
+            const persona = [resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
+                turnMeta.memoryInstructions].filter(Boolean).join('\n');
             const configuredModel = String(this._config?.model || '').trim();
             const configuredProvider = normalizeDshProviderId(this._config?.provider);
             const catalog = sdk && !configuredModel

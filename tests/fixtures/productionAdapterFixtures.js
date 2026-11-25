@@ -399,10 +399,9 @@ const serverA = http.createServer((req, res) => {
                         lastUserContent.includes('Verified shared-memory note') ? 'stale snapshot' : '[]';
                 }
             } else if (lastUserContent.startsWith('只返回与当前任务最相关')) {
-                memoryAnswer = JSON.stringify(lastUserContent.includes('TEST_MIXED_RECEIPT')
-                    ? ['memory://computer/preview.md', 'memory://project/preview.md']
-                    : lastUserContent.includes('TEST_RESUME_CHOICES')
-                        ? ['memory://computer/preview.md', 'memory://computer/other.md'] : ['memory://computer/preview.md']);
+                res.writeHead(500);
+                res.end('Unexpected extra memory selection call');
+                return;
             } else if (lastUserContent.includes('TEST_RESUME_CHOICES') || lastUserContent.includes('我选「项目 A」')) {
                 const marker = lastUserContent.match(/\\[随问回执 [a-f0-9-]+\\]/)?.[0];
                 if (marker && lastUserContent.includes('最近确认过项目 A')) {

@@ -1,6 +1,6 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {MarkdownMemory} from '../core/markdownMemory.js';
+import {excerptMemoryNote, MarkdownMemory} from '../core/markdownMemory.js';
 
 function assert(condition, message) {
     if (!condition) throw new Error(message);
@@ -37,6 +37,17 @@ try {
     const recalled = await switchedBackend.recall(snapshot, JSON.stringify([topic, projectTopic, 'file:///etc/passwd']));
     assert(recalled.size === 2 && recalled.get(topic) === edits[1].markdown, 'Shared notes read back');
     assert(!(await otherWorkspace.snapshot()).notes.has(projectTopic), 'Project memory isolated');
+    const hit = await computer.search(snapshot, '需要查看配置');
+    assert(hit.size === 1 && hit.get(projectTopic) === edits[3].markdown,
+        'Search reaches a useful word present only in the note body');
+    assert((await computer.search(snapshot, '火星轨道')).size === 0, 'Unrelated query sends no topics');
+    assert((await otherWorkspace.search(await otherWorkspace.snapshot(), '配置')).size === 0,
+        'Body search excludes other workspaces');
+    const correction = await computer.search(snapshot, '以后改用另一个', {previousReferences: [topic]});
+    assert(correction.get(topic) === edits[1].markdown, 'Contextual correction keeps prior reference');
+    const excerpt = excerptMemoryNote('背景说明。'.repeat(360) + '\nOCR 调用方法在这里。', 'OCR');
+    assert(excerpt.includes('OCR 调用方法') && excerpt.length < 1100,
+        'Late keyword match is included in the bounded excerpt');
     const info = Gio.File.new_for_path(computer.path('computer', 'desktop-apps.md'))
         .query_info('unix::mode', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
     assert((info.get_attribute_uint32('unix::mode') & 0o777) === 0o600, 'Private topic file');

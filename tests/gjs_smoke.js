@@ -508,12 +508,12 @@ let mockHttpProc = null;
                 'Model authored Markdown was written by the host');
             memoryReader._initWithRuntime({...memoryRuntime}, memoryConfig, tmpRoot, tmpRoot, 'memory-reader');
             memoryReader._memory = sharedMemory;
-            await memoryReader.request('prompt', {message: 'TEST_MEMORY_RECALL'});
+            await memoryReader.request('prompt', {message: '查看 Verified 的记录 TEST_MEMORY_RECALL'});
             for (let i = 0; i < 200 && !memoryReaderEvents.some(event => event.type === 'agent_settled'); i++) {
                 await sleepGjs(20);
             }
             assert(memoryReaderEvents.some(event => event.message?.content?.some?.(part => part.text === 'RECALL_OK')),
-                'New client received the model-selected Markdown topic in its normal request');
+                'New client received a matching Markdown excerpt in its normal request');
             await memoryReader.request('prompt', {message: '忘记测试笔记 TEST_MEMORY_FORGET', turnId: 'forget-a'});
             await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === 'forget-a');
             await memoryReader.request('prompt', {message: 'TEST_MEMORY_AFTER_FORGET', turnId: 'follow-b'});
@@ -562,7 +562,7 @@ let mockHttpProc = null;
                 ['TEMPORARY', '# 偏好 B', false],
                 ['FORGET', undefined, true],
             ]) {
-                const userRequest = (scenario === 'DUPLICATE' ? '记住 ' : '') + 'TEST_EXPERIENCE_' + scenario;
+                const userRequest = (scenario === 'DUPLICATE' ? '记住 ' : '') + '偏好 TEST_EXPERIENCE_' + scenario;
                 await memoryReader.request('prompt', {message: userRequest, turnId: scenario});
                 await waitForEventGjs(memoryReaderEvents, e => e.type === 'agent_settled' && e.turnId === scenario);
                 for (let attempt = 0; attempt < 200 && memoryReader._memoryUpdates.size; attempt++) await sleepGjs(20);
@@ -588,7 +588,7 @@ let mockHttpProc = null;
                 {scope: 'project', name: 'preview.md', markdown: 'Delete body'},
             ]), () => true);
             memoryReader._memory = mixed;
-            await memoryReader.request('prompt', {message: 'TEST_MIXED_RECEIPT', turnId: 'mixed-turn'});
+            await memoryReader.request('prompt', {message: '更新预览笔记 TEST_MIXED_RECEIPT', turnId: 'mixed-turn'});
             const mixedReceipt = await waitForEventGjs(memoryReaderEvents, e => e.memoryTurnId === 'mixed-turn');
             assert(mixedReceipt.status === 'committed' && mixedReceipt.message.includes('已删除：项目 / preview.md') &&
                 mixedReceipt.message.includes('文件仍保留：电脑 / keep.md') &&
@@ -710,19 +710,19 @@ let mockHttpProc = null;
             const memory = new MarkdownMemory(tmpRoot, GLib.build_filenamev([tmpRoot, 'from-' + writer]));
             await runMemoryTurn(writer, memory, 'writer-' + writer, 'TEST_MEMORY_WRITE', {expectWrite: true});
             for (const reader of memoryBackends.filter(backend => backend !== writer)) {
-                const text = await runMemoryTurn(reader, memory, writer + '-to-' + reader, 'TEST_MEMORY_RECALL',
-                    {displayUserText: '测试对话中的附件显示文本'});
+                const text = await runMemoryTurn(reader, memory, writer + '-to-' + reader, '查看 Verified 的记录 TEST_MEMORY_RECALL',
+                    {displayUserText: '查看 Verified 的记录（带附件）'});
                 assert(text === 'RECALL_OK', writer + ' to ' + reader + ' recalls its model-written topic: ' + text);
             }
             routeRegistry.setMemoryEnabled(writer, false);
-            const text = await runMemoryTurn(writer, memory, 'disabled-' + writer, 'TEST_MEMORY_RECALL');
+            const text = await runMemoryTurn(writer, memory, 'disabled-' + writer, '查看 Verified 的记录 TEST_MEMORY_RECALL');
             assert(text === 'RECALL_MISSING', writer + ' receives no Markdown when memory is disabled');
             routeRegistry.setMemoryEnabled(writer, true);
         }
         for (const [backend, log] of Object.entries(cliLogs)) {
             const calls = Decoder.decode(GLib.file_get_contents(log)[1]).trim().split('\n').map(line => JSON.parse(line));
             assert(calls.filter(call => call.update).length === 1 && calls.every(call =>
-                call.recall || call.update ? call.readonly : !call.readonly),
+                !call.recall && call.readonly === call.update),
             backend + ' only uses read-only for auxiliary calls and skips learning on attachment turns');
         }
 

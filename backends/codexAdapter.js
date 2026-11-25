@@ -81,7 +81,8 @@ export class CodexAdapter extends BaseBackendAdapter {
         const {remoteId, prompt: effectiveCliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
             memoryContext, allowResume: !disableResume,
             workspace, specialDirs, mode: effectiveMode,
-            assistantInstructions: resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
+            assistantInstructions: [resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
+                turnMeta.memoryInstructions].filter(Boolean).join('\n'),
         });
 
         const useCodexStdin = Boolean(cliCaps?.supportsStdinPrompt !== false);
