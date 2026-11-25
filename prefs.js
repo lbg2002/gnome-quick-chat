@@ -746,7 +746,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const widthRow = new Adw.SpinRow({
             title: '面板宽度 (px)',
-            subtitle: '独立随问面板的宽度',
+            subtitle: '随问对话区域的宽度',
             adjustment: new Gtk.Adjustment({
                 lower: 340,
                 upper: 680,
@@ -798,15 +798,12 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         uiPage.add(agentGroup);
 
         const modes = ['readonly', 'smart', 'full'];
-        const modeComboModel = Gtk.StringList.new([
-            '只读（允许查看文件与检索，禁止修改）',
-            '智能（低风险自动执行，修改/删除需真实审批；Codex 无审批通道时仍只读）',
-            '完全权限（危险：允许无审批修改与删除）',
-        ]);
+        const modeComboModel = Gtk.StringList.new(['只读', '智能', '完全权限']);
         const modeRow = new Adw.ComboRow({
             title: 'Agent 权限模式',
             model: modeComboModel,
         });
+        compactNameCombo(modeRow);
         modeRow.selected = Math.max(
             0,
             modes.indexOf(registry.getBackendProfile(getEffectiveBackend()).mode || 'readonly')
@@ -1588,7 +1585,6 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const displayMode = eff === 'codex' && rawMode === 'chat' ? 'readonly' : rawMode;
             const curModeIdx = Math.max(0, modes.indexOf(displayMode));
             syncingModeCombo = true;
-            modeComboModel.splice(0, modeComboModel.get_n_items(), caps.modeLabels);
             modeRow.selected = curModeIdx;
             syncingModeCombo = false;
 
@@ -1602,16 +1598,21 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             refreshMemoryRow();
 
             modeRow.sensitive = caps.supportsTools;
+            const smartDescription = {
+                dsh: 'DSH SDK 支持逐项审批。Headless 的智能模式保持只读。',
+                zcode: '需要确认的工具操作会由 ZCode 权限桥接发起审批。',
+                codex: 'Codex exec 无法把审批回传到随问，智能模式保持只读。',
+            };
             if (eff === 'unconfigured') {
-                modeRow.subtitle = '尚未配置可用后端；请先安装 ZCode / Codex CLI 或配置自定义 OpenAI 兼容 API';
+                modeRow.subtitle = '配置后端后可设置权限。';
             } else if (!caps.supportsTools) {
-                modeRow.subtitle = '当前自定义 OpenAI API 仅执行纯文本 HTTP 对话流，不挂载任何本机文件、命令或网络工具';
-            } else if (caps.supportsApproval) {
-                modeRow.subtitle = '需审批 Agent 按完整命令/规范真实路径/来源逐项请求您授权（非系统级强制只读沙箱；Shell 命令默认仅单次放行）';
-            } else if (eff === 'codex') {
-                modeRow.subtitle = 'Codex 非交互执行模式无法把写入审批回传到随问；智能模式保持只读，只有显式开启完全权限才允许写入';
+                modeRow.subtitle = 'OpenAI 兼容 API 提供文本对话。';
+            } else if (displayMode === 'full') {
+                modeRow.subtitle = '可以直接运行命令和修改文件，操作不会逐项请求审批。';
+            } else if (displayMode === 'smart') {
+                modeRow.subtitle = smartDescription[eff] || '工具操作受当前后端的权限策略约束。';
             } else {
-                modeRow.subtitle = `当前后端 (${eff.toUpperCase()}) 通过 CLI 权限预设控制操作；智能模式无真实审批回传时会保持只读`;
+                modeRow.subtitle = '允许查询和读取。后端会拒绝超出只读权限的操作。';
             }
             syncDiagnosticsUi();
         };

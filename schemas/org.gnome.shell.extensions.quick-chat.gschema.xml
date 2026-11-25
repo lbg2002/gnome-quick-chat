@@ -206,7 +206,7 @@
     </key>
     <key name="panel-fallback-mode" type="s">
       <default>'panel-button'</default>
-      <summary>Legacy panel mount preference; only the standalone button is available</summary>
+      <summary>Legacy panel mount preference retained for compatibility</summary>
     </key>
     <key name="quick-prompts-json" type="s">
       <default>''</default>

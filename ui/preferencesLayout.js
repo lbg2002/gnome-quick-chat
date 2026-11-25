@@ -4,8 +4,8 @@ import Pango from 'gi://Pango';
 
 export function compactPreferenceRow(row) {
     if (row instanceof Adw.ActionRow || row instanceof Adw.ExpanderRow) {
-        row.set_title_lines(1);
-        row.set_subtitle_lines(2);
+        row.set_title_lines(0);
+        row.set_subtitle_lines(0);
     }
 }
 
@@ -14,8 +14,8 @@ function nameFactory() {
     factory.connect('setup', (_, item) => {
         item.child = new Gtk.Label({
             xalign: 0,
-            ellipsize: Pango.EllipsizeMode.END,
-            single_line_mode: true,
+            wrap: true,
+            wrap_mode: Pango.WrapMode.WORD_CHAR,
             max_width_chars: 24,
         });
     });

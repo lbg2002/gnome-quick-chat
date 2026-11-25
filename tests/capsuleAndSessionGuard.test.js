@@ -186,7 +186,7 @@ test('native panel destruction cancels a queued new session before touching stal
     f.ext.disable();
 });
 
-function actorFixture() {
+function actorFixture({withDateMenu = false} = {}) {
     const time = clock();
     const chrome = new Set();
     const statusArea = new Map();
@@ -207,6 +207,13 @@ function actorFixture() {
         show() { this.visible = true; }
         hide() { this.visible = false; }
         get_parent() { return this.parent; }
+        get_children() { return this.children; }
+        insert_child_at_index(child, index) {
+            assert.equal(child.parent, undefined);
+            this.children.splice(index, 0, child);
+            child.parent = this;
+        }
+        add_style_class_name() {}
         add_child(child) {
             assert.equal(child.parent, undefined);
             this.children.push(child);
@@ -258,6 +265,10 @@ function actorFixture() {
     const calendar = new Actor();
     nativeDate.add_child(notifications);
     nativeDate.add_child(calendar);
+    const shellMenu = {box: new BoxLayout()};
+    const popupContent = new Actor();
+    shellMenu.box.add_child(popupContent);
+    popupContent.add_child(nativeDate);
     const Main = {
         pushModal: () => assert.fail('unexpected modal grab'),
         popModal: () => assert.fail('unexpected modal release'),
@@ -268,8 +279,12 @@ function actorFixture() {
                 actor.connect('destroy', () => chrome.delete(actor));
             },
         },
+        sessionMode: {hasNotifications: true},
         panel: {
-            get statusArea() { assert.fail('private DateMenu access'); },
+            get statusArea() {
+                assert.ok(withDateMenu, 'standalone fallback must avoid DateMenu access');
+                return {dateMenu: {menu: shellMenu, _messageList: notifications}};
+            },
             addToStatusArea(name, button) {
                 assert.ok(!statusArea.has(name));
                 statusArea.set(name, button);
@@ -282,7 +297,7 @@ function actorFixture() {
         St: {BoxLayout, Label, ScrollView, Entry, Button: Actor, PolicyType: {}},
         GLib: time.GLib, global: {stage}, PanelMenu: {Button: PanelButton},
     };
-    return {native, time, chrome, statusArea, stage, nativeDate, notifications, calendar, Actor};
+    return {native, time, chrome, statusArea, stage, shellMenu, popupContent, nativeDate, notifications, calendar, Actor};
 }
 
 test('100 capsule toggles preserve other focus, coalesce updates and release owned resources', async () => {
@@ -351,12 +366,53 @@ test('standalone panel mount and rollback preserve native notification and calen
     assert.equal(f.calendar.get_parent(), f.nativeDate);
 });
 
+test('embedded DateMenu toggles the original left column and restores it on destruction', () => {
+    const f = actorFixture({withDateMenu: true});
+    const Integration = loadClass('ui/dateMenuIntegration.js', 'DateMenuIntegration', f.native);
+    const integration = new Integration();
+    const wrapper = new f.Actor();
+    const tabs = new f.Actor();
+    wrapper.add_child(tabs);
+    assert.equal(integration.mount(wrapper, tabs), true);
+    assert.equal(integration.mountMode, 'datemenu');
+    assert.equal(f.shellMenu.box.children[0], tabs);
+    assert.equal(f.statusArea.size, 0);
+    for (let i = 0; i < 30; i++) {
+        integration.setChatVisible(true);
+        assert.equal(wrapper.visible, true);
+        assert.equal(f.notifications.visible, false);
+        assert.deepEqual(f.nativeDate.children, [wrapper, f.notifications, f.calendar]);
+        assert.equal(f.calendar.visible, true);
+        integration.setChatVisible(false);
+        assert.equal(f.notifications.visible, true);
+        assert.equal(wrapper.visible, false);
+    }
+    f.native.Main.sessionMode.isLocked = true;
+    integration.setChatVisible(true);
+    assert.equal(wrapper.visible, false);
+    assert.equal(tabs.visible, false);
+    assert.equal(f.notifications.visible, true);
+    f.native.Main.sessionMode.isLocked = false;
+    integration.setChatVisible(true);
+    tabs.destroy(); // Shell can destroy the separate tabs before the chat wrapper.
+    wrapper.destroy();
+    assert.equal(f.notifications.visible, true);
+    assert.deepEqual(f.nativeDate.children, [f.notifications, f.calendar]);
+    assert.deepEqual(f.shellMenu.box.children, [f.popupContent]);
+    assert.equal(integration.mountMode, 'unmounted');
+});
+
+test('model picker has no stale DateMenu layout dependency', () => {
+    assert.doesNotMatch(source('extension.js'), /nudgeLayout/);
+    assert.doesNotMatch(source('ui/modelPicker.js'), /onNudgeLayout/);
+});
+
 test('experimental capsule defaults off and preferences bound titles and model names', () => {
     const schema = source('schemas/org.gnome.shell.extensions.quick-chat.gschema.xml');
     assert.match(schema, /key name="enable-experimental-capsule" type="b">\s*<default>false<\/default>/);
     assert.doesNotMatch(source('ui/capsuleView.js'), /\b(pushModal|popModal|grab_keyboard)\b|stage\.grab\(/);
     assert.match(source('prefs.js'), /compactNameCombo\(providerComboRow\)/);
     assert.match(source('prefs.js'), /compactNameCombo\(modelComboRow\)/);
-    assert.match(source('ui/preferencesLayout.js'), /set_title_lines\(1\)/);
-    assert.match(source('ui/preferencesLayout.js'), /set_subtitle_lines\(2\)/);
+    assert.match(source('ui/preferencesLayout.js'), /set_title_lines\(0\)/);
+    assert.match(source('ui/preferencesLayout.js'), /set_subtitle_lines\(0\)/);
 });

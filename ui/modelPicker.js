@@ -27,7 +27,6 @@ export class ModelPickerController {
         getActiveRuntimeInfo = null,
         getClient,
         isExtensionAlive,
-        onNudgeLayout,
         onOpenPreferences,
     }) {
         this._settings = settings;
@@ -37,7 +36,6 @@ export class ModelPickerController {
         this._getActiveRuntimeInfo = getActiveRuntimeInfo;
         this._getClient = getClient;
         this._isExtensionAlive = isExtensionAlive;
-        this._onNudgeLayout = onNudgeLayout;
         this._onOpenPreferences = onOpenPreferences;
 
         this.container = null;
@@ -88,12 +86,10 @@ export class ModelPickerController {
         }
         if (!nextOpen) {
             this.container.visible = false;
-            this._onNudgeLayout?.();
             return;
         }
         this.populate();
         this.container.visible = true;
-        this._onNudgeLayout?.();
     }
 
     refreshResultsOnly() {
@@ -436,7 +432,6 @@ export class ModelPickerController {
                 resultsSection.add_child(createWrapLabel(emptyText, 'qc-picker-empty'));
             }
             renderFooterRow(liveState);
-            this._onNudgeLayout?.();
         };
 
         this._renderResultsFn = renderResultsSection;

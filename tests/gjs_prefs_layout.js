@@ -48,12 +48,12 @@ try {
         assert(min <= 480 && row.get_width() > 0 && row.get_width() <= 540,
             `row exceeds the width budget: minimum ${min}, allocated ${row.get_width()}`);
     }
-    assert(action.get_title_lines() === 1 && expander.get_title_lines() === 1, 'title line cap');
-    assert(action.get_subtitle_lines() === 2 && expander.get_subtitle_lines() === 2, 'subtitle line cap');
+    assert(action.get_title_lines() === 0 && expander.get_title_lines() === 0, 'titles can wrap');
+    assert(action.get_subtitle_lines() === 0 && expander.get_subtitle_lines() === 0, 'subtitles can wrap');
     const label = [...widgets(combo)].find(widget => widget instanceof Gtk.Label &&
         widget.label === longName && widget.get_mapped());
-    assert(label?.ellipsize === Pango.EllipsizeMode.END, 'selected combo item should ellipsize');
-    assert(label.get_layout().is_ellipsized(), 'long selected name should be visually truncated');
+    assert(label?.wrap && label.wrap_mode === Pango.WrapMode.WORD_CHAR, 'selected combo item wraps');
+    assert(!label.get_layout().is_ellipsized(), 'long selected name remains visible');
     assert(label.tooltip_text === longName, 'full model name should remain available');
     assert(entry.text === longName, 'editable value was altered');
     print('GTK/Adw layout passed at 540 px: ActionRow, ExpanderRow, EntryRow, ComboRow.');

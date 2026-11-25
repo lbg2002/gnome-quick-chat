@@ -208,6 +208,8 @@ export class ChatPanelView {
             y_align: Clutter.ActorAlign.CENTER,
         });
         const tabGroup = new St.BoxLayout({orientation: H, style_class: 'qc-tab-group'});
+        this.tabs = tabs;
+        this._tabGroup = tabGroup;
 
         this._aiTab = new St.Button({
             style_class: 'qc-tab-button',
@@ -244,6 +246,17 @@ export class ChatPanelView {
         tabs.add_child(settingsBtn);
 
         this.wrapper.add_child(tabs);
+    }
+
+    addNotificationsTab() {
+        this._notificationsTab = createStButton('通知', () => this._onSelectTab('notifications'),
+            'qc-tab-button', '显示 GNOME 通知列表');
+        this._tabGroup.insert_child_at_index(this._notificationsTab, 0);
+    }
+
+    selectTab(tab) {
+        this._notificationsTab?.set_checked(tab === 'notifications');
+        this._aiTab?.set_checked(tab === 'ai');
     }
 
     _buildChatArea() {
@@ -1095,8 +1108,10 @@ export class ChatPanelView {
                 isLight = true;
             }
         } catch (_) {}
-        if (isLight) this.wrapper.add_style_class_name('qc-light');
-        else this.wrapper.remove_style_class_name('qc-light');
+        for (const actor of [this.wrapper, this.tabs]) {
+            if (isLight) actor?.add_style_class_name('qc-light');
+            else actor?.remove_style_class_name('qc-light');
+        }
     }
 
     applyDimensions() {

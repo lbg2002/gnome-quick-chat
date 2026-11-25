@@ -197,7 +197,6 @@ export default class QuickChat extends Extension {
                 },
                 getClient: () => this._chatController?.client || null,
                 isExtensionAlive: () => this._isSessionUnlockedAndAlive(lifeGen),
-                onNudgeLayout: () => this._dateIntegration?.nudgeLayout(),
                 onOpenPreferences: () => this._openExtensionPreferences(),
                 getCurrentResolvedModel: () => this._modelLabel || '',
                 getAvailableBackends: () => this._cachedAvailableBackends,
@@ -218,7 +217,7 @@ export default class QuickChat extends Extension {
                 scheduleIdle: fn => this._scheduleIdle(fn),
                 clearTimer: id => this._clearTimer(id),
                 easeActor: (actor, params) => this._easeActor(actor, params),
-                onSelectTab: () => this._showChat(),
+                onSelectTab: tab => tab === 'notifications' ? this._showNotifications() : this._showChat(),
                 onReconnectNow: () => this._reconnectNow(),
                 onOpenPreferences: () => this._openExtensionPreferences(),
                 onClipboardAsk: openFirst => this._triggerClipboardAsk(openFirst),
@@ -250,13 +249,18 @@ export default class QuickChat extends Extension {
 
             const wrapper = this._panel.build();
             wrapper.connect('destroy', () => this._onPanelDestroyed(lifeGen));
-            if (!this._dateIntegration.mount(wrapper)) {
+            if (!this._dateIntegration.mount(wrapper, this._panel.tabs)) {
                 console.warn('[Quick Chat] Panel mount unavailable: ' + this._dateIntegration.lastMountError);
                 this.disable();
                 return;
             }
             this._syncDiagnosticsSnapshot({mountMode: this._dateIntegration.mountMode});
-            this._showChat(false);
+            if (this._dateIntegration.mountMode === 'datemenu') {
+                this._panel.addNotificationsTab();
+                this._showNotifications();
+            } else {
+                this._showChat(false);
+            }
 
             const hostMenu = this._dateIntegration.menu;
             if (hostMenu) {
@@ -340,13 +344,17 @@ export default class QuickChat extends Extension {
             this._cancelEditQuestion({keepEntry: true});
             this._attachments?.clear();
             this._panel?.renderAttachments([], '');
+            this._dateIntegration?.setChatVisible(false);
             this._panel?.wrapper?.hide();
             this._live = null;
             this._chatController?.stopClient();
             this._setBusy(false);
         } else {
-            this._panel?.wrapper?.show();
-            this._showChat(false);
+            if (this._dateIntegration?.mountMode === 'datemenu') this._showNotifications();
+            else {
+                this._panel?.wrapper?.show();
+                this._showChat(false);
+            }
         }
     }
 
@@ -1090,8 +1098,22 @@ export default class QuickChat extends Extension {
         } catch (_) {}
     }
 
+    _showNotifications() {
+        if (this._dateIntegration?.mountMode !== 'datemenu') return;
+        this._tab = 'notifications';
+        this._modelPicker?.toggle(false);
+        this._panel?.toggleSessionMenu(false);
+        this._panel?.closeSlashMenu();
+        this._dateIntegration.setChatVisible(false);
+        this._panel?.selectTab('notifications');
+        this._updateAiTabBadge();
+    }
+
     _showChat(connect = true) {
         if (!this._panel?.wrapper) return;
+        this._tab = 'ai';
+        this._dateIntegration?.setChatVisible(true);
+        this._panel.selectTab('ai');
 
         this._panel.flushPendingBackgroundWork({
             isAiTabOpenAndVisible: Boolean(this._dateIntegration?.menu?.isOpen),
