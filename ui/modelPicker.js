@@ -151,7 +151,8 @@ export class ModelPickerController {
         const configuredBackend = this._registry.getConfiguredBackend();
         const effectiveBackend = this._getEffectiveBackend();
         const profile = this._registry.getBackendProfile(effectiveBackend);
-        const catalog = peekCachedBackendCatalog(effectiveBackend);
+        const catalog = effectiveBackend === 'zcode' && this._refreshing
+            ? {providers: []} : peekCachedBackendCatalog(effectiveBackend);
         const runtimeInfo = this._getActiveRuntimeInfo?.() || {};
         const availableBackends = this._getAvailableBackends?.() || null;
 
@@ -236,12 +237,8 @@ export class ModelPickerController {
         }
         this.container.add_child(backendRow);
 
-        const summaryText = [pickerState.currentModelSummary, pickerState.capabilityNotice]
-            .filter(Boolean)
-            .join(' · ');
-        if (summaryText) {
-            this.container.add_child(createWrapLabel(summaryText, 'qc-mini-label'));
-        }
+        const summaryLabel = createWrapLabel('', 'qc-mini-label');
+        this.container.add_child(summaryLabel);
 
         if (effectiveBackend !== 'unconfigured') {
             const searchEntry = new St.Entry({
@@ -331,6 +328,7 @@ export class ModelPickerController {
             resultsSection.destroy_all_children();
 
             const liveState = this._buildCurrentPickerState();
+            summaryLabel.text = [liveState.currentModelSummary, liveState.capabilityNotice].filter(Boolean).join(' · ');
             const eff = liveState.effectiveBackend;
             const catalog = peekCachedBackendCatalog(eff);
             const ranked = liveState.ranked;
@@ -428,23 +426,24 @@ export class ModelPickerController {
                             ? '正在后台异步加载模型目录…'
                             : eff === 'openai'
                                 ? `当前生效模型：${liveState.activeModelId || '自动发现'}（点击右上角 ↻ 可在线拉取列表）`
-                                : '未检测到预设模型列表，将使用后端默认模型。';
+                                : eff === 'zcode'
+                                    ? 'ZCode 本地配置中没有可选模型。'
+                                    : '未检测到预设模型列表，将使用后端默认模型。';
                 resultsSection.add_child(createWrapLabel(emptyText, 'qc-picker-empty'));
             }
             renderFooterRow(liveState);
         };
 
         this._renderResultsFn = renderResultsSection;
-        renderResultsSection();
-
         const initialPeek = peekCachedBackendCatalog(effectiveBackend);
         if (
             effectiveBackend !== 'unconfigured' &&
             effectiveBackend !== 'openai' &&
-            (!initialPeek.fromCache || initialPeek.stale)
+            (effectiveBackend === 'zcode' || !initialPeek.fromCache || initialPeek.stale)
         ) {
-            this._refreshCatalogInBackground(effectiveBackend, false);
+            this._refreshCatalogInBackground(effectiveBackend, effectiveBackend === 'zcode');
         }
+        renderResultsSection();
 
         this.container.add_child(footerRow);
     }

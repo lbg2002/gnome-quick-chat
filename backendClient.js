@@ -749,7 +749,7 @@ export class BackendClient {
         if (event.type !== 'agent_settled') return;
         this._memoryTurn = null;
         this._store?.clearRemoteSessionId('shared_memory_context');
-        if (job.cancelled || event.status !== 'completed' || event.partial ||
+        if (job.cancelled || event.status !== 'completed' || event.partial || event.modelMismatch ||
             !job.learn || !job.snapshot || !job.answer) {
             job.toolCalls?.clear();
             return;
@@ -1157,7 +1157,7 @@ export class BackendClient {
                 lastProgress ? '上轮观察到的工具进展（仅在本次相关时参考） ' + JSON.stringify(lastProgress) : '',
             ].filter(Boolean).join('\n');
             memoryContext = [guidance, memoryContext].filter(Boolean).join('\n\n');
-            return this._adapter.sendMessage({
+            const response = await this._adapter.sendMessage({
                 promptText: fields.message || '',
                 memoryContext,
                 disableResume: Boolean(this._memory),
@@ -1167,6 +1167,10 @@ export class BackendClient {
                 specialDirs: this._specialDirs,
                 timeouts: this._timeouts,
             });
+            if (response?.disposition === 'rejected_before_send' && this._memoryTurn?.turnId === turnMeta.turnId) {
+                this._memoryTurn = null;
+            }
+            return response;
         }
         return {};
     }

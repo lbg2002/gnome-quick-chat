@@ -878,6 +878,7 @@ export class TurnController {
             onTerminateProcess = null,
             onCleanupTempFiles = null,
             onBeforeSettle = null,
+            emitEvents = true,
         } = options;
 
         const cleanFinishReason = typeof finishReason === 'string' ? finishReason.trim() : '';
@@ -966,7 +967,7 @@ export class TurnController {
             this._activeTurn = null;
         }
 
-        if (this._disposed || !wasActive) {
+        if (this._disposed || !wasActive || !emitEvents) {
             return false;
         }
 
@@ -1086,6 +1087,7 @@ export class TurnController {
             ...(turn.contextWindowTokens ? {contextWindowTokens: turn.contextWindowTokens} : {}),
             ...(turn.reasoningEffort ? {reasoningEffort: turn.reasoningEffort} : {}),
             errorMessage: turn.error || '',
+            ...(turn.modelMismatch ? {modelMismatch: turn.modelMismatch} : {}),
         });
         return true;
     }

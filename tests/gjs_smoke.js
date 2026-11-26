@@ -777,9 +777,67 @@ let mockHttpProc = null;
                 {displayUserText: '测试附件', expectExcludedEvidence: true});
         }
 
-        // An explicit ZCode route must be confirmed before any substitute output is delivered.
-        for (const [reported, expectedStatus] of [
-            ['gpt-6.1-terra', 'completed'], ['gpt-6-astra', 'failed'], [null, 'failed'],
+        const zcodeConfig = {mode: 'readonly', provider: 'openai', model: 'gpt-6-astra'};
+        const savedZCodeSession = new SessionStore('zcode-model-preflight', {sessionsRootDir: tmpRoot});
+        await savedZCodeSession.load();
+        savedZCodeSession.appendMessage({role: 'user', content: '旧会话历史探针'}, 'zcode', zcodeConfig);
+        savedZCodeSession.appendMessage({role: 'assistant', content: '旧回复'}, 'zcode', zcodeConfig);
+        await savedZCodeSession.setRemoteSessionId('original-zcode-session', 'zcode', zcodeConfig);
+        const invalidEvents = [];
+        const preflightTurns = new TurnController(event => invalidEvents.push(event));
+        const personal = {
+            config: {
+                providerConfigRules: {providerRules: [{providerId: 'openai',
+                    config: {personalModelIds: ['gpt-6-astra', 'gpt-6.1-terra']}}]},
+                modelConfigRules: {providerModelRules: [{providerId: 'openai', modelId: 'gpt-6.1-terra',
+                    config: {enabled: false}}]},
+            },
+        };
+        const personalPath = tmpRoot + '/.zcode/v2/provider_config.json';
+        let overrideWrites = 0;
+        const zcodeResumeFixture = tmpRoot + '/zcode-resume-fixture.cjs';
+        GLib.file_set_contents(zcodeResumeFixture, [
+            "const args = process.argv.slice(2);",
+            "const prompt = args.find(arg => arg.startsWith('--prompt='));",
+            "if (!args.includes('--resume=original-zcode-session') || !prompt?.includes('新问题') || prompt.includes('旧会话历史探针')) process.exit(2);",
+            "console.log(JSON.stringify({type:'turn.started',payload:{intent:{modelSelection:{providerId:'openai',modelId:'gpt-6-astra'}}}}));",
+            "console.log(JSON.stringify({type:'model.streaming',payload:{kind:'text_delta',delta:'已接着回答'}}));",
+            "console.log(JSON.stringify({type:'turn.completed'}));",
+        ].join('\n'));
+        const preflightAdapter = new ZCodeAdapter({turns: preflightTurns, store: savedZCodeSession,
+            getSessionContextConfig: () => zcodeConfig,
+            modelConfigIo: {
+                homeDir: tmpRoot,
+                fileExistsAsync: async path => path === personalPath,
+                readJsonAsync: async path => path === personalPath ? personal
+                    : JSON.parse(Decoder.decode(GLib.file_get_contents(path)[1])),
+                writePrivateFileAsync: async (path, bytes) => {
+                    overrideWrites++;
+                    await writePrivateFileAsync(path, bytes);
+                },
+                getRuntimeDir: () => tmpRoot,
+                makeUuid: () => GLib.uuid_string_random(),
+                removeFile: removeFileQuietly,
+            },
+        }).initialize({executable: nodeBin, commandPrefix: [nodeBin, zcodeResumeFixture]},
+            {...zcodeConfig, model: 'gpt-6.1-terra'});
+        await preflightAdapter.restoreSession(savedZCodeSession, {...zcodeConfig, model: 'gpt-6.1-terra'});
+        const rejection = await preflightAdapter.sendMessage({promptText: '保留这条草稿', workspace: tmpRoot});
+        assert(rejection.disposition === 'rejected_before_send' && rejection.error.includes('gpt-6.1-terra') &&
+            !overrideWrites && !invalidEvents.length && !preflightTurns.activeTurn,
+        'Disabled ZCode model is rejected locally before writing a config or spawning a process');
+        assert(savedZCodeSession.messages.length === 2 && savedZCodeSession.remoteSessionId === 'original-zcode-session',
+            'Rejecting an unsent prompt changes neither history nor its native session');
+        preflightAdapter.configure(zcodeConfig);
+        await preflightAdapter.sendMessage({promptText: '新问题', workspace: tmpRoot});
+        const resumed = await waitForEventGjs(invalidEvents, event => event.type === 'agent_settled');
+        assert(resumed.status === 'completed' && overrideWrites === 1 &&
+            savedZCodeSession.remoteSessionId === 'original-zcode-session',
+        'The next valid prompt resumes the original session without resending historical text');
+
+        // A backend mismatch is visible to the user without stopping the existing native session.
+        for (const [reported, mismatched] of [
+            ['gpt-6.1-terra', false], ['gpt-6-astra', true], [null, false],
         ]) {
             const events = [];
             const turns = new TurnController(event => events.push(event));
@@ -792,19 +850,21 @@ let mockHttpProc = null;
                 {type: 'model.streaming', payload: {kind: 'text_delta', delta: 'model answer'}},
                 {type: 'turn.completed'},
             ];
+            let nativeConfirmed = false;
+            let sessionCleared = false;
             spawnManagedCliTurn({
                 backend: 'zcode', runtime: {executable: nodeBin}, config: {mode: 'readonly'},
                 workspace: tmpRoot, turns, turn, getSessionContextConfig: () => ({}), isDisposedFn: () => false,
+                remoteId: 'resumed-zcode-session',
+                store: {appendMessage() {}, confirmRemoteTurnSynced() { nativeConfirmed = true; },
+                    clearRemoteSessionId() { sessionCleared = true; }},
                 rawArgv: [nodeBin, '-e', `console.log(${JSON.stringify(frames.map(frame =>
                     JSON.stringify(frame)).join('\n'))})`],
             });
             const settled = await waitForEventGjs(events, event => event.type === 'agent_settled');
-            assert(settled.status === expectedStatus, 'ZCode route must match explicit model: ' + settled.errorMessage);
-            if (expectedStatus === 'failed') {
-                assert(!turn.text && settled.errorMessage.includes('gpt-6.1-terra'),
-                    'Rejected ZCode turn does not display substitute output');
-                if (reported) assert(settled.errorMessage.includes(reported), 'Failure identifies the returned model');
-            }
+            assert(settled.status === 'completed' && Boolean(settled.modelMismatch) === mismatched &&
+                nativeConfirmed && !sessionCleared, 'ZCode reports a mismatch while retaining the synced native session');
+            if (mismatched) assert(settled.modelMismatch.includes(reported), 'Error identifies the reported model');
         }
 
         assert(isDshWriteWorkspace(tmpRoot, tmpRoot), 'Explicit test workspace permits DSH workspace sandbox');

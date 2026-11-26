@@ -1649,7 +1649,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                     : null;
                 if (matchedProv) {
                     availableModels = [...matchedProv.models];
-                } else {
+                } else if (eff !== 'zcode' || !curProv) {
                     const set = new Set();
                     for (const p of currentCatalog.providers) {
                         for (const m of p.models) set.add(m);
@@ -1668,7 +1668,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 }
             }
 
-            if (curMod && !modelValues.includes(curMod)) {
+            const unlistedZCodeModel = eff === 'zcode' && curMod && !modelValues.includes(curMod);
+            if (curMod && !unlistedZCodeModel && !modelValues.includes(curMod)) {
                 labels.push(`自定义: ${curMod}`);
                 modelValues.push(curMod);
             }
@@ -1676,7 +1677,12 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             syncingUi = true;
             modelComboModel.splice(0, modelComboModel.get_n_items(), labels);
             const idx = Math.max(0, modelValues.indexOf(curMod));
-            modelComboRow.selected = idx;
+            modelComboRow.selected = unlistedZCodeModel ? Gtk.INVALID_LIST_POSITION : idx;
+            modelComboRow.subtitle = unlistedZCodeModel
+                ? (currentCatalog.fromCache
+                    ? `已选模型 ${curMod} 不在当前提供方的可用列表中，请重新选择。`
+                    : `正在核对已选模型 ${curMod}…`)
+                : '也可在下方手动填写';
             if (modelEntryRow.text !== curMod) {
                 modelEntryRow.text = curMod;
             }
@@ -1906,7 +1912,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 return;
             }
 
-            if (!targetBaseUrl) {
+            if (eff === 'zcode' || !targetBaseUrl) {
                 rebuildProviderAndModelUi(
                     eff === 'openai' || eff === 'unconfigured'
                         ? '⚠️ 请先在上方填写接口地址 (Base URL)'

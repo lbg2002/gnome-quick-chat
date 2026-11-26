@@ -506,3 +506,17 @@ test('R11.6: Background notifications enforce lock-screen epoch boundary, ignore
     assert.equal(route.targetBackend, 'zcode');
     assert.notEqual(route.targetMode, 'full');
 });
+
+test('ZCode picker never promotes an unavailable configured or reported model to a selectable option', () => {
+    const catalog = {fromCache: true, providers: [
+        {id: 'openai', models: ['gpt-6-astra']}, {id: 'openai-2', models: ['gpt-6.1-terra']},
+    ]};
+    const result = resolveModelPickerState({
+        effectiveBackend: 'zcode', profile: {provider: 'openai', model: 'gpt-6.1-terra'}, catalog,
+        runtimeModelId: 'gpt-6.1-terra', runtimeProviderId: 'openai',
+        favoriteKeys: ['zcode::openai::gpt-6.1-terra'], recentKeys: ['zcode::openai::gpt-6.1-terra'],
+    });
+    assert.match(result.currentModelSummary, /已选模型不可用.*openai/);
+    assert.deepEqual(result.ranked.items.filter(item => item.modelId === 'gpt-6.1-terra')
+        .map(item => [item.providerId, item.isSelected]), [['openai-2', false]]);
+});

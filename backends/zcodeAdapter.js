@@ -79,11 +79,13 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         approvedScopes,
         getSessionContextConfig,
         emitEvent,
+        modelConfigIo = null,
     } = {}) {
         super('zcode', {emitEvent});
         this._turns = turns;
         this._store = store;
         this._approvedScopes = approvedScopes || new Set();
+        this._modelConfigIo = modelConfigIo;
         this._getSessionContextConfig = getSessionContextConfig || (() => ({}));
     }
 
@@ -109,6 +111,13 @@ export class ZCodeAdapter extends BaseBackendAdapter {
             catalog: cat,
             models: [],
         };
+    }
+
+    async restoreSession(sessionStore) {
+        if (!sessionStore) return super.restoreSession(sessionStore);
+        // Check the runtime context only when an accepted model is about to use it.
+        await sessionStore.load();
+        return {messages: [...sessionStore.messages], remoteSessionId: sessionStore.remoteSessionId || ''};
     }
 
     async sendMessage({
@@ -147,13 +156,6 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         const modeInfo = normalizeEffectiveAgentMode('zcode', this._config?.mode || 'readonly', cliCaps);
         const effectiveMode = modeInfo.effectiveMode;
 
-        const {remoteId, prompt: effectiveCliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
-            memoryContext, allowResume: !disableResume,
-            workspace, specialDirs, mode: effectiveMode,
-            assistantInstructions: [resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
-                turnMeta.memoryInstructions].filter(Boolean).join('\n'),
-        });
-
         const requireBridgeHandshake = modeInfo.native.bridgeApproval;
         if (requireBridgeHandshake && !this._runtime?.bridgePath) {
             const err = new Error('未找到 ZCode 权限审批桥接模块（zcodeBridge.cjs），已阻止在需审批模式下启动任务');
@@ -164,14 +166,18 @@ export class ZCodeAdapter extends BaseBackendAdapter {
         let zcodeIsolated = {env: {}, tempFilePath: '', resolvedProvider: '', resolvedModel: ''};
         let promptTempFilePath = '';
         let rawArgv = [];
+        let remoteId = '';
+        let effectiveCliPrompt = '';
         const useZCodePromptFile = Boolean(this._runtime?.bridgePath);
 
         try {
-            validateCliPromptLength(effectiveCliPrompt, {viaArgv: !useZCodePromptFile});
-
-            zcodeIsolated = await createIsolatedZCodeConfigOverrideAsync(this._config);
+            zcodeIsolated = await createIsolatedZCodeConfigOverrideAsync(this._config, this._modelConfigIo);
             if (zcodeIsolated.tempFilePath) {
                 turn.tempFiles.push(zcodeIsolated.tempFilePath);
+            }
+            if (!this._turns.isCurrent(turn)) {
+                turn.tempFiles.splice(0).forEach(removeFileQuietly);
+                return {disposition: 'cancelled', turnId: turn.id};
             }
             if (zcodeIsolated.resolvedModel && !this._disposed) {
                 this._runtime.resolvedProvider = zcodeIsolated.resolvedProvider || this._runtime.resolvedProvider;
@@ -185,6 +191,13 @@ export class ZCodeAdapter extends BaseBackendAdapter {
                     };
                 }
             }
+            ({remoteId, prompt: effectiveCliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
+                memoryContext, allowResume: !disableResume,
+                workspace, specialDirs, mode: effectiveMode,
+                assistantInstructions: [resolveDesktopAssistantPrompt(this._config?.assistantInstructions),
+                    turnMeta.memoryInstructions].filter(Boolean).join('\n'),
+            }));
+            validateCliPromptLength(effectiveCliPrompt, {viaArgv: !useZCodePromptFile});
             if (useZCodePromptFile) {
                 const runtimeDir = getPrivateRuntimeDir();
                 promptTempFilePath = GLib.build_filenamev([
@@ -213,18 +226,12 @@ export class ZCodeAdapter extends BaseBackendAdapter {
             });
         } catch (prepErr) {
             turn.tempFiles.splice(0).forEach(removeFileQuietly);
-            this._store?.clearRemoteSessionId('prep_failed');
-            if (this._turns.isCurrent(turn)) {
-                this._turns.finalizeTurn(turn, {
-                    status: turn.aborted ? 'cancelled' : 'failed',
-                    errorText: turn.aborted ? '' : prepErr.message,
-                    onCleanupTempFiles: files => files.forEach(removeFileQuietly),
-                });
-            }
-            if (turn.aborted) {
+            if (turn.aborted || !this._turns.isCurrent(turn)) {
                 return {disposition: 'cancelled', turnId: turn.id};
             }
-            throw prepErr;
+            const error = prepErr?.message || String(prepErr);
+            this._turns.finalizeTurn(turn, {status: 'failed', errorText: error, emitEvents: false});
+            return {disposition: 'rejected_before_send', turnId: turn.id, error};
         }
 
         const updatedCtxCfg = this._getSessionContextConfig();

@@ -775,8 +775,10 @@ export function parseZCodeProviderCatalog(personalConfigObj, builtinConfigObj = 
         providers.push({id, name, baseUrl, apiKey: '', models});
     }
 
+    const defaultSelection = pc.defaultModelSelection;
     return {
-        defaultSelection: pc.defaultModelSelection || null,
+        defaultSelection: providers.some(provider => provider.id === defaultSelection?.providerId &&
+            provider.models.includes(defaultSelection.modelId)) ? defaultSelection : null,
         providers,
     };
 }

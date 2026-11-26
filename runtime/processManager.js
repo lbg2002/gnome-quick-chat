@@ -811,20 +811,11 @@ export function spawnManagedCliTurn({
             if (!norm) continue;
 
             const expectedRoute = turn.expectedZCodeRoute;
-            if (expectedRoute && norm.type === 'message_start' && norm.modelId) {
-                turn.reportedModelId = turn.modelId = norm.modelId;
-                if (norm.modelId !== expectedRoute.model || (norm.providerId && norm.providerId !== expectedRoute.provider)) {
-                    monitor.fatalError = `ZCode 模型不匹配：已选 ${expectedRoute.provider}/${expectedRoute.model}，后端报告 ${norm.providerId || '未知提供方'}/${norm.modelId}。请重新选择可用模型。`;
-                    abortTurnForFatalMonitorError();
-                    return false;
-                }
-            }
-            if (expectedRoute && !turn.reportedModelId &&
-                ['message_update', 'message_end', 'turn_completed', 'turn_result',
-                    'tool_execution_start', 'permission_request'].includes(norm.type)) {
-                monitor.fatalError = `ZCode 未确认所选模型 ${expectedRoute.model}，已中止回合。请检查 ZCode 版本和模型配置。`;
-                abortTurnForFatalMonitorError();
-                return false;
+            if (expectedRoute && norm.type === 'message_start' && norm.modelId &&
+                (norm.modelId !== expectedRoute.model || (norm.providerId && norm.providerId !== expectedRoute.provider))) {
+                turn.modelMismatch = redactSensitiveText(
+                    `ZCode 模型不匹配：已选 ${expectedRoute.provider}/${expectedRoute.model}，后端报告 ${norm.providerId || '未知提供方'}/${norm.modelId}。`,
+                    {maxChars: 280});
             }
 
             // R7: Only meaningful semantic progress events extend the phase watchdog;

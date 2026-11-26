@@ -1709,10 +1709,8 @@ export default class QuickChat extends Extension {
                 clientGeneration: generation,
                 lifecycleGeneration: lifeGen,
             });
-            if (result?.disposition === 'rejected_budget') {
-                // OpenAI may reject AFTER async model metadata discovery. This is
-                // a structured result rather than an exception, but the request
-                // was never sent and must not consume the user's draft/attachments.
+            if (['rejected_budget', 'rejected_before_send'].includes(result?.disposition)) {
+                // Model or budget validation can reject a request before sending.
                 if (
                     !this._isSessionUnlockedAndAlive(lifeGen) ||
                     generation !== this._chatController?.clientGeneration ||
@@ -2404,6 +2402,9 @@ export default class QuickChat extends Extension {
                 const msg = event.errorMessage || '执行失败';
                 this._panel.setStatusIndicator('error', `错误：${msg}`);
                 this._syncDiagnosticsSnapshot({lastConnectionError: msg});
+            } else if (event.modelMismatch) {
+                this._panel.setStatusIndicator('error', `错误：${event.modelMismatch}`);
+                this._syncDiagnosticsSnapshot({lastConnectionError: event.modelMismatch});
             } else if (terminalStatus === 'completed' && finishReason === 'length') {
                 const usageHint = usage?.totalTokens ? ` · 本轮 ${usage.totalTokens} tokens` : '';
                 this._panel.setStatusIndicator('ready', `⚠️ 输出达长度上限 (length)${usageHint} · 可点击继续生成`);

@@ -555,7 +555,7 @@ export function resolveModelPickerState({
             if (m) extraModels.push({providerId: '', modelId: String(m).trim()});
         }
     }
-    if (activeModelId) {
+    if (activeModelId && eff !== 'zcode') {
         extraModels.push({providerId: activeProviderId, modelId: activeModelId});
     }
 
@@ -563,12 +563,21 @@ export function resolveModelPickerState({
         backend: eff,
         extraModels,
     });
+    const activeZCodeEntry = eff === 'zcode' && activeModelId &&
+        allEntries.find(entry => entry.modelId === activeModelId &&
+            (!explicitProviderId || entry.providerId === explicitProviderId));
+    const unlistedZCodeModel = eff === 'zcode' && explicitModelId && !activeZCodeEntry;
+    const zcodeSelectionNotice = unlistedZCodeModel
+        ? (!catalog?.fromCache && !catalog?.providers?.length
+            ? `待核对已选模型：${explicitModelId}`
+            : `已选模型不可用：${explicitModelId}${explicitProviderId ? ` (${explicitProviderId})` : ''}。请选择可用模型。`)
+        : '';
     const ranked = filterAndRankModels(allEntries, {
         query,
         favoriteKeys,
         recentKeys,
-        selectedProviderId: activeProviderId,
-        selectedModelId: activeModelId,
+        selectedProviderId: eff === 'zcode' ? activeZCodeEntry?.providerId || '' : activeProviderId,
+        selectedModelId: unlistedZCodeModel ? '' : activeModelId,
         page,
         pageSize,
     });
@@ -610,9 +619,9 @@ export function resolveModelPickerState({
 
     const rawEffort = String(configuredEffort || profile?.effort || 'default').trim() || 'default';
     const effectiveEffort = thinkingSupport.supported ? rawEffort : 'default';
-    const activeModelSummary = activeModelId
+    const activeModelSummary = zcodeSelectionNotice || (activeModelId
         ? `当前真实模型：${activeModelId}${activeProviderId ? ` (${activeProviderId})` : ''}${isUsingDefaultModel ? ' [默认]' : ''}`
-        : (eff === 'unconfigured' || !isBackendAvailable ? '当前真实模型：未配置' : '当前真实模型：自动默认');
+        : (eff === 'unconfigured' || !isBackendAvailable ? '当前真实模型：未配置' : '当前真实模型：自动默认'));
 
     return {
         configuredBackend: configured,
@@ -622,9 +631,9 @@ export function resolveModelPickerState({
         realActiveModel: activeModelId,
         activeProviderId,
         isUsingDefaultModel,
-        currentModelSummary: activeModelId
+        currentModelSummary: zcodeSelectionNotice || (activeModelId
             ? `当前模型: ${activeModelId}${activeProviderId ? ` (${activeProviderId})` : ''}${isUsingDefaultModel ? ' [默认]' : ''}`
-            : (eff === 'unconfigured' || !isBackendAvailable ? '当前模型: 未配置' : '当前模型: 自动默认'),
+            : (eff === 'unconfigured' || !isBackendAvailable ? '当前模型: 未配置' : '当前模型: 自动默认')),
         activeModelSummary,
         backendChips,
         capabilityNotice,
