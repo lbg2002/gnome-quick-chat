@@ -7,6 +7,6 @@
   ],
   "settings-schema": "org.gnome.shell.extensions.quick-chat",
   "url": "https://github.com/lbg2002/gnome-quick-chat",
-  "version": 13,
-  "version-name": "0.3.10"
+  "version": 14,
+  "version-name": "0.3.11"
 }
