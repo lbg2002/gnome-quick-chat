@@ -96,9 +96,13 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         try {
             const provider = new Gtk.CssProvider();
             provider.load_from_string(
-                'window.qc-prefs .subtitle { font-size: 0.82em; } ' +
-                'window.qc-prefs .title { font-size: 0.94em; } ' +
-                'window.qc-prefs row { min-width: 0; }'
+                'window.qc-prefs .subtitle { font-size: 0.85em; } ' +
+                'window.qc-prefs .title { font-size: 0.96em; } ' +
+                'window.qc-prefs preferencesgroup > box > box > label.dim-label { font-size: 0.88em; } ' +
+                'window.qc-prefs row { min-width: 0; } ' +
+                'window.qc-prefs row.action, window.qc-prefs row.expander, window.qc-prefs row.combo { padding-top: 2px; padding-bottom: 2px; } ' +
+                'window.qc-prefs button.qc-prefs-action { padding: 5px 12px; font-size: 0.90em; } ' +
+                'window.qc-prefs button:focus-visible, window.qc-prefs row:focus-visible, window.qc-prefs switch:focus-visible { outline: 2px solid @accent_bg_color; outline-offset: 2px; }'
             );
             const display = Gdk.Display.get_default();
             Gtk.StyleContext.add_provider_for_display(
@@ -145,7 +149,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const dismissNoticeBtn = new Gtk.Button({
             label: '知道了',
             valign: Gtk.Align.CENTER,
-            css_classes: ['flat'],
+            css_classes: ['qc-prefs-action'],
         });
         const syncNoticeBanner = () => {
             const msg = getStr('migration-notice', '').trim();
@@ -180,6 +184,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             title: '运行模式',
             model: Gtk.StringList.new(backendNames),
         });
+        compactNameCombo(backendRow);
         backendRow.selected = Math.max(0, backends.indexOf(getStr('backend', 'auto')));
         backendGroup.add(backendRow);
 
@@ -508,6 +513,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 '深入 · 复杂多步任务 (High)',
             ]),
         });
+        compactNameCombo(effortRow);
         effortRow.selected = Math.max(0, efforts.indexOf(getActiveEffort(getEffectiveBackend())));
         effortRow.connect('notify::selected', () => {
             if (syncingUi) return;
@@ -620,12 +626,12 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const addQuickPromptBtn = new Gtk.Button({
             icon_name: 'list-add-symbolic',
             tooltip_text: '新增自定义快捷动作模板',
-            css_classes: ['flat'],
+            css_classes: ['flat', 'circular'],
         });
         const resetQuickPromptsBtn = new Gtk.Button({
             icon_name: 'edit-undo-symbolic',
             tooltip_text: '恢复默认快捷动作模板',
-            css_classes: ['flat'],
+            css_classes: ['flat', 'circular'],
         });
         quickHeaderBox.append(addQuickPromptBtn);
         quickHeaderBox.append(resetQuickPromptsBtn);
@@ -965,7 +971,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const editPersonaButton = new Gtk.Button({
             label: '编辑提示词',
             valign: Gtk.Align.CENTER,
-            css_classes: ['flat'],
+            css_classes: ['qc-prefs-action'],
         });
         personaRow.add_suffix(editPersonaButton);
         agentGroup.add(personaRow);
@@ -1043,7 +1049,11 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         });
         privacyGroup.add(memoryRow);
         const memoryLocation = new Adw.ActionRow({title: '我的电脑 · Markdown 记忆', subtitle: getMemoryDirectory()});
-        const openMemory = new Gtk.Button({label: '打开目录', valign: Gtk.Align.CENTER});
+        const openMemory = new Gtk.Button({
+            label: '打开目录',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['qc-prefs-action'],
+        });
         openMemory.connect('clicked', () => {
             const directory = getMemoryDirectory();
             if (GLib.file_test(directory, GLib.FileTest.IS_SYMLINK)) return;
@@ -1065,7 +1075,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const resetSessionBtn = new Gtk.Button({
             label: '新建会话',
             valign: Gtk.Align.CENTER,
-            css_classes: ['flat'],
+            css_classes: ['qc-prefs-action'],
         });
         resetSessionBtn.connect('clicked', () => {
             const curSid = getStr('session-id', '').trim();
@@ -1085,7 +1095,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const restorePrevBtn = new Gtk.Button({
             label: '恢复上一会话',
             valign: Gtk.Align.CENTER,
-            css_classes: ['flat'],
+            css_classes: ['qc-prefs-action'],
         });
         restorePrevBtn.connect('clicked', async () => {
             restorePrevBtn.sensitive = false;
@@ -1199,7 +1209,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const cleanupSessionsBtn = new Gtk.Button({
             label: '扫描清理',
             valign: Gtk.Align.CENTER,
-            css_classes: ['flat'],
+            css_classes: ['qc-prefs-action'],
         });
         cleanupSessionsBtn.connect('clicked', async () => {
             cleanupSessionsBtn.sensitive = false;
@@ -1263,7 +1273,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
                 const importBtn = new Gtk.Button({
                     label: '只读导入',
                     valign: Gtk.Align.CENTER,
-                    css_classes: ['flat'],
+                    css_classes: ['qc-prefs-action'],
                 });
                 importBtn.connect('clicked', async () => {
                     importBtn.sensitive = false;
@@ -1460,6 +1470,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const installBtn = new Gtk.Button({
             label: '下载并安装 ZIP',
             valign: Gtk.Align.CENTER,
+            css_classes: ['qc-prefs-action'],
             sensitive: false,
         });
         updateInstallRow.add_suffix(installBtn);
@@ -1473,6 +1484,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const releaseBtn = new Gtk.Button({
             label: '查看 Releases',
             valign: Gtk.Align.CENTER,
+            css_classes: ['qc-prefs-action'],
         });
         releaseRow.add_suffix(releaseBtn);
         releaseBtn.connect('clicked', () => {

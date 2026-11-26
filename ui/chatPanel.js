@@ -131,6 +131,8 @@ export class ChatPanelView {
         this._reconnectButton = null;
         this._status = null;
         this._statusDot = null;
+        this._statusBtn = null;
+        this._modelSelection = null;
         this._sendButton = null;
         this._stopButton = null;
         this._newButton = null;
@@ -259,6 +261,26 @@ export class ChatPanelView {
         this._aiTab?.set_checked(tab === 'ai');
     }
 
+    _createWrappingButton(label, callback, styleClass = 'button qc-button', tooltip = '', {
+        xAlign = Clutter.ActorAlign.START,
+    } = {}) {
+        const lbl = createWrapLabel(label, '');
+        lbl.x_align = xAlign;
+        lbl.y_align = Clutter.ActorAlign.CENTER;
+        const btn = new St.Button({
+            style_class: styleClass,
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            x_expand: true,
+            x_align: Clutter.ActorAlign.FILL,
+            accessible_name: tooltip || label,
+            child: lbl,
+        });
+        btn.connect('clicked', callback);
+        return btn;
+    }
+
     _buildChatArea() {
         const header = new St.BoxLayout({
             orientation: H,
@@ -275,6 +297,7 @@ export class ChatPanelView {
             x_align: Clutter.ActorAlign.FILL,
             accessible_name: '点击快速切换模型与后端',
         });
+        this._statusBtn = statusBtn;
         const statusBox = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-status-box',
@@ -287,16 +310,25 @@ export class ChatPanelView {
         });
         statusBox.add_child(this._statusDot);
         this._status = createWrapLabel('未连接', 'qc-status');
-        // Bound the status label. Long backend diagnostics belong in the
-        // settings report, not in an infinitely expanding Shell header.
-        this._status.set_width(160);
+        this._status.x_expand = true;
+        this._status.x_align = Clutter.ActorAlign.FILL;
         this._status.clutter_text.line_wrap = false;
         this._status.clutter_text.ellipsize = Pango.EllipsizeMode.END;
         this._status.y_align = Clutter.ActorAlign.CENTER;
-        const statusLines = new St.BoxLayout({orientation: V, x_expand: true});
-        this._modelSelection = new St.Label({text: '正在检测模型…', style_class: 'qc-role'});
+        const statusLines = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-status-lines',
+            x_expand: true,
+            x_align: Clutter.ActorAlign.FILL,
+        });
+        this._modelSelection = new St.Label({
+            text: '正在检测模型…',
+            style_class: 'qc-header-model',
+            x_expand: true,
+            x_align: Clutter.ActorAlign.FILL,
+        });
+        this._modelSelection.clutter_text.line_wrap = false;
         this._modelSelection.clutter_text.ellipsize = Pango.EllipsizeMode.END;
-        this._modelSelection.set_width(160);
         statusLines.add_child(this._modelSelection);
         statusLines.add_child(this._status);
         statusBox.add_child(statusLines);
@@ -314,30 +346,37 @@ export class ChatPanelView {
         });
         header.add_child(statusBtn);
 
-        header.add_child(createStButton(
+        const headerActions = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-header-actions',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+
+        headerActions.add_child(createStButton(
             '📎',
             () => this._onAttachFileButton?.(),
-            'qc-button-subtle',
+            'qc-button-subtle qc-header-icon-btn',
             '附加选中文件或本地路径引用'
         ));
 
-        header.add_child(createStButton(
+        headerActions.add_child(createStButton(
             '📋',
             () => this._onClipboardAsk(false),
-            'qc-button-subtle',
+            'qc-button-subtle qc-header-icon-btn',
             '将剪贴板或选中日志作为独立附件引用（不覆盖草稿）'
         ));
 
         this._newButton = createStButton('＋ 新对话', () => this._onNewSession(), 'qc-button-subtle', '开启新对话');
-        header.add_child(this._newButton);
+        headerActions.add_child(this._newButton);
 
         this._sessionMenuBtn = createStButton(
             '▾',
             () => this.toggleSessionMenu(),
-            'qc-button-subtle',
+            'qc-button-subtle qc-header-icon-btn',
             '当前会话恢复、导出与清理菜单'
         );
-        header.add_child(this._sessionMenuBtn);
+        headerActions.add_child(this._sessionMenuBtn);
+        header.add_child(headerActions);
 
         this.chatBox.add_child(header);
 
@@ -485,9 +524,9 @@ export class ChatPanelView {
     _buildContextAndSlashBars() {
         // 1. Historical question edit banner (Stage F3)
         this._editBanner = new St.BoxLayout({
-            orientation: H,
+            orientation: V,
             style_class: 'qc-inline-banner',
-            y_align: Clutter.ActorAlign.CENTER,
+            x_expand: true,
             visible: false,
         });
         this._editBannerLabel = createWrapLabel(
@@ -495,24 +534,35 @@ export class ChatPanelView {
             'qc-mini-label'
         );
         this._editBanner.add_child(this._editBannerLabel);
-        this._editBanner.add_child(createStButton(
+        const editActions = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-banner-actions',
+            x_align: Clutter.ActorAlign.END,
+        });
+        editActions.add_child(createStButton(
             '取消',
             () => this._onCancelEditQuestion?.(),
             'qc-copy-btn',
             '取消编辑历史问题'
         ));
+        this._editBanner.add_child(editActions);
         this.chatBox.add_child(this._editBanner);
 
         // 2. Optional local smart model routing suggestion banner (Stage F6)
         this._routeBanner = new St.BoxLayout({
-            orientation: H,
+            orientation: V,
             style_class: 'qc-inline-banner',
-            y_align: Clutter.ActorAlign.CENTER,
+            x_expand: true,
             visible: false,
         });
         this._routeBannerLabel = createWrapLabel('', 'qc-mini-label');
         this._routeBanner.add_child(this._routeBannerLabel);
-        this._routeBanner.add_child(createStButton(
+        const routeActions = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-banner-actions',
+            x_align: Clutter.ActorAlign.END,
+        });
+        routeActions.add_child(createStButton(
             '采用',
             () => {
                 if (this._currentRouteSuggestion) {
@@ -522,7 +572,7 @@ export class ChatPanelView {
             'qc-copy-btn',
             '采用本地推荐的后端与模型'
         ));
-        this._routeBanner.add_child(createStButton(
+        routeActions.add_child(createStButton(
             '忽略',
             () => {
                 if (this._currentRouteSuggestion) {
@@ -532,18 +582,20 @@ export class ChatPanelView {
             'qc-copy-btn',
             '忽略本次推荐'
         ));
+        this._routeBanner.add_child(routeActions);
         this.chatBox.add_child(this._routeBanner);
 
         // 3. Inline file path attachment bar (Stage F2)
         this._fileAttachBar = new St.BoxLayout({
-            orientation: H,
+            orientation: V,
             style_class: 'qc-inline-banner',
-            y_align: Clutter.ActorAlign.CENTER,
+            x_expand: true,
             visible: false,
         });
         this._filePathEntry = new St.Entry({
             hint_text: '输入或粘贴本地文件路径（如 ~/notes.md）…',
             can_focus: true,
+            track_hover: true,
             x_expand: true,
             style_class: 'qc-picker-search',
         });
@@ -552,7 +604,12 @@ export class ChatPanelView {
             if (p) this._onAttachPathSubmit?.(p, {preferPathOnly: false});
         });
         this._fileAttachBar.add_child(this._filePathEntry);
-        this._fileAttachBar.add_child(createStButton(
+        const fileAttachActions = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-banner-actions',
+            x_align: Clutter.ActorAlign.END,
+        });
+        fileAttachActions.add_child(createStButton(
             '引正文',
             () => {
                 const p = this._filePathEntry?.get_text().trim() || '';
@@ -561,7 +618,7 @@ export class ChatPanelView {
             'qc-copy-btn',
             '读取 UTF-8 文本文件正文作为引用（≤128 KB）'
         ));
-        this._fileAttachBar.add_child(createStButton(
+        fileAttachActions.add_child(createStButton(
             '仅路径',
             () => {
                 const p = this._filePathEntry?.get_text().trim() || '';
@@ -570,12 +627,13 @@ export class ChatPanelView {
             'qc-copy-btn',
             '仅附带文件路径标识，不上传文件内容'
         ));
-        this._fileAttachBar.add_child(createStButton(
+        fileAttachActions.add_child(createStButton(
             '✕',
             () => this.toggleFileAttachBar(false),
             'qc-copy-btn',
             '关闭文件附加栏'
         ));
+        this._fileAttachBar.add_child(fileAttachActions);
         this.chatBox.add_child(this._fileAttachBar);
 
         // 4. Context attachments list & outbound scope notice (Stage F2)
@@ -654,7 +712,7 @@ export class ChatPanelView {
             const cls = idx === this._slashSelectedIndex
                 ? 'qc-slash-item qc-slash-item-active'
                 : 'qc-slash-item';
-            const btn = createStButton(
+            const btn = this._createWrappingButton(
                 `${cmd.label} — ${cmd.description}`,
                 () => {
                     this._slashSelectedIndex = idx;
@@ -663,8 +721,6 @@ export class ChatPanelView {
                 cls,
                 cmd.label
             );
-            btn.x_align = Clutter.ActorAlign.FILL;
-            btn.x_expand = true;
             this._slashMenuBox.add_child(btn);
         });
         this._slashMenuBox.visible = true;
@@ -758,23 +814,24 @@ export class ChatPanelView {
         for (const item of items) {
             const itemBox = new St.BoxLayout({
                 orientation: V,
-                x_expand: true,
-            });
-            const row = new St.BoxLayout({
-                orientation: H,
                 style_class: 'qc-attachment-row',
-                y_align: Clutter.ActorAlign.CENTER,
                 x_expand: true,
             });
             const titleLabel = createWrapLabel(
                 `📎 ${item.sourceLabel} · ${item.title} (${item.sizeLabel})`,
                 'qc-attachment-title'
             );
-            row.add_child(titleLabel);
+            itemBox.add_child(titleLabel);
+
+            const itemActions = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-banner-actions',
+                x_align: Clutter.ActorAlign.END,
+            });
 
             if (item.canToggleContent) {
                 const modeLabel = item.kind === 'file_content' ? '改为仅路径' : '附带正文';
-                row.add_child(createStButton(
+                itemActions.add_child(createStButton(
                     modeLabel,
                     () => this._onToggleAttachmentFileMode?.(item.id),
                     'qc-copy-btn',
@@ -782,20 +839,20 @@ export class ChatPanelView {
                 ));
             }
 
-            row.add_child(createStButton(
+            itemActions.add_child(createStButton(
                 item.previewExpanded ? '收起' : '预览',
                 () => this._onToggleAttachmentPreview?.(item.id),
                 'qc-copy-btn',
                 '预览将随本次提问发送的引用内容'
             ));
 
-            row.add_child(createStButton(
+            itemActions.add_child(createStButton(
                 '✕',
                 () => this._onRemoveAttachment?.(item.id),
                 'qc-copy-btn',
                 '移除此附件引用'
             ));
-            itemBox.add_child(row);
+            itemBox.add_child(itemActions);
 
             if (item.previewExpanded) {
                 itemBox.add_child(createWrapLabel(item.previewText || '', 'qc-attachment-preview'));
@@ -804,16 +861,20 @@ export class ChatPanelView {
         }
 
         if (pureApiActionDesc?.hasPathWarning) {
-            const actionRow = new St.BoxLayout({
-                orientation: H,
+            const actionBox = new St.BoxLayout({
+                orientation: V,
                 style_class: 'qc-attachment-row',
-                y_align: Clutter.ActorAlign.CENTER,
                 x_expand: true,
             });
-            actionRow.add_child(createWrapLabel(pureApiActionDesc.warningText, 'qc-scope-notice'));
+            actionBox.add_child(createWrapLabel(pureApiActionDesc.warningText, 'qc-scope-notice'));
+            const warnActions = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-banner-actions',
+                x_align: Clutter.ActorAlign.END,
+            });
             for (const act of pureApiActionDesc.actions || []) {
                 if (act.action === 'upgrade_to_content' && act.itemIds?.length) {
-                    actionRow.add_child(createStButton(
+                    warnActions.add_child(createStButton(
                         act.label,
                         () => {
                             for (const id of act.itemIds) {
@@ -824,7 +885,7 @@ export class ChatPanelView {
                         act.description
                     ));
                 } else if (act.action === 'switch_to_agent_backend') {
-                    actionRow.add_child(createStButton(
+                    warnActions.add_child(createStButton(
                         act.label,
                         () => this._onSwitchToAgentBackendForPath?.(),
                         'qc-copy-btn',
@@ -832,7 +893,8 @@ export class ChatPanelView {
                     ));
                 }
             }
-            this._attachmentBar.add_child(actionRow);
+            actionBox.add_child(warnActions);
+            this._attachmentBar.add_child(actionBox);
         }
 
         if (scopeNotice) {
@@ -885,13 +947,19 @@ export class ChatPanelView {
             'qc-mini-label'
         ));
 
-        const actionsRow = new St.BoxLayout({
+        const actionsCol = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-session-actions-col',
+            x_expand: true,
+        });
+
+        const primaryRow = new St.BoxLayout({
             orientation: H,
             style_class: 'qc-session-actions',
             y_align: Clutter.ActorAlign.CENTER,
         });
 
-        actionsRow.add_child(createStButton(
+        primaryRow.add_child(createStButton(
             '＋ 新建',
             () => {
                 this.toggleSessionMenu(false);
@@ -903,7 +971,7 @@ export class ChatPanelView {
 
         const prevBtn = createStButton(
             previousSessionId
-                ? `↺ 恢复上一会话${previousPreview ? ` (${previousPreview.slice(0, 8)})` : ''}`
+                ? `↺ 恢复上一会话${previousPreview ? ` (${previousPreview.slice(0, 6)})` : ''}`
                 : '↺ 暂无上一会话',
             () => {
                 if (!previousSessionId) return;
@@ -911,10 +979,29 @@ export class ChatPanelView {
                 this._onRestorePreviousSession?.(previousSessionId);
             },
             'qc-copy-btn',
-            '恢复最近一个非空会话'
+            previousPreview ? `恢复最近一个非空会话：${previousPreview}` : '恢复最近一个非空会话'
         );
         prevBtn.reactive = Boolean(previousSessionId && !this._isBusy?.());
-        actionsRow.add_child(prevBtn);
+        primaryRow.add_child(prevBtn);
+
+        const exportBtn = createStButton(
+            '⇩ 导出对话',
+            () => {
+                this.toggleSessionMenu(false);
+                this._onExportSession?.();
+            },
+            'qc-copy-btn',
+            '导出当前对话为 Markdown 并复制到剪贴板'
+        );
+        exportBtn.reactive = messageCount > 0;
+        primaryRow.add_child(exportBtn);
+        actionsCol.add_child(primaryRow);
+
+        const secondaryRow = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-session-actions',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
 
         if (canUndoLastRewind) {
             const undoBtn = createStButton(
@@ -927,11 +1014,11 @@ export class ChatPanelView {
                 '恢复上一次编辑或重试时舍弃的后续对话记录'
             );
             undoBtn.reactive = !this._isBusy?.();
-            actionsRow.add_child(undoBtn);
+            secondaryRow.add_child(undoBtn);
         }
 
         if (saveWarning) {
-            actionsRow.add_child(createStButton(
+            secondaryRow.add_child(createStButton(
                 '↻ 重试保存',
                 () => {
                     this.toggleSessionMenu(false);
@@ -942,19 +1029,7 @@ export class ChatPanelView {
             ));
         }
 
-        const exportBtn = createStButton(
-            '⇩ 导出对话',
-            () => {
-                this.toggleSessionMenu(false);
-                this._onExportSession?.();
-            },
-            'qc-copy-btn',
-            '导出当前对话为 Markdown 并复制到剪贴板'
-        );
-        exportBtn.reactive = messageCount > 0;
-        actionsRow.add_child(exportBtn);
-
-        actionsRow.add_child(createStButton(
+        secondaryRow.add_child(createStButton(
             '📋 复制诊断',
             () => {
                 this.toggleSessionMenu(false);
@@ -984,9 +1059,17 @@ export class ChatPanelView {
                 '删除当前会话本地历史文件'
             );
             delBtn.reactive = !this._isBusy?.();
-            actionsRow.add_child(delBtn);
-        } else {
-            actionsRow.add_child(createStButton(
+            secondaryRow.add_child(delBtn);
+        }
+        actionsCol.add_child(secondaryRow);
+
+        if (this._sessionDeleteConfirming) {
+            const confirmRow = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-session-actions',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            confirmRow.add_child(createStButton(
                 '确认删除当前会话？',
                 () => {
                     this._sessionDeleteConfirming = false;
@@ -996,7 +1079,7 @@ export class ChatPanelView {
                 'qc-copy-btn qc-danger-btn',
                 '确认永久删除当前会话磁盘记录'
             ));
-            actionsRow.add_child(createStButton(
+            confirmRow.add_child(createStButton(
                 '取消',
                 () => {
                     this._sessionDeleteConfirming = false;
@@ -1014,23 +1097,29 @@ export class ChatPanelView {
                 'qc-copy-btn',
                 '取消删除'
             ));
+            actionsCol.add_child(confirmRow);
         }
 
-        this._sessionMenuBox.add_child(actionsRow);
+        this._sessionMenuBox.add_child(actionsCol);
 
         const expiredCount = cleanupPlan?.candidatesToDelete?.length || 0;
         if (expiredCount > 0) {
-            const cleanupRow = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-session-actions',
-                y_align: Clutter.ActorAlign.CENTER,
+            const cleanupCol = new St.BoxLayout({
+                orientation: V,
+                style_class: 'qc-session-actions-col',
+                x_expand: true,
             });
             const sizeSummary = cleanupPlan?.candidateSizeSummary || '0 B';
-            cleanupRow.add_child(createWrapLabel(
+            cleanupCol.add_child(createWrapLabel(
                 `发现 ${expiredCount} 个超出保留策略（${cleanupPlan.policySummary}，共约 ${sizeSummary}）的旧会话`,
                 'qc-mini-label'
             ));
-            cleanupRow.add_child(createStButton(
+            const cleanupActions = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-banner-actions',
+                x_align: Clutter.ActorAlign.END,
+            });
+            cleanupActions.add_child(createStButton(
                 `同意清理 (${expiredCount} / ${sizeSummary})`,
                 () => {
                     const ids = cleanupPlan.candidatesToDelete.map(c => c.sessionId);
@@ -1040,7 +1129,8 @@ export class ChatPanelView {
                 'qc-copy-btn qc-danger-btn',
                 '经您明确同意后清理超出保留范围的旧会话'
             ));
-            this._sessionMenuBox.add_child(cleanupRow);
+            cleanupCol.add_child(cleanupActions);
+            this._sessionMenuBox.add_child(cleanupCol);
         }
     }
 
@@ -1076,21 +1166,19 @@ export class ChatPanelView {
             x_expand: true,
         });
         if (effBackend === 'unconfigured') {
-            const setupChip = createStButton('⚙ 打开随问设置配置后端…', () => {
+            const setupChip = this._createWrappingButton('⚙ 打开随问设置配置后端…', () => {
                 this._onDismissMigrationNotice?.();
                 this._onOpenPreferences?.();
             }, 'qc-chip', '打开设置配置后端');
-            setupChip.x_align = Clutter.ActorAlign.START;
             chips.add_child(setupChip);
         }
 
         const quickPrompts = parseQuickPromptsConfig(this._getSettingString('quick-prompts-json', ''));
         for (const item of quickPrompts) {
-            const chip = createStButton(item.label, () => {
+            const chip = this._createWrappingButton(item.label, () => {
                 // Stage F1 hard rule: quick actions fill input draft ONLY and NEVER auto-send!
                 this.applyQuickPromptItem(item);
             }, 'qc-chip', item.label);
-            chip.x_align = Clutter.ActorAlign.START;
             chips.add_child(chip);
         }
         card.add_child(chips);
@@ -1169,8 +1257,18 @@ export class ChatPanelView {
         }
     }
 
+    _syncStatusAccessibleName() {
+        if (!this._statusBtn) return;
+        const model = this._modelSelection?.text || '';
+        const status = this._status?.text || '';
+        this._statusBtn.accessible_name = model
+            ? `点击快速切换模型与后端：${model}${status ? `（${status}）` : ''}`
+            : '点击快速切换模型与后端';
+    }
+
     setModelSelection(label) {
         if (this._modelSelection) this._modelSelection.text = label;
+        this._syncStatusAccessibleName();
     }
 
     setStatusIndicator(state, text) {
@@ -1179,6 +1277,7 @@ export class ChatPanelView {
         if (this.lastStatusText !== nextText) {
             this.lastStatusText = nextText;
             this._status.text = nextText;
+            this._syncStatusAccessibleName();
         }
         if (this.lastStatusState === state) return;
         this.lastStatusState = state;
@@ -1446,15 +1545,17 @@ export class ChatPanelView {
             const remaining = this.historyWindow.olderRemainingCount;
             const label = `↑ 加载更早的 ${Math.min(DEFAULT_HISTORY_PAGE_SIZE, remaining)} 条对话（剩余 ${remaining} 条）`;
             if (!this._loadMoreBtn) {
-                this._loadMoreBtn = createStButton(
+                this._loadMoreBtn = this._createWrappingButton(
                     label,
                     () => this.prependOlderHistoryBatch(),
                     'qc-load-more-btn',
-                    '加载更早的历史对话'
+                    '加载更早的历史对话',
+                    {xAlign: Clutter.ActorAlign.CENTER}
                 );
                 this.messagesBox.insert_child_at_index(this._loadMoreBtn, 0);
             } else {
-                this._loadMoreBtn.label = label;
+                if (this._loadMoreBtn.child) this._loadMoreBtn.child.text = label;
+                this._loadMoreBtn.accessible_name = label;
             }
         }
 
@@ -1467,15 +1568,17 @@ export class ChatPanelView {
             const newerRemaining = this.historyWindow.newerRemainingCount;
             const newerLabel = `↓ 返回最新对话（已回收底部 ${newerRemaining} 条不可见消息以节省内存）`;
             if (!this._loadNewerBtn) {
-                this._loadNewerBtn = createStButton(
+                this._loadNewerBtn = this._createWrappingButton(
                     newerLabel,
                     () => this.restoreLatestHistoryWindow(),
                     'qc-load-more-btn',
-                    '回到最新历史窗口'
+                    '回到最新历史窗口',
+                    {xAlign: Clutter.ActorAlign.CENTER}
                 );
                 this.messagesBox.add_child(this._loadNewerBtn);
             } else {
-                this._loadNewerBtn.label = newerLabel;
+                if (this._loadNewerBtn.child) this._loadNewerBtn.child.text = newerLabel;
+                this._loadNewerBtn.accessible_name = newerLabel;
                 try {
                     this.messagesBox.set_child_above_sibling(this._loadNewerBtn, null);
                 } catch (_) {}
@@ -1730,7 +1833,7 @@ export class ChatPanelView {
 
         this.wrapper = this.chatBox = this.entry = this.scroll = this.messagesBox = null;
         this._aiTab = this._aiBadge = null;
-        this._reconnectButton = this._status = this._statusDot = null;
+        this._reconnectButton = this._status = this._statusDot = this._statusBtn = this._modelSelection = null;
         this._sendButton = this._stopButton = this._newButton = this._sessionMenuBtn = null;
         this._sessionMenuBox = this._editBanner = this._editBannerLabel = null;
         this._routeBanner = this._routeBannerLabel = this._currentRouteSuggestion = null;

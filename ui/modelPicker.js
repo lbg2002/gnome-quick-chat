@@ -198,34 +198,20 @@ export class ModelPickerController {
             this.container.add_child(noticeRow);
         }
 
-        const backendRow = new St.BoxLayout({
+        const headerRow = new St.BoxLayout({
             orientation: H,
-            style_class: 'qc-picker-row',
+            style_class: 'qc-picker-header',
             y_align: Clutter.ActorAlign.CENTER,
         });
-        backendRow.add_child(new St.Label({
-            text: '引擎:',
+        headerRow.add_child(new St.Label({
+            text: '引擎与模型',
             style_class: 'qc-picker-label',
+            x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
         }));
-
-        for (const item of pickerState.backendChips) {
-            backendRow.add_child(createStButton(
-                item.displayLabel,
-                () => {
-                    this.page = 0;
-                    // Fast switch updates backend profile/selection without resetting composer draft or attachments (R11.1)
-                    this._registry.selectBackend(item.id, {clearMigrationNotice: true});
-                    this.populate();
-                },
-                item.active ? 'qc-picker-chip qc-picker-chip-active' : 'qc-picker-chip',
-                item.statusTag ? `${item.label}（${item.statusTag}）` : `切换到 ${item.label}`
-            ));
-        }
-        backendRow.add_child(new St.Widget({x_expand: true}));
         if (effectiveBackend !== 'unconfigured') {
-            backendRow.add_child(createStButton(
-                '↻',
+            headerRow.add_child(createStButton(
+                '↻ 刷新',
                 () => {
                     invalidateBackendDetectionCaches('catalog');
                     this._refreshCatalogInBackground(effectiveBackend, true);
@@ -235,7 +221,39 @@ export class ModelPickerController {
                 '后台异步刷新模型目录'
             ));
         }
-        this.container.add_child(backendRow);
+        headerRow.add_child(createStButton('更多设置…', () => {
+            this.toggle(false);
+            this._onOpenPreferences?.();
+        }, 'qc-picker-chip', '打开完整设置页面'));
+        this.container.add_child(headerRow);
+
+        const chipsCol = new St.BoxLayout({
+            orientation: V,
+            style_class: 'qc-picker-chips-col',
+            x_expand: true,
+        });
+        for (let i = 0; i < pickerState.backendChips.length; i += 3) {
+            const chipRow = new St.BoxLayout({
+                orientation: H,
+                style_class: 'qc-picker-row',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            for (const item of pickerState.backendChips.slice(i, i + 3)) {
+                chipRow.add_child(createStButton(
+                    item.displayLabel,
+                    () => {
+                        this.page = 0;
+                        // Fast switch updates backend profile/selection without resetting composer draft or attachments (R11.1)
+                        this._registry.selectBackend(item.id, {clearMigrationNotice: true});
+                        this.populate();
+                    },
+                    item.active ? 'qc-picker-chip qc-picker-chip-active' : 'qc-picker-chip',
+                    item.statusTag ? `${item.label}（${item.statusTag}）` : `切换到 ${item.label}`
+                ));
+            }
+            chipsCol.add_child(chipRow);
+        }
+        this.container.add_child(chipsCol);
 
         const summaryLabel = createWrapLabel('', 'qc-mini-label');
         this.container.add_child(summaryLabel);
@@ -247,6 +265,7 @@ export class ModelPickerController {
                     ? '搜索已缓存模型，或输入自定义模型 ID 按回车切换…'
                     : '搜索模型或 Provider（★ 收藏 · 近期使用优先展示）…',
                 can_focus: true,
+                track_hover: true,
                 x_expand: true,
             });
             if (this.query) searchEntry.set_text(this.query);
@@ -267,16 +286,30 @@ export class ModelPickerController {
             this.container.add_child(searchEntry);
         }
 
+        const resultsScroll = new St.ScrollView({
+            style_class: 'qc-picker-scroll',
+            x_expand: true,
+            overlay_scrollbars: true,
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+        });
         const resultsSection = new St.BoxLayout({
             orientation: V,
             style_class: 'qc-picker-models',
             x_expand: true,
         });
-        this.container.add_child(resultsSection);
+        resultsScroll.set_child(resultsSection);
+        this.container.add_child(resultsScroll);
+
+        const paginationBox = new St.BoxLayout({
+            orientation: V,
+            x_expand: true,
+        });
+        this.container.add_child(paginationBox);
 
         const footerRow = new St.BoxLayout({
             orientation: H,
-            style_class: 'qc-picker-row',
+            style_class: 'qc-picker-row qc-picker-footer',
             y_align: Clutter.ActorAlign.CENTER,
         });
 
@@ -299,7 +332,7 @@ export class ModelPickerController {
                 const curEffort = this._registry.getBackendProfile(eff).reasoningEffort || 'default';
                 for (const ef of [
                     {id: 'default', label: '默认'},
-                    {id: 'fast', label: '快'},
+                    {id: 'fast', label: '快速'},
                     {id: 'standard', label: '标准'},
                     {id: 'deep', label: '深入'},
                 ]) {
@@ -316,16 +349,12 @@ export class ModelPickerController {
                     ));
                 }
             }
-            footerRow.add_child(new St.Widget({x_expand: true}));
-            footerRow.add_child(createStButton('更多设置…', () => {
-                this.toggle(false);
-                this._onOpenPreferences?.();
-            }, 'qc-picker-chip', '打开完整设置页面'));
         };
 
         const renderResultsSection = () => {
             if (!resultsSection.get_parent()) return;
             resultsSection.destroy_all_children();
+            paginationBox.destroy_all_children();
 
             const liveState = this._buildCurrentPickerState();
             summaryLabel.text = [liveState.currentModelSummary, liveState.capabilityNotice].filter(Boolean).join(' · ');
@@ -335,49 +364,52 @@ export class ModelPickerController {
             this.page = ranked.page;
 
             if (ranked.items.length > 0) {
-                for (let i = 0; i < ranked.items.length; i += 2) {
-                    const line = new St.BoxLayout({orientation: H, style_class: 'qc-picker-row', x_expand: true});
-                    for (const entry of ranked.items.slice(i, i + 2)) {
-                        const cell = new St.BoxLayout({
-                            orientation: H,
-                            style_class: 'qc-picker-model-cell',
-                            x_expand: true,
-                            y_align: Clutter.ActorAlign.CENTER,
-                        });
-                        const suffix = catalog.providers.length > 1 && entry.providerName
-                            ? ` (${entry.providerName})`
-                            : '';
-                        const recentBadge = entry.isRecent && !entry.isSelected && !entry.isFavorite ? ' · 近期' : '';
-                        const lbl = `${entry.isSelected ? '✓ ' : ''}${entry.modelId}${suffix}${recentBadge}`;
-                        const mBtn = createStButton(
-                            lbl,
-                            () => {
-                                this._registry.updateBackendProfile(
-                                    eff,
-                                    {provider: entry.providerId, model: entry.modelId},
-                                    {recordRecent: true}
-                                );
-                                this.toggle(false);
-                            },
-                            entry.isSelected ? 'qc-picker-model-btn qc-picker-chip-active' : 'qc-picker-model-btn',
-                            lbl
+                for (const entry of ranked.items) {
+                    const cell = new St.BoxLayout({
+                        orientation: H,
+                        style_class: 'qc-picker-model-cell',
+                        x_expand: true,
+                        y_align: Clutter.ActorAlign.CENTER,
+                    });
+                    const suffix = catalog.providers.length > 1 && entry.providerName
+                        ? ` (${entry.providerName})`
+                        : '';
+                    const recentBadge = entry.isRecent && !entry.isSelected && !entry.isFavorite ? ' · 近期' : '';
+                    const lbl = `${entry.isSelected ? '✓ ' : ''}${entry.modelId}${suffix}${recentBadge}`;
+                    const modelLbl = createWrapLabel(lbl, 'qc-picker-model-label');
+                    modelLbl.y_align = Clutter.ActorAlign.CENTER;
+                    const mBtn = new St.Button({
+                        style_class: entry.isSelected ? 'qc-picker-model-btn qc-picker-chip-active' : 'qc-picker-model-btn',
+                        can_focus: true,
+                        reactive: true,
+                        track_hover: true,
+                        x_expand: true,
+                        x_align: Clutter.ActorAlign.FILL,
+                        accessible_name: lbl,
+                        child: modelLbl,
+                    });
+                    mBtn.connect('clicked', () => {
+                        this._registry.updateBackendProfile(
+                            eff,
+                            {provider: entry.providerId, model: entry.modelId},
+                            {recordRecent: true}
                         );
-                        mBtn.x_expand = true;
-                        cell.add_child(mBtn);
+                        this.toggle(false);
+                    });
+                    cell.add_child(mBtn);
 
-                        const starBtn = createStButton(
-                            entry.isFavorite ? '★' : '☆',
-                            () => {
-                                this._toggleFavoriteModel(entry.key);
-                                renderResultsSection();
-                            },
-                            entry.isFavorite ? 'qc-picker-star-btn qc-picker-star-active' : 'qc-picker-star-btn',
-                            entry.isFavorite ? '取消收藏该模型' : '收藏该模型（置顶显示）'
-                        );
-                        cell.add_child(starBtn);
-                        line.add_child(cell);
-                    }
-                    resultsSection.add_child(line);
+                    const starBtn = createStButton(
+                        entry.isFavorite ? '★' : '☆',
+                        () => {
+                            this._toggleFavoriteModel(entry.key);
+                            renderResultsSection();
+                        },
+                        entry.isFavorite ? 'qc-picker-star-btn qc-picker-star-active' : 'qc-picker-star-btn',
+                        entry.isFavorite ? '取消收藏该模型' : '收藏该模型（置顶显示）'
+                    );
+                    starBtn.y_align = Clutter.ActorAlign.CENTER;
+                    cell.add_child(starBtn);
+                    resultsSection.add_child(cell);
                 }
 
                 if (ranked.totalPages > 1) {
@@ -413,11 +445,11 @@ export class ModelPickerController {
                     pageRow.add_child(prevBtn);
                     pageRow.add_child(pageInfo);
                     pageRow.add_child(nextBtn);
-                    resultsSection.add_child(pageRow);
+                    paginationBox.add_child(pageRow);
                 }
             } else {
                 const emptyText = eff === 'unconfigured'
-                    ? '未检测到可用引擎：请安装 ZCode / Codex CLI，或点击下方「更多设置…」配置 OpenAI API。'
+                    ? '未检测到可用引擎：请安装 ZCode / Codex CLI，或点击右上角「更多设置…」配置 OpenAI API。'
                     : this.query.trim()
                         ? (eff === 'openai'
                             ? `无匹配缓存模型，可直接按回车使用「${this.query.trim()}」`
@@ -425,7 +457,7 @@ export class ModelPickerController {
                         : this._refreshing
                             ? '正在后台异步加载模型目录…'
                             : eff === 'openai'
-                                ? `当前生效模型：${liveState.activeModelId || '自动发现'}（点击右上角 ↻ 可在线拉取列表）`
+                                ? `当前生效模型：${liveState.activeModelId || '自动发现'}（点击右上角「↻ 刷新」可在线拉取列表）`
                                 : eff === 'zcode'
                                     ? 'ZCode 本地配置中没有可选模型。'
                                     : '未检测到预设模型列表，将使用后端默认模型。';

@@ -9,14 +9,17 @@ export function compactPreferenceRow(row) {
     }
 }
 
-function nameFactory() {
+function nameFactory(maxWidthChars = 24, vMargin = 2) {
     const factory = new Gtk.SignalListItemFactory();
     factory.connect('setup', (_, item) => {
         item.child = new Gtk.Label({
             xalign: 0,
+            valign: Gtk.Align.CENTER,
             wrap: true,
             wrap_mode: Pango.WrapMode.WORD_CHAR,
-            max_width_chars: 24,
+            max_width_chars: maxWidthChars,
+            margin_top: vMargin,
+            margin_bottom: vMargin,
         });
     });
     factory.connect('bind', (_, item) => {
@@ -28,6 +31,6 @@ function nameFactory() {
 }
 
 export function compactNameCombo(row) {
-    row.factory = nameFactory();
-    row.list_factory = nameFactory();
+    row.factory = nameFactory(24, 2);
+    row.list_factory = nameFactory(36, 3);
 }

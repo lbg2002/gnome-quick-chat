@@ -7,6 +7,7 @@ import {compactNameCombo, compactPreferenceRow} from '../ui/preferencesLayout.js
 
 Adw.init();
 const longName = '超长模型与服务商名称'.repeat(60) + '-long-provider-model-id'.repeat(60);
+const longBackend = '自动检测 (ZCode → Codex → DSH → OpenAI API · 支持超长中文说明不截断显示)';
 const longSubtitle = '使用相同的设置测试中文副标题和连续的标识符。'.repeat(40);
 const window = new Adw.PreferencesWindow({default_width: 540, default_height: 550});
 const page = new Adw.PreferencesPage({title: '界面与权限'});
@@ -15,12 +16,25 @@ const action = new Adw.ActionRow({title: longName, subtitle: longSubtitle});
 const expander = new Adw.ExpanderRow({title: longName, subtitle: longSubtitle, expanded: true});
 const entry = new Adw.EntryRow({title: '手动填写模型', text: longName});
 const combo = new Adw.ComboRow({title: '选择 Provider', model: Gtk.StringList.new([longName])});
-for (const row of [action, expander, entry, combo]) compactPreferenceRow(row);
+const backendCombo = new Adw.ComboRow({title: '运行模式', model: Gtk.StringList.new([longBackend])});
+const switchRow = new Adw.SwitchRow({title: longName, subtitle: longSubtitle});
+const spinRow = new Adw.SpinRow({
+    title: '面板宽度与中文长标题测试'.repeat(6),
+    subtitle: longSubtitle,
+    adjustment: new Gtk.Adjustment({lower: 340, upper: 680, step_increment: 10}),
+});
+for (const row of [action, expander, entry, combo, backendCombo, switchRow, spinRow]) {
+    compactPreferenceRow(row);
+}
 compactNameCombo(combo);
+compactNameCombo(backendCombo);
 expander.add_row(entry);
 group.add(action);
 group.add(expander);
 group.add(combo);
+group.add(backendCombo);
+group.add(switchRow);
+group.add(spinRow);
 page.add(group);
 window.add(page);
 window.present();
@@ -43,20 +57,24 @@ await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => 
 
 try {
     assert(window.get_width() === 540, 'test window expanded for the long text: ' + window.get_width());
-    for (const row of [action, expander, entry, combo]) {
+    for (const row of [action, expander, entry, combo, backendCombo, switchRow, spinRow]) {
         const [min] = row.measure(Gtk.Orientation.HORIZONTAL, -1);
         assert(min <= 480 && row.get_width() > 0 && row.get_width() <= 540,
             `row exceeds the width budget: minimum ${min}, allocated ${row.get_width()}`);
     }
     assert(action.get_title_lines() === 0 && expander.get_title_lines() === 0, 'titles can wrap');
     assert(action.get_subtitle_lines() === 0 && expander.get_subtitle_lines() === 0, 'subtitles can wrap');
-    const label = [...widgets(combo)].find(widget => widget instanceof Gtk.Label &&
-        widget.label === longName && widget.get_mapped());
-    assert(label?.wrap && label.wrap_mode === Pango.WrapMode.WORD_CHAR, 'selected combo item wraps');
-    assert(!label.get_layout().is_ellipsized(), 'long selected name remains visible');
-    assert(label.tooltip_text === longName, 'full model name should remain available');
+    assert(switchRow.get_title_lines() === 0 && switchRow.get_subtitle_lines() === 0, 'switch row wraps');
+    assert(spinRow.get_title_lines() === 0 && spinRow.get_subtitle_lines() === 0, 'spin row wraps');
+    for (const [row, expected] of [[combo, longName], [backendCombo, longBackend]]) {
+        const label = [...widgets(row)].find(widget => widget instanceof Gtk.Label &&
+            widget.label === expected && widget.get_mapped());
+        assert(label?.wrap && label.wrap_mode === Pango.WrapMode.WORD_CHAR, 'selected combo item wraps');
+        assert(!label.get_layout().is_ellipsized(), 'long selected name remains visible');
+        assert(label.tooltip_text === expected, 'full model name should remain available');
+    }
     assert(entry.text === longName, 'editable value was altered');
-    print('GTK/Adw layout passed at 540 px: ActionRow, ExpanderRow, EntryRow, ComboRow.');
+    print('GTK/Adw layout passed at 540 px: ActionRow, ExpanderRow, EntryRow, ComboRow, SwitchRow, SpinRow.');
 } finally {
     window.destroy();
 }

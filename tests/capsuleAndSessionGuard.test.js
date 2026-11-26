@@ -448,8 +448,34 @@ test('experimental capsule defaults off and preferences bound titles and model n
     const schema = source('schemas/org.gnome.shell.extensions.quick-chat.gschema.xml');
     assert.match(schema, /key name="enable-experimental-capsule" type="b">\s*<default>false<\/default>/);
     assert.doesNotMatch(source('ui/capsuleView.js'), /\b(pushModal|popModal|grab_keyboard)\b|stage\.grab\(/);
-    assert.match(source('prefs.js'), /compactNameCombo\(providerComboRow\)/);
-    assert.match(source('prefs.js'), /compactNameCombo\(modelComboRow\)/);
+    const prefs = source('prefs.js');
+    for (const comboName of ['backendRow', 'providerComboRow', 'modelComboRow', 'effortRow', 'modeRow']) {
+        assert.match(prefs, new RegExp(`compactNameCombo\\(${comboName}\\)`));
+    }
     assert.match(source('ui/preferencesLayout.js'), /set_title_lines\(0\)/);
     assert.match(source('ui/preferencesLayout.js'), /set_subtitle_lines\(0\)/);
+});
+
+test('GNOME 50 UI polish keeps shared DateMenu sizing, focus feedback, and unwrapped labels', () => {
+    const css = source('stylesheet.css');
+    for (const selector of [
+        '.qc-tab-button:focus',
+        '.qc-entry:focus',
+        '.qc-send-btn:focus',
+        '.qc-picker-chip:focus',
+        '.qc-picker-model-btn:focus',
+        '.qc-button-subtle:focus',
+    ]) {
+        assert.ok(css.includes(selector), `missing focus feedback rule for ${selector}`);
+    }
+    assert.match(css, /\.qc-in-date-menu \.qc-scroll-stack,\s*\.qc-in-date-menu \.qc-scroll\s*\{\s*min-height:\s*0;/);
+
+    const chatPanel = source('ui/chatPanel.js');
+    assert.doesNotMatch(chatPanel, /set_width\(160\)/);
+    assert.match(chatPanel, /applyDimensions\(\{shared = false\} = \{\}\)/);
+    assert.match(chatPanel, /_createWrappingButton\(/);
+
+    const picker = source('ui/modelPicker.js');
+    assert.match(picker, /qc-picker-scroll/);
+    assert.match(picker, /slice\(i,\s*i \+ 3\)/);
 });

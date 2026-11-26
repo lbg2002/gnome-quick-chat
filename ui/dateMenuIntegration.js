@@ -44,6 +44,7 @@ export class DateMenuIntegration {
         }
 
         const slot = new St.Widget({
+            style_class: 'qc-datemenu-slot',
             layout_manager: new Clutter.BinLayout(),
             y_expand: true,
             clip_to_allocation: true,
@@ -120,7 +121,10 @@ export class DateMenuIntegration {
         mount.tabs?.destroy();
         // The wrapper can itself be delivering destroy after the native tree was torn down.
         if (mount.slot.get_parent() === mount.columns) {
-            if (mount.wrapper.get_parent() === mount.slot) mount.slot.remove_child(mount.wrapper);
+            if (mount.wrapper.get_parent() === mount.slot) {
+                mount.wrapper.remove_style_class_name('qc-in-date-menu');
+                mount.slot.remove_child(mount.wrapper);
+            }
             mount.slot.destroy();
         }
     }
