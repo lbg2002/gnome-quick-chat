@@ -465,17 +465,27 @@ test('GNOME 50 UI polish keeps shared DateMenu sizing, focus feedback, and unwra
         '.qc-picker-chip:focus',
         '.qc-picker-model-btn:focus',
         '.qc-button-subtle:focus',
+        '.qc-seg-btn:focus',
+        '.qc-tool-icon-btn:focus',
     ]) {
         assert.ok(css.includes(selector), `missing focus feedback rule for ${selector}`);
     }
     assert.match(css, /\.qc-in-date-menu \.qc-scroll-stack,\s*\.qc-in-date-menu \.qc-scroll\s*\{\s*min-height:\s*0;/);
+    assert.match(css, /\.qc-picker-models\s*\{[\s\S]*?padding:\s*2px\s+12px\s+4px\s+0;/);
 
     const chatPanel = source('ui/chatPanel.js');
     assert.doesNotMatch(chatPanel, /set_width\(160\)/);
     assert.match(chatPanel, /applyDimensions\(\{shared = false\} = \{\}\)/);
     assert.match(chatPanel, /_createWrappingButton\(/);
+    assert.match(chatPanel, /_onModelPickerToggled\(open\)/);
+    assert.match(chatPanel, /this\.mountedCards\.length > 0/);
+    for (const iconName of ['mail-attachment-symbolic', 'edit-paste-symbolic', 'view-more-symbolic']) {
+        assert.ok(chatPanel.includes(iconName), `missing symbolic icon ${iconName}`);
+    }
 
     const picker = source('ui/modelPicker.js');
     assert.match(picker, /qc-picker-scroll/);
-    assert.match(picker, /slice\(i,\s*i \+ 3\)/);
+    assert.match(picker, /qc-segmented-group/);
+    assert.match(picker, /starred-symbolic/);
+    assert.match(picker, /non-starred-symbolic/);
 });

@@ -124,6 +124,7 @@ export class ChatPanelView {
         this.wrapper = null;
         this.chatBox = null;
         this.entry = null;
+        this._scrollStack = null;
         this.scroll = null;
         this.messagesBox = null;
         this._aiTab = null;
@@ -203,6 +204,24 @@ export class ChatPanelView {
         return this.wrapper;
     }
 
+    _createIconButton(iconName, callback, styleClass = 'qc-icon-button', tooltip = '', iconStyleClass = 'qc-symbolic-icon') {
+        const icon = new St.Icon({
+            icon_name: iconName,
+            style_class: iconStyleClass,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const btn = new St.Button({
+            style_class: styleClass,
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            accessible_name: tooltip,
+            child: icon,
+        });
+        btn.connect('clicked', callback);
+        return btn;
+    }
+
     _buildTopTabs() {
         const tabs = new St.BoxLayout({
             orientation: H,
@@ -225,7 +244,7 @@ export class ChatPanelView {
             style_class: 'qc-tab-content',
             y_align: Clutter.ActorAlign.CENTER,
         });
-        aiContent.add_child(new St.Label({text: '✦ 随问', y_align: Clutter.ActorAlign.CENTER}));
+        aiContent.add_child(new St.Label({text: '随问', y_align: Clutter.ActorAlign.CENTER}));
         this._aiBadge = new St.Label({
             text: '●',
             style_class: 'qc-ai-tab-dot',
@@ -238,13 +257,22 @@ export class ChatPanelView {
         tabGroup.add_child(this._aiTab);
 
         tabs.add_child(tabGroup);
-        tabs.add_child(new St.Widget({x_expand: true}));
 
-        this._reconnectButton = createStButton('↻', () => this._onReconnectNow(), 'qc-icon-button', '重新连接智能后端');
+        this._reconnectButton = this._createIconButton(
+            'view-refresh-symbolic',
+            () => this._onReconnectNow(),
+            'qc-icon-button',
+            '重新连接智能后端'
+        );
         this._reconnectButton.visible = false;
         tabs.add_child(this._reconnectButton);
 
-        const settingsBtn = createStButton('⚙', () => this._onOpenPreferences(), 'qc-icon-button', '随问设置');
+        const settingsBtn = this._createIconButton(
+            'emblem-system-symbolic',
+            () => this._onOpenPreferences(),
+            'qc-icon-button',
+            '随问设置'
+        );
         tabs.add_child(settingsBtn);
 
         this.wrapper.add_child(tabs);
@@ -333,9 +361,9 @@ export class ChatPanelView {
         statusLines.add_child(this._status);
         statusBox.add_child(statusLines);
 
-        const chevron = new St.Label({
-            text: '▾',
-            style_class: 'qc-status-chevron',
+        const chevron = new St.Icon({
+            icon_name: 'pan-down-symbolic',
+            style_class: 'qc-symbolic-icon-sm qc-status-chevron',
             y_align: Clutter.ActorAlign.CENTER,
         });
         statusBox.add_child(chevron);
@@ -352,27 +380,49 @@ export class ChatPanelView {
             y_align: Clutter.ActorAlign.CENTER,
         });
 
-        headerActions.add_child(createStButton(
-            '📎',
+        headerActions.add_child(this._createIconButton(
+            'mail-attachment-symbolic',
             () => this._onAttachFileButton?.(),
-            'qc-button-subtle qc-header-icon-btn',
+            'qc-tool-icon-btn',
             '附加选中文件或本地路径引用'
         ));
 
-        headerActions.add_child(createStButton(
-            '📋',
+        headerActions.add_child(this._createIconButton(
+            'edit-paste-symbolic',
             () => this._onClipboardAsk(false),
-            'qc-button-subtle qc-header-icon-btn',
+            'qc-tool-icon-btn',
             '将剪贴板或选中日志作为独立附件引用（不覆盖草稿）'
         ));
 
-        this._newButton = createStButton('＋ 新对话', () => this._onNewSession(), 'qc-button-subtle', '开启新对话');
+        const newBtnContent = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-new-btn-content',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        newBtnContent.add_child(new St.Icon({
+            icon_name: 'list-add-symbolic',
+            style_class: 'qc-symbolic-icon-sm',
+            y_align: Clutter.ActorAlign.CENTER,
+        }));
+        newBtnContent.add_child(new St.Label({
+            text: '新对话',
+            y_align: Clutter.ActorAlign.CENTER,
+        }));
+        this._newButton = new St.Button({
+            style_class: 'qc-button-subtle',
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            accessible_name: '开启新对话',
+            child: newBtnContent,
+        });
+        this._newButton.connect('clicked', () => this._onNewSession());
         headerActions.add_child(this._newButton);
 
-        this._sessionMenuBtn = createStButton(
-            '▾',
+        this._sessionMenuBtn = this._createIconButton(
+            'view-more-symbolic',
             () => this.toggleSessionMenu(),
-            'qc-button-subtle qc-header-icon-btn',
+            'qc-tool-icon-btn',
             '当前会话恢复、导出与清理菜单'
         );
         headerActions.add_child(this._sessionMenuBtn);
@@ -384,10 +434,13 @@ export class ChatPanelView {
             orientation: V,
             style_class: 'qc-model-picker',
             x_expand: true,
+            y_expand: true,
             visible: false,
         });
         this.chatBox.add_child(pickerBox);
-        this._modelPicker.attachActors(pickerBox, chevron);
+        this._modelPicker.attachActors(pickerBox, chevron, {
+            onToggle: open => this._onModelPickerToggled(open),
+        });
 
         this._sessionMenuBox = new St.BoxLayout({
             orientation: V,
@@ -403,6 +456,7 @@ export class ChatPanelView {
             x_expand: true,
             y_expand: true,
         });
+        this._scrollStack = scrollStack;
 
         this.scroll = new St.ScrollView({
             style_class: 'qc-scroll',
@@ -500,7 +554,7 @@ export class ChatPanelView {
         inputRow.add_child(this.entry);
 
         this._sendButton = createStButton('发送', () => this._onSend(), 'qc-send-btn', '发送问题');
-        this._stopButton = createStButton('■ 停止', () => this._onAbort(), 'qc-stop-btn', '停止生成');
+        this._stopButton = createStButton('停止', () => this._onAbort(), 'qc-stop-btn', '停止生成');
         this._stopButton.hide();
         inputRow.add_child(this._sendButton);
         inputRow.add_child(this._stopButton);
@@ -1335,9 +1389,21 @@ export class ChatPanelView {
         this.updateJumpBottomVisibility();
     }
 
+    _onModelPickerToggled(open) {
+        if (this._scrollStack) {
+            this._scrollStack.visible = !open;
+        }
+        this.updateJumpBottomVisibility();
+    }
+
     updateJumpBottomVisibility() {
         if (!this._jumpBottomBtn) return;
-        const shouldShow = this.userScrolledUp || Boolean(this.historyWindow?.hasNewer);
+        const canShowInScroll = Boolean(
+            (!this._scrollStack || this._scrollStack.visible) &&
+            !this._modelPicker?.isOpen &&
+            this.mountedCards.length > 0
+        );
+        const shouldShow = canShowInScroll && (this.userScrolledUp || Boolean(this.historyWindow?.hasNewer));
         if (shouldShow && !this._jumpBottomBtn.visible) {
             this._jumpBottomBtn.opacity = 0;
             this._jumpBottomBtn.translation_y = 6;
@@ -1791,6 +1857,8 @@ export class ChatPanelView {
         this._loadNewerBtn = null;
         this._empty = null;
         this.messagesBox?.destroy_all_children();
+        this.userScrolledUp = false;
+        this.updateJumpBottomVisibility();
         if (buildEmpty) this.buildEmptyState();
     }
 
@@ -1831,7 +1899,7 @@ export class ChatPanelView {
             try { actor?.remove_all_transitions?.(); } catch (_) {}
         }
 
-        this.wrapper = this.chatBox = this.entry = this.scroll = this.messagesBox = null;
+        this.wrapper = this.chatBox = this.entry = this._scrollStack = this.scroll = this.messagesBox = null;
         this._aiTab = this._aiBadge = null;
         this._reconnectButton = this._status = this._statusDot = this._statusBtn = this._modelSelection = null;
         this._sendButton = this._stopButton = this._newButton = this._sessionMenuBtn = null;

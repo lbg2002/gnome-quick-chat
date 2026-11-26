@@ -40,6 +40,7 @@ export class ModelPickerController {
 
         this.container = null;
         this.chevronLabel = null;
+        this._onToggle = null;
         this.isOpen = false;
         this.query = '';
         this.page = 0;
@@ -61,9 +62,10 @@ export class ModelPickerController {
         return this._hasKey(key) ? (this._settings.get_strv(key) || []) : [];
     }
 
-    attachActors(containerBox, chevronLabel) {
+    attachActors(containerBox, chevronLabel, {onToggle = null} = {}) {
         this.container = containerBox;
         this.chevronLabel = chevronLabel;
+        this._onToggle = onToggle;
     }
 
     resetSessionState() {
@@ -82,14 +84,20 @@ export class ModelPickerController {
         const nextOpen = typeof forceState === 'boolean' ? forceState : !this.isOpen;
         this.isOpen = nextOpen;
         if (this.chevronLabel) {
-            this.chevronLabel.text = nextOpen ? '▴' : '▾';
+            if (this.chevronLabel instanceof St.Icon) {
+                this.chevronLabel.icon_name = nextOpen ? 'pan-up-symbolic' : 'pan-down-symbolic';
+            } else {
+                this.chevronLabel.text = nextOpen ? '▴' : '▾';
+            }
         }
         if (!nextOpen) {
             this.container.visible = false;
+            this._onToggle?.(false);
             return;
         }
         this.populate();
         this.container.visible = true;
+        this._onToggle?.(true);
     }
 
     refreshResultsOnly() {
@@ -175,6 +183,24 @@ export class ModelPickerController {
         });
     }
 
+    _createIconBtn(iconName, callback, tooltip, styleClass = 'qc-picker-icon-btn') {
+        const icon = new St.Icon({
+            icon_name: iconName,
+            style_class: 'qc-symbolic-icon-sm',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const btn = new St.Button({
+            style_class: styleClass,
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            accessible_name: tooltip,
+            child: icon,
+        });
+        btn.connect('clicked', callback);
+        return btn;
+    }
+
     populate() {
         if (!this.container) return;
         this.container.destroy_all_children();
@@ -204,66 +230,78 @@ export class ModelPickerController {
             y_align: Clutter.ActorAlign.CENTER,
         });
         headerRow.add_child(new St.Label({
-            text: '引擎与模型',
-            style_class: 'qc-picker-label',
+            text: '选择模型',
+            style_class: 'qc-picker-title',
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
         }));
         if (effectiveBackend !== 'unconfigured') {
-            headerRow.add_child(createStButton(
-                '↻ 刷新',
+            headerRow.add_child(this._createIconBtn(
+                'view-refresh-symbolic',
                 () => {
                     invalidateBackendDetectionCaches('catalog');
                     this._refreshCatalogInBackground(effectiveBackend, true);
                     this._renderResultsFn?.();
                 },
-                'qc-picker-chip',
                 '后台异步刷新模型目录'
             ));
         }
-        headerRow.add_child(createStButton('更多设置…', () => {
-            this.toggle(false);
-            this._onOpenPreferences?.();
-        }, 'qc-picker-chip', '打开完整设置页面'));
+        headerRow.add_child(this._createIconBtn(
+            'emblem-system-symbolic',
+            () => {
+                this.toggle(false);
+                this._onOpenPreferences?.();
+            },
+            '打开完整设置页面'
+        ));
+        headerRow.add_child(this._createIconBtn(
+            'window-close-symbolic',
+            () => this.toggle(false),
+            '收起模型选择器'
+        ));
         this.container.add_child(headerRow);
 
-        const chipsCol = new St.BoxLayout({
-            orientation: V,
-            style_class: 'qc-picker-chips-col',
+        const engineBar = new St.BoxLayout({
+            orientation: H,
+            style_class: 'qc-segmented-group',
             x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
         });
-        for (let i = 0; i < pickerState.backendChips.length; i += 3) {
-            const chipRow = new St.BoxLayout({
-                orientation: H,
-                style_class: 'qc-picker-row',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-            for (const item of pickerState.backendChips.slice(i, i + 3)) {
-                chipRow.add_child(createStButton(
-                    item.displayLabel,
-                    () => {
-                        this.page = 0;
-                        // Fast switch updates backend profile/selection without resetting composer draft or attachments (R11.1)
-                        this._registry.selectBackend(item.id, {clearMigrationNotice: true});
-                        this.populate();
-                    },
-                    item.active ? 'qc-picker-chip qc-picker-chip-active' : 'qc-picker-chip',
-                    item.statusTag ? `${item.label}（${item.statusTag}）` : `切换到 ${item.label}`
-                ));
-            }
-            chipsCol.add_child(chipRow);
+        for (const item of pickerState.backendChips) {
+            const segCls = [
+                'qc-seg-btn',
+                item.active ? 'qc-seg-btn-active' : '',
+                !item.installed ? 'qc-seg-btn-dim' : '',
+            ].filter(Boolean).join(' ');
+            const segBtn = createStButton(
+                item.label,
+                () => {
+                    this.page = 0;
+                    // Fast switch updates backend profile/selection without resetting composer draft or attachments (R11.1)
+                    this._registry.selectBackend(item.id, {clearMigrationNotice: true});
+                    this.populate();
+                },
+                segCls,
+                item.statusTag ? `${item.label}（${item.statusTag}）` : `切换到 ${item.label}`
+            );
+            segBtn.x_expand = true;
+            engineBar.add_child(segBtn);
         }
-        this.container.add_child(chipsCol);
+        this.container.add_child(engineBar);
 
-        const summaryLabel = createWrapLabel('', 'qc-mini-label');
+        const summaryLabel = createWrapLabel('', 'qc-picker-caption');
         this.container.add_child(summaryLabel);
 
         if (effectiveBackend !== 'unconfigured') {
             const searchEntry = new St.Entry({
                 style_class: 'qc-picker-search',
+                primary_icon: new St.Icon({
+                    icon_name: 'edit-find-symbolic',
+                    style_class: 'qc-search-icon',
+                }),
                 hint_text: effectiveBackend === 'openai'
-                    ? '搜索已缓存模型，或输入自定义模型 ID 按回车切换…'
-                    : '搜索模型或 Provider（★ 收藏 · 近期使用优先展示）…',
+                    ? '搜索缓存模型，或输入模型 ID 按回车…'
+                    : '搜索模型或服务商…',
                 can_focus: true,
                 track_hover: true,
                 x_expand: true,
@@ -289,6 +327,7 @@ export class ModelPickerController {
         const resultsScroll = new St.ScrollView({
             style_class: 'qc-picker-scroll',
             x_expand: true,
+            y_expand: true,
             overlay_scrollbars: true,
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
@@ -318,7 +357,7 @@ export class ModelPickerController {
             const eff = stateForFooter.effectiveBackend;
             const thinkingSupport = stateForFooter.thinkingSupport;
             footerRow.add_child(new St.Label({
-                text: '思考:',
+                text: '思考',
                 style_class: 'qc-picker-label',
                 y_align: Clutter.ActorAlign.CENTER,
             }));
@@ -326,9 +365,15 @@ export class ModelPickerController {
             if (!thinkingSupport.supported) {
                 footerRow.add_child(createWrapLabel(
                     thinkingSupport.reason || '当前模型不支持思考强度调节',
-                    'qc-mini-label'
+                    'qc-picker-caption'
                 ));
             } else {
+                const effortBar = new St.BoxLayout({
+                    orientation: H,
+                    style_class: 'qc-segmented-group',
+                    x_expand: true,
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
                 const curEffort = this._registry.getBackendProfile(eff).reasoningEffort || 'default';
                 for (const ef of [
                     {id: 'default', label: '默认'},
@@ -336,7 +381,7 @@ export class ModelPickerController {
                     {id: 'standard', label: '标准'},
                     {id: 'deep', label: '深入'},
                 ]) {
-                    footerRow.add_child(createStButton(
+                    const efBtn = createStButton(
                         ef.label,
                         () => {
                             if (eff !== 'unconfigured') {
@@ -344,10 +389,13 @@ export class ModelPickerController {
                             }
                             this.populate();
                         },
-                        curEffort === ef.id ? 'qc-picker-chip qc-picker-chip-active' : 'qc-picker-chip',
+                        curEffort === ef.id ? 'qc-seg-btn qc-seg-btn-active' : 'qc-seg-btn',
                         `思考强度：${ef.label}`
-                    ));
+                    );
+                    efBtn.x_expand = true;
+                    effortBar.add_child(efBtn);
                 }
+                footerRow.add_child(effortBar);
             }
         };
 
@@ -398,14 +446,14 @@ export class ModelPickerController {
                     });
                     cell.add_child(mBtn);
 
-                    const starBtn = createStButton(
-                        entry.isFavorite ? '★' : '☆',
+                    const starBtn = this._createIconBtn(
+                        entry.isFavorite ? 'starred-symbolic' : 'non-starred-symbolic',
                         () => {
                             this._toggleFavoriteModel(entry.key);
                             renderResultsSection();
                         },
-                        entry.isFavorite ? 'qc-picker-star-btn qc-picker-star-active' : 'qc-picker-star-btn',
-                        entry.isFavorite ? '取消收藏该模型' : '收藏该模型（置顶显示）'
+                        entry.isFavorite ? '取消收藏该模型' : '收藏该模型（置顶显示）',
+                        entry.isFavorite ? 'qc-picker-star-btn qc-picker-star-active' : 'qc-picker-star-btn'
                     );
                     starBtn.y_align = Clutter.ActorAlign.CENTER;
                     cell.add_child(starBtn);
@@ -449,7 +497,7 @@ export class ModelPickerController {
                 }
             } else {
                 const emptyText = eff === 'unconfigured'
-                    ? '未检测到可用引擎：请安装 ZCode / Codex CLI，或点击右上角「更多设置…」配置 OpenAI API。'
+                    ? '未检测到可用引擎：请安装 ZCode / Codex CLI，或点击右上角设置图标配置 OpenAI API。'
                     : this.query.trim()
                         ? (eff === 'openai'
                             ? `无匹配缓存模型，可直接按回车使用「${this.query.trim()}」`
@@ -457,7 +505,7 @@ export class ModelPickerController {
                         : this._refreshing
                             ? '正在后台异步加载模型目录…'
                             : eff === 'openai'
-                                ? `当前生效模型：${liveState.activeModelId || '自动发现'}（点击右上角「↻ 刷新」可在线拉取列表）`
+                                ? `当前生效模型：${liveState.activeModelId || '自动发现'}（点击右上角刷新图标可在线拉取列表）`
                                 : eff === 'zcode'
                                     ? 'ZCode 本地配置中没有可选模型。'
                                     : '未检测到预设模型列表，将使用后端默认模型。';
@@ -481,6 +529,7 @@ export class ModelPickerController {
     }
 
     dispose() {
+        const wasOpen = this.isOpen;
         ++this._bgGen;
         try { this._activeCancellable?.cancel?.(); } catch (_) {}
         this._activeCancellable = null;
@@ -488,5 +537,7 @@ export class ModelPickerController {
         this.container = null;
         this.chevronLabel = null;
         this.isOpen = false;
+        if (wasOpen) this._onToggle?.(false);
+        this._onToggle = null;
     }
 }
