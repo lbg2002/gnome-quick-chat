@@ -53,6 +53,19 @@ test('permissions: Codex smart must stay sandboxed read-only and never grant wri
     assert.ok(args.includes('approval_policy="never"'));
     assert.ok(!args.includes('sandbox_mode="danger-full-access"'));
 });
+test('DSH smart maps to workspace-write only with SDK approval and a dedicated workspace', () => {
+    const sdk = {dshSdk: true};
+    const options = {workspaceWrite: true};
+    const mapped = normalizeEffectiveAgentMode('dsh', 'smart', sdk, options);
+    assert.deepEqual(mapped.native, {
+        transport: 'sdk', sandbox: 'workspace-write', approvalPolicy: 'ask', approvalRequests: true,
+    });
+    assert.equal(normalizeEffectiveAgentMode('dsh', 'smart', sdk).native.sandbox, 'read-only');
+    assert.equal(normalizeEffectiveAgentMode('dsh', 'smart', {}, options).native.sandbox, 'read-only');
+    assert.equal(normalizeEffectiveAgentMode('dsh', 'readonly', sdk, options).native.approvalRequests, false);
+    assert.equal(normalizeEffectiveAgentMode('dsh', 'full', sdk, options).native.sandbox, 'danger-full-access');
+});
+
 test('DSH: only the documented headless JSONL and approval flags pass compatibility detection', () => {
     const valid = `Usage: dsh --profile headless [options] [task...]
       --json                  write newline-delimited events

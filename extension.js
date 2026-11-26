@@ -1260,8 +1260,8 @@ export default class QuickChat extends Extension {
         }, backendTag));
 
         const effectiveMode = state.effectiveMode || config.mode;
-        const caps = state.capabilities || getBackendCapabilities(state.backend, effectiveMode);
-        const badge = caps.modeBadges?.[effectiveMode] || caps.modeBadges?.[config.mode] || '';
+        const caps = state.capabilities || getBackendCapabilities(state.backend);
+        const badge = state.modeBadge || caps.modeBadges?.[effectiveMode] || caps.modeBadges?.[config.mode] || '';
         const httpWarnSuffix = state.endpointSecurity?.isRemotePlaintextHttp ? ' · ⚠️明文HTTP' : '';
         this._idleStatus = (badge || '就绪') + httpWarnSuffix;
 

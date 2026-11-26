@@ -28,6 +28,7 @@ import {UNCONFIGURED_BACKEND_MESSAGE} from './core/configMigration.js';
 import {
     cleanupStaleRuntimeFiles,
     getUserSpecialDirs,
+    isDshWriteWorkspace,
     removeFileQuietly,
 } from './core/paths.js';
 import {inspectEndpointSecurity} from './core/secretPolicy.js';
@@ -293,7 +294,7 @@ export function resolveBackendRuntime(config = {}) {
             label,
             cliCapabilities,
             effectiveModeInfo,
-            capabilities: getBackendCapabilities('zcode', effectiveModeInfo.effectiveMode, cliCapabilities),
+            capabilities: getBackendCapabilities('zcode', cliCapabilities),
         };
     }
 
@@ -305,9 +306,7 @@ export function resolveBackendRuntime(config = {}) {
         if (!executable || !env.isExecutable(executable)) {
             throw new Error('未检测到 DeepSeek Harness CLI（dsh）');
         }
-        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode, {
-            enableAutoReview: config.dshAutoReview === true,
-        });
+        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode);
         return {
             backend: 'dsh', available: true, executable,
             setsidPath: resolveSetsidExecutable(pathDirs),
@@ -342,7 +341,7 @@ export function resolveBackendRuntime(config = {}) {
             label: resolvedModel || 'Codex',
             cliCapabilities,
             effectiveModeInfo,
-            capabilities: getBackendCapabilities('codex', effectiveModeInfo.effectiveMode, cliCapabilities),
+            capabilities: getBackendCapabilities('codex', cliCapabilities),
         };
     }
 
@@ -530,7 +529,7 @@ export async function resolveBackendRuntimeAsync(config = {}, {
             label,
             cliCapabilities,
             effectiveModeInfo,
-            capabilities: getBackendCapabilities('zcode', effectiveModeInfo.effectiveMode, cliCapabilities),
+            capabilities: getBackendCapabilities('zcode', cliCapabilities),
         };
     }
 
@@ -550,10 +549,7 @@ export async function resolveBackendRuntimeAsync(config = {}, {
             version: probe.ok ? probe.output.trim() : '',
             dshSdk: probe.ok && supportsDshSdk(probe.output),
         };
-        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode, {
-            enableAutoReview: config.dshAutoReview === true,
-            ...cliCapabilities,
-        });
+        const effectiveModeInfo = normalizeEffectiveAgentMode('dsh', requestedMode, cliCapabilities);
         return {
             backend: 'dsh', available: true,
             executable,
@@ -601,7 +597,7 @@ export async function resolveBackendRuntimeAsync(config = {}, {
             label: resolvedModel || 'Codex',
             cliCapabilities,
             effectiveModeInfo,
-            capabilities: getBackendCapabilities('codex', effectiveModeInfo.effectiveMode, cliCapabilities),
+            capabilities: getBackendCapabilities('codex', cliCapabilities),
         };
     }
 
@@ -639,6 +635,10 @@ export class BackendClient {
         this._specialDirs = getUserSpecialDirs();
         this._timeouts = resolveSplitTimeouts(config);
         this._runtime = runtime;
+        if (runtime.backend === 'dsh') {
+            runtime.effectiveModeInfo = normalizeEffectiveAgentMode('dsh', config.mode, runtime.cliCapabilities,
+                {workspaceWrite: isDshWriteWorkspace(config.workspace, workspace)});
+        }
         this._backend = this._runtime.backend;
 
         this._store = new SessionStore(sessionId, {
@@ -861,6 +861,7 @@ export class BackendClient {
             resolvedModel: this._runtime?.resolvedModel || '',
             resolvedWorkspace: this._workspace || '',
             dshSdk: this._runtime?.cliCapabilities?.dshSdk === true,
+            dshSandbox: this._backend === 'dsh' ? this._runtime?.effectiveModeInfo?.native?.sandbox : '',
             effectiveMode: this._runtime?.effectiveModeInfo?.effectiveMode || (this._config?.mode || 'readonly'),
         };
     }
@@ -906,6 +907,7 @@ export class BackendClient {
                 capabilities: this._adapter?.getCapabilities() || this._runtime.capabilities || null,
                 effectiveMode: this._runtime.effectiveModeInfo?.effectiveMode || (this._config?.mode || 'readonly'),
                 modeNotice: this._runtime.effectiveModeInfo?.notice || '',
+                modeBadge: this._runtime.effectiveModeInfo?.badge || '',
                 cliVersion: this._runtime.cliCapabilities?.version || '',
                 bridgeAvailable: Boolean(this._runtime?.bridgePath),
                 endpointSecurity: endpointSec,

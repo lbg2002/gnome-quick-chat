@@ -171,7 +171,7 @@ export function makeDshModelCatalog(configured = {}, profileProviders = []) {
     };
 }
 
-export function buildDshProfileOverlay({provider = '', model = '', persona = '', piAiPatch = '', mountCredentials = false, sdkMode = ''} = {}) {
+export function buildDshProfileOverlay({provider = '', model = '', persona = '', piAiPatch = '', mountCredentials = false, sdkPermissions = null} = {}) {
     const cleanProvider = normalizeDshProviderId(provider);
     const cleanModel = cleanDshModelId(model);
     if (Boolean(provider) !== Boolean(model) || (provider && (!cleanProvider || !cleanModel))) {
@@ -181,9 +181,10 @@ export function buildDshProfileOverlay({provider = '', model = '', persona = '',
     if (cleanPersona.length > 8192) throw new Error('桌面助手提示词最多 8192 字');
     const patches = [];
     if (mountCredentials) patches.push('- id: credentials\n  disabled: false');
-    if (sdkMode) {
-        const sandbox = sdkMode === 'full' ? 'danger-full-access' : 'read-only';
-        const policy = sdkMode === 'smart' ? 'ask' : 'never';
+    if (sdkPermissions) {
+        const {sandbox, approvalPolicy: policy} = sdkPermissions;
+        if (!['read-only', 'workspace-write', 'danger-full-access'].includes(sandbox) ||
+            !['ask', 'never'].includes(policy)) throw new Error('无效的 DSH SDK 权限映射');
         patches.push(
             `- id: sandbox-policy\n  config:\n    mode: ${sandbox}`,
             `- id: approval\n  config:\n    policy: ${policy}`,

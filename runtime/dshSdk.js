@@ -54,16 +54,16 @@ function answerQuestions(questions, drafts) {
 
 /** Translates one DSH SDK process into the shared CLI turn and interaction contract. */
 export class DshSdkTurn {
-    constructor({sessionId, workspace, provider, model, prompt, approvalRequests, fullAccess = false, resume = false}) {
+    constructor({sessionId, workspace, provider, model, prompt, permissions, resume = false}) {
         this.sessionId = sessionId;
         this.initialize = {
-            cwd: workspace, provider, model, approvalRequests,
+            cwd: workspace, provider, model, approvalRequests: permissions.approvalRequests,
             capabilities: {userQuestions: true},
         };
         this.prompt = prompt;
         this.resume = resume;
-        this.expectedSandbox = fullAccess ? 'danger-full-access' : 'read-only';
-        this.expectedApprovalPolicy = approvalRequests ? 'ask' : 'never';
+        this.expectedSandbox = permissions.sandbox;
+        this.expectedApprovalPolicy = permissions.approvalPolicy;
         this.phase = 'initialize';
         this.pending = new Map();
         this.toolInputs = new Map();

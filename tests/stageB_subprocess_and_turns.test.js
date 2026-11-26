@@ -264,7 +264,7 @@ test('B2: prepareZCodeConfigOverride fails closed on missing/corrupt config, unk
                             providerId: 'openai',
                             providerName: 'OpenAI',
                             config: {
-                                modelOrder: ['gpt-4o', 'gpt-5'],
+                                modelOrder: ['gpt-4o', 'gpt-5', 'stale-model-order-entry'],
                                 personalModelIds: ['gpt-4o', 'gpt-5'],
                             },
                         },
@@ -279,6 +279,21 @@ test('B2: prepareZCodeConfigOverride fails closed on missing/corrupt config, unk
             () => prepareZCodeConfigOverride({provider: 'nonexistent-provider', model: 'm1'}, baseIo),
             /无法将所选模型应用到 ZCode 配置/
         );
+
+        assert.throws(
+            () => prepareZCodeConfigOverride({provider: 'openai', model: 'stale-model-order-entry'}, baseIo),
+            /未登记或已停用/
+        );
+        validPersonal.config.modelConfigRules = {
+            providerModelRules: [{providerId: 'openai', modelId: 'gpt-5', config: {enabled: false}}],
+        };
+        fs.writeFileSync(personalPath, JSON.stringify(validPersonal));
+        assert.throws(
+            () => prepareZCodeConfigOverride({provider: 'openai', model: 'gpt-5'}, baseIo),
+            /未登记或已停用/
+        );
+        delete validPersonal.config.modelConfigRules;
+        fs.writeFileSync(personalPath, JSON.stringify(validPersonal));
 
         // 4. Read-back verification mismatch -> cleans up temp file and throws!
         let removedTemp = '';

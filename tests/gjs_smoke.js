@@ -27,7 +27,7 @@ import {buildRuntimeContextSignature, buildBudgetedContextMessages} from '../cor
 import {MarkdownMemory} from '../core/markdownMemory.js';
 import {SessionStore} from '../core/sessionStore.js';
 import {TurnController} from '../core/turnController.js';
-import {requireWorkspaceDirectory, writePrivateFileAsync, removeFileQuietly} from '../core/paths.js';
+import {isDshWriteWorkspace, requireWorkspaceDirectory, writePrivateFileAsync, removeFileQuietly} from '../core/paths.js';
 import {StreamingMarkdownParser} from '../core/markdownStreamParser.js';
 import {HistoryWindowController, computeAdaptiveRenderDelayMs, formatMemoryReceipt} from '../core/renderScheduler.js';
 import {matchSlashCommands, applyQuickActionToDraft} from '../core/quickActions.js';
@@ -776,6 +776,41 @@ let mockHttpProc = null;
             await runMemoryTurn(backend, sharedMemory, 'excluded-evidence-' + backend, 'TEST_TOOL_EVIDENCE',
                 {displayUserText: '测试附件', expectExcludedEvidence: true});
         }
+
+        // An explicit ZCode route must be confirmed before any substitute output is delivered.
+        for (const [reported, expectedStatus] of [
+            ['gpt-6.1-terra', 'completed'], ['gpt-6-astra', 'failed'], [null, 'failed'],
+        ]) {
+            const events = [];
+            const turns = new TurnController(event => events.push(event));
+            const turn = turns.beginTurn({backend: 'zcode', modelId: 'gpt-6.1-terra',
+                cancellable: new Gio.Cancellable()});
+            turn.expectedZCodeRoute = {provider: 'openai', model: 'gpt-6.1-terra'};
+            const frames = [
+                ...(reported ? [{type: 'turn.started',
+                    payload: {intent: {modelSelection: {providerId: 'openai', modelId: reported}}}}] : []),
+                {type: 'model.streaming', payload: {kind: 'text_delta', delta: 'model answer'}},
+                {type: 'turn.completed'},
+            ];
+            spawnManagedCliTurn({
+                backend: 'zcode', runtime: {executable: nodeBin}, config: {mode: 'readonly'},
+                workspace: tmpRoot, turns, turn, getSessionContextConfig: () => ({}), isDisposedFn: () => false,
+                rawArgv: [nodeBin, '-e', `console.log(${JSON.stringify(frames.map(frame =>
+                    JSON.stringify(frame)).join('\n'))})`],
+            });
+            const settled = await waitForEventGjs(events, event => event.type === 'agent_settled');
+            assert(settled.status === expectedStatus, 'ZCode route must match explicit model: ' + settled.errorMessage);
+            if (expectedStatus === 'failed') {
+                assert(!turn.text && settled.errorMessage.includes('gpt-6.1-terra'),
+                    'Rejected ZCode turn does not display substitute output');
+                if (reported) assert(settled.errorMessage.includes(reported), 'Failure identifies the returned model');
+            }
+        }
+
+        assert(isDshWriteWorkspace(tmpRoot, tmpRoot), 'Explicit test workspace permits DSH workspace sandbox');
+        assert(!isDshWriteWorkspace('', tmpRoot) &&
+            !isDshWriteWorkspace('~', GLib.get_home_dir()) && !isDshWriteWorkspace('/', '/'),
+        'DSH smart never enables workspace write for the default workspace, home, or root');
 
         // 5D2. Real DSH Headless JSONL → Gio.Subprocess → shared TurnController.
         const fakeDshScript = GLib.build_filenamev([tmpRoot, 'fake_dsh_cli.cjs']);

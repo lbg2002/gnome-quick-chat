@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {isDefaultBrowserLaunchRequest} from '../protocol.js';
+import {isDefaultBrowserLaunchRequest, normalizeEffectiveAgentMode} from '../protocol.js';
 import {DshSdkTurn, supportsDshSdk} from '../runtime/dshSdk.js';
 import {buildDshProfileOverlay} from '../core/dshModelCatalog.js';
 import {BaseBackendAdapter} from '../backends/baseAdapter.js';
@@ -8,10 +8,13 @@ import {BaseBackendAdapter} from '../backends/baseAdapter.js';
 const frame = data => ({jsonrpc: '2.0', ...data});
 const event = (type, data) => frame({method: 'session.event', params: {sessionId: 'local-turn', event: {type, data}}});
 
+const sdkPermissions = (mode, workspaceWrite = false) =>
+    normalizeEffectiveAgentMode('dsh', mode, {dshSdk: true}, {workspaceWrite}).native;
+
 function fixture(approvalRequests = true) {
     const sdk = new DshSdkTurn({
         sessionId: 'local-turn', workspace: '/tmp', provider: 'codex', model: 'example',
-        prompt: 'question', approvalRequests,
+        prompt: 'question', permissions: sdkPermissions(approvalRequests ? 'smart' : 'readonly'),
     });
     const sent = [];
     sdk.start(async message => sent.push(message));
@@ -88,11 +91,11 @@ test('DSH completes only after durable turn/end plus session/wait', () => {
 });
 
 test('DSH overlay uses native managed credentials and preserves restricted approval policy', () => {
-    const overlay = buildDshProfileOverlay({mountCredentials: true, sdkMode: 'smart'});
+    const overlay = buildDshProfileOverlay({mountCredentials: true, sdkPermissions: sdkPermissions('smart', true)});
     assert.match(overlay, /id: credentials\n  disabled: false/);
-    assert.match(overlay, /mode: read-only/);
+    assert.match(overlay, /mode: workspace-write/);
     assert.match(overlay, /policy: ask/);
-    assert.match(buildDshProfileOverlay({sdkMode: 'readonly'}), /policy: never/);
+    assert.match(buildDshProfileOverlay({sdkPermissions: sdkPermissions('readonly')}), /policy: never/);
 });
 
 test('shared backend context is rebuilt from the current local conversation after edits', () => {
@@ -119,7 +122,7 @@ test('shared backend context is rebuilt from the current local conversation afte
 
 test('DSH restores a bound native session before sending the next prompt', () => {
     const makeTurn = () => new DshSdkTurn({sessionId: 'local-turn', workspace: '/tmp', provider: 'codex',
-        model: 'example', prompt: 'next question', approvalRequests: true, resume: true});
+        model: 'example', prompt: 'next question', permissions: sdkPermissions('smart'), resume: true});
     const sent = [];
     const sdk = makeTurn();
     sdk.start(async message => sent.push(message));
@@ -156,7 +159,7 @@ test('browser action accepts only a direct instruction with no arbitrary command
 
 test('DSH checks the route in the live request header before accepting answer events', () => {
     const sdk = new DshSdkTurn({sessionId: 'local-turn', workspace: '/tmp', provider: 'codex',
-        model: 'gpt-6.1-terra', prompt: 'question'});
+        model: 'gpt-6.1-terra', prompt: 'question', permissions: sdkPermissions('readonly')});
     const sent = [];
     sdk.start(async message => sent.push(message));
     assert.equal(sent[0].params.model, 'gpt-6.1-terra');

@@ -8,7 +8,7 @@ import {
     preparePromptWithinBudget,
 } from '../protocol.js';
 import GLib from 'gi://GLib';
-import {getPrivateRuntimeDir, removeFileQuietly, writePrivateFileAsync} from '../core/paths.js';
+import {getPrivateRuntimeDir, isDshWriteWorkspace, removeFileQuietly, writePrivateFileAsync} from '../core/paths.js';
 import {loadLocalBackendCatalogAsync, readDshWebProfilePatchAsync} from '../core/backendDetect.js';
 import {
     buildDshProfileOverlay,
@@ -64,10 +64,10 @@ export class DshAdapter extends BaseBackendAdapter {
 
         const sdk = this._runtime?.cliCapabilities?.dshSdk === true;
         const modeInfo = normalizeEffectiveAgentMode(
-            'dsh', this._config?.mode || 'readonly',
-            {enableAutoReview: this._config?.dshAutoReview === true, dshSdk: sdk}
+            'dsh', this._config?.mode || 'readonly', {dshSdk: sdk},
+            {workspaceWrite: sdk && this._config?.mode === 'smart' && isDshWriteWorkspace(this._config.workspace, workspace)}
         );
-        const effectiveMode = modeInfo.effectiveMode;
+        const {effectiveMode, native} = modeInfo;
         const {remoteId, prompt: cliPrompt} = this.prepareCliContext(budgetCheck.promptText, {
             memoryContext, allowResume: !disableResume,
             workspace, specialDirs, mode: effectiveMode,
@@ -100,7 +100,7 @@ export class DshAdapter extends BaseBackendAdapter {
                 provider: model ? (provider || 'deepseek-official') : '',
                 model, persona, piAiPatch,
                 mountCredentials: true,
-                sdkMode: sdk ? effectiveMode : '',
+                sdkPermissions: sdk ? native : null,
             });
             let overlayPath = '';
             if (profileOverlay) {
@@ -121,8 +121,7 @@ export class DshAdapter extends BaseBackendAdapter {
                     resume: Boolean(remoteId),
                     provider: provider || 'deepseek-official',
                     model,
-                    prompt: cliPrompt, approvalRequests: effectiveMode === 'smart',
-                    fullAccess: effectiveMode === 'full',
+                    prompt: cliPrompt, permissions: native,
                 });
                 rawArgv = [this._runtime.executable, '--profile', 'sdk', '--patch', overlayPath];
             } else {
@@ -173,7 +172,7 @@ export class DshAdapter extends BaseBackendAdapter {
             rawArgv,
             stdinPromptText: cliPrompt,
             conversationTransport: turn.dshSdk,
-            turnExtraEnv: sdk ? {DSH_PERMISSION_MODE: effectiveMode === 'full' ? 'danger-full-access' : 'read-only'} : {},
+            turnExtraEnv: sdk ? {DSH_PERMISSION_MODE: native.sandbox} : {},
             keepStdinOpenForApproval: false,
             requireBridgeHandshake: false,
             remoteId,

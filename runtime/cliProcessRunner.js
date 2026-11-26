@@ -606,9 +606,10 @@ export function evaluateSubprocessOutcome({
     };
 }
 
+const ZCODE_BUILTIN_CONFIG = '/opt/ZCode/resources/config/provider/zcode-builtin.json';
 export const MAX_ZCODE_CONFIG_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on provider_config.json
 
-function validateAndBuildZCodeOverrideObject(personalObj, config) {
+function validateAndBuildZCodeOverrideObject(personalObj, config, builtinConfig) {
     const desiredProvider = String(config?.provider || '').trim();
     const desiredModel = String(config?.model || '').trim();
     const reasoningEffort = String(config?.reasoningEffort || 'default').trim();
@@ -617,25 +618,15 @@ function validateAndBuildZCodeOverrideObject(personalObj, config) {
     const override = buildZCodePersonalConfigOverride(personalObj, {
         provider: desiredProvider,
         model: desiredModel,
-        reasoningEffort,
+        reasoningEffort, builtinConfig,
     });
     if (!override || !override.configObj) {
         throw new Error('构建 ZCode 临时模型配置失败，已阻止静默回退至默认模型');
     }
 
-    const catalog = Array.isArray(override.configObj?.config?.providerConfigRules?.providerRules)
-        ? override.configObj.config.providerConfigRules.providerRules
-        : [];
-    const providerExists = catalog.some(
-        r => String(r?.providerId || '').toLowerCase() === String(override.providerId || '').toLowerCase()
-    );
-    const appliedSel = override.configObj?.config?.defaultModelSelection;
-    if (
-        (desiredProvider || desiredModel) &&
-        (!override.providerId || !override.modelId || !appliedSel?.providerId || !appliedSel?.modelId || (desiredProvider && !providerExists))
-    ) {
+    if (!override.providerId || !override.modelId) {
         throw new Error(
-            `无法将所选模型应用到 ZCode 配置（provider=${desiredProvider || '默认'}，model=${desiredModel || '默认'}），请在设置中重新选择可用模型`
+            `无法将所选模型应用到 ZCode 配置（提供方 ${desiredProvider || '默认'}，模型 ${desiredModel || '默认'}）。模型未登记或已停用，请重新选择可用模型。`
         );
     }
 
@@ -689,7 +680,8 @@ export function prepareZCodeConfigOverride(config, io) {
         };
     }
 
-    const {override} = validateAndBuildZCodeOverrideObject(personalObj, config);
+    const builtin = io.fileExists(ZCODE_BUILTIN_CONFIG) ? io.readJson(ZCODE_BUILTIN_CONFIG) : null;
+    const {override} = validateAndBuildZCodeOverrideObject(personalObj, config, builtin);
 
     let tempFilePath = '';
     try {
@@ -773,7 +765,9 @@ export async function prepareZCodeConfigOverrideAsync(config, asyncIo) {
         };
     }
 
-    const {override} = validateAndBuildZCodeOverrideObject(personalObj, config);
+    const builtin = await asyncIo.fileExistsAsync(ZCODE_BUILTIN_CONFIG)
+        ? await asyncIo.readJsonAsync(ZCODE_BUILTIN_CONFIG, {maxBytes: MAX_ZCODE_CONFIG_BYTES}) : null;
+    const {override} = validateAndBuildZCodeOverrideObject(personalObj, config, builtin);
 
     let tempFilePath = '';
     try {

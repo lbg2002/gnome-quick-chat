@@ -154,7 +154,7 @@ export class ZCodeAdapter extends BaseBackendAdapter {
                 turnMeta.memoryInstructions].filter(Boolean).join('\n'),
         });
 
-        const requireBridgeHandshake = effectiveMode === 'smart';
+        const requireBridgeHandshake = modeInfo.native.bridgeApproval;
         if (requireBridgeHandshake && !this._runtime?.bridgePath) {
             const err = new Error('未找到 ZCode 权限审批桥接模块（zcodeBridge.cjs），已阻止在需审批模式下启动任务');
             this._turns.finalizeTurn(turn, {status: 'failed', errorText: err.message});
@@ -178,6 +178,12 @@ export class ZCodeAdapter extends BaseBackendAdapter {
                 this._runtime.resolvedModel = zcodeIsolated.resolvedModel;
                 this._runtime.label = zcodeIsolated.resolvedModel;
                 turn.selectedModelId = turn.modelId = zcodeIsolated.resolvedModel;
+                if (String(this._config?.model || '').trim() || String(this._config?.provider || '').trim()) {
+                    turn.expectedZCodeRoute = {
+                        model: zcodeIsolated.resolvedModel,
+                        provider: zcodeIsolated.resolvedProvider,
+                    };
+                }
             }
             if (useZCodePromptFile) {
                 const runtimeDir = getPrivateRuntimeDir();

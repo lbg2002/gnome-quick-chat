@@ -1334,7 +1334,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
             const eff = sel.effectiveBackend;
             const profile = registry.getBackendProfile(eff);
             const modeInfo = normalizeEffectiveAgentMode(eff, profile.mode || 'readonly');
-            const caps = getBackendCapabilities(eff, modeInfo.effectiveMode);
+            const caps = getBackendCapabilities(eff);
             const sec = eff === 'openai' ? inspectEndpointSecurity(getStr('openai-base-url', '')) : {warning: ''};
             const storedMatchesBackend = Boolean(stored && stored.effectiveBackend === eff);
 
@@ -1580,8 +1580,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         const syncBackendCapabilitiesUi = eff => {
             const profile = registry.getBackendProfile(eff);
             const rawMode = profile.mode || 'readonly';
-            const modeInfo = normalizeEffectiveAgentMode(eff, rawMode);
-            const caps = getBackendCapabilities(eff, modeInfo.effectiveMode);
+            const caps = getBackendCapabilities(eff);
             const displayMode = eff === 'codex' && rawMode === 'chat' ? 'readonly' : rawMode;
             const curModeIdx = Math.max(0, modes.indexOf(displayMode));
             syncingModeCombo = true;
@@ -1599,7 +1598,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
             modeRow.sensitive = caps.supportsTools;
             const smartDescription = {
-                dsh: 'DSH SDK 支持逐项审批。Headless 的智能模式保持只读。',
+                dsh: 'DSH SDK 智能档可在已配置的独立工作目录内修改，并支持逐项审批。Headless 智能档只读。',
                 zcode: '需要确认的工具操作会由 ZCode 权限桥接发起审批。',
                 codex: 'Codex exec 无法把审批回传到随问，智能模式保持只读。',
             };

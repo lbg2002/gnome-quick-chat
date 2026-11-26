@@ -184,7 +184,7 @@ export function getBackendCapabilities(backend, cliCaps = null) {
                     '智能（支持 SDK 时弹窗审批）',
                     '完全权限（危险：显式解锁 DSH 的高权限预设）',
                 ],
-                modeBadges: {chat: '只读', readonly: '只读', smart: '智能（只读限制）', full: '完全权限'},
+                modeBadges: {chat: '只读', readonly: '只读', smart: '智能审批', full: '完全权限'},
             };
         case 'unconfigured':
             return {
@@ -235,35 +235,47 @@ export function getBackendCapabilities(backend, cliCaps = null) {
     }
 }
 
-export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly', cliCaps = null) {
+export function normalizeEffectiveAgentMode(backend, requestedMode = 'readonly', cliCaps = null, {workspaceWrite = false} = {}) {
     const mode = ['chat', 'readonly', 'smart', 'full'].includes(requestedMode) ? requestedMode : 'readonly';
-    if (backend === 'openai') {
-        return {effectiveMode: 'chat', downgradedFromChat: false, notice: ''};
+    const result = (effectiveMode, native, notice = '', badge = '') => ({
+        effectiveMode, native, notice, badge, downgradedFromChat: mode === 'chat' && effectiveMode !== 'chat',
+    });
+
+    if (backend === 'openai') return result('chat', {transport: 'http'});
+    if (backend === 'zcode') {
+        return result(mode, {
+            cliMode: {chat: 'plan', readonly: 'plan', smart: 'build', full: 'yolo'}[mode],
+            bridgeApproval: mode === 'smart',
+        });
     }
-    if (backend === 'dsh' && mode === 'smart' && cliCaps?.dshSdk === true) {
-        return {effectiveMode: 'smart', downgradedFromChat: false, notice: 'DSH SDK：只读沙箱，按原生请求弹窗授权单次操作。'};
+    if (backend === 'dsh') {
+        const sdk = cliCaps?.dshSdk === true;
+        const approvalRequests = sdk && mode === 'smart';
+        const sandbox = mode === 'full' ? 'danger-full-access'
+            : approvalRequests && workspaceWrite ? 'workspace-write' : 'read-only';
+        const approvalPolicy = approvalRequests ? 'ask' : 'never';
+        const native = {transport: sdk ? 'sdk' : 'headless', sandbox, approvalPolicy, approvalRequests};
+        if (approvalRequests) {
+            return sandbox === 'workspace-write'
+                ? result('smart', native, '', '智能 · 工作区内修改')
+                : result('smart', native, '配置独立工作目录后，DSH 智能模式可在目录内修改。当前以只读沙箱和原生单次审批运行。', '智能 · 只读沙箱');
+        }
+        return mode === 'smart' || mode === 'chat'
+            ? result('readonly', native, 'DSH Headless 无随问弹窗审批，当前使用只读沙箱。',
+                mode === 'smart' ? '智能 · Headless 只读' : '')
+            : result(mode, native);
     }
-    if (backend === 'dsh' && (mode === 'smart' || mode === 'chat')) {
-        return {
-            effectiveMode: 'readonly', downgradedFromChat: mode === 'chat',
-            notice: 'DSH Headless 无随问弹窗审批。智能模式保持只读。',
-        };
+    if (backend === 'codex') {
+        const native = {sandbox: mode === 'full' ? 'danger-full-access' : 'read-only', approvalPolicy: 'never'};
+        if (mode === 'smart') {
+            return result('readonly', native, 'Codex exec 无法把审批回传到随问，当前使用只读沙箱。', '智能 · Codex 只读');
+        }
+        if (mode === 'chat' && !cliCaps?.supportsDisableTools) {
+            return result('readonly', native, 'Codex CLI 无可用的禁用工具开关，当前使用只读沙箱。如需严格纯问答可使用 OpenAI API。');
+        }
+        return result(mode, native);
     }
-    if (backend === 'codex' && mode === 'smart') {
-        return {
-            effectiveMode: 'readonly',
-            downgradedFromChat: false,
-            notice: 'Codex exec 没有可用的随问审批回传通道：智能模式安全降级为只读。写文件请勿改为无审批全权限，除非确认信任任务。',
-        };
-    }
-    if (backend === 'codex' && mode === 'chat' && !cliCaps?.supportsDisableTools) {
-        return {
-            effectiveMode: 'readonly',
-            downgradedFromChat: true,
-            notice: 'Codex CLI 当前版本无真实禁用工具开关，已按只读沙箱 Agent 运行；如需严格纯问答请使用 OpenAI API。',
-        };
-    }
-    return {effectiveMode: mode, downgradedFromChat: false, notice: ''};
+    return result(mode, {});
 }
 
 export function parseZCodeHelpCapabilities(helpText = '', versionText = '') {
@@ -617,14 +629,10 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
         args.push('--toolsearch-mode', 'off');
     }
 
-    if (mode === 'full') {
-        args.push('--mode', 'yolo');
-    } else if (mode === 'smart') {
-        args.push('--mode', 'build'); // ZCode's native risk-aware approval policy.
-    } else if (mode === 'readonly') {
-        args.push('--mode', 'plan'); // Genuine read-only tool execution.
-    } else {
-        args.push('--mode', 'plan', '--disallowed-tools', 'Bash Edit Write Read Grep Glob LS WebFetch WebSearch TodoWrite NotebookEdit');
+    const {native} = normalizeEffectiveAgentMode('zcode', mode, cliCaps);
+    args.push('--mode', native.cliMode);
+    if (!['readonly', 'smart', 'full'].includes(mode)) {
+        args.push('--disallowed-tools', 'Bash Edit Write Read Grep Glob LS WebFetch WebSearch TodoWrite NotebookEdit');
     }
 
     if (resumeSessionId && (!cliCaps?.probed || cliCaps.supportsResume)) {
@@ -641,7 +649,7 @@ export function buildZCodeArgs(config, prompt, resumeSessionId = '', workspace =
  */
 export function buildDshArgs(config, resumeSessionId = '', {overlayPath = ''} = {}) {
     const executable = String(config?.executable || 'dsh').trim() || 'dsh';
-    const preset = config?.mode === 'full' ? 'danger-full-access' : 'read-only';
+    const {native} = normalizeEffectiveAgentMode('dsh', config?.mode);
     if (overlayPath && (!overlayPath.startsWith('/') ||
         overlayPath.includes('\u0000') || overlayPath.includes('\n'))) {
         throw new Error('DSH 临时配置补丁路径无效');
@@ -649,8 +657,8 @@ export function buildDshArgs(config, resumeSessionId = '', {overlayPath = ''} = 
     return [
         executable, '--profile', 'headless',
         ...(overlayPath ? ['--patch', overlayPath] : []),
-        '--json', '--permission-mode', preset,
-        '--approval-policy', 'never',
+        '--json', '--permission-mode', native.sandbox,
+        '--approval-policy', native.approvalPolicy,
         ...(resumeSessionId ? ['--session-id', String(resumeSessionId)] : []),
         '-',
     ];
@@ -669,7 +677,7 @@ export function buildCodexArgs(config, workspace, prompt, resumeSessionId = '', 
     }
 
     // Never treat prompt text as a permission boundary! Mode is enforced strictly via Codex CLI sandbox_mode.
-    const {effectiveMode} = normalizeEffectiveAgentMode('codex', config?.mode || 'readonly', cliCaps);
+    const {native} = normalizeEffectiveAgentMode('codex', config?.mode || 'readonly', cliCaps);
     const exec = config?.executable || 'codex';
     const common = ['--json'];
     if (!cliCaps?.probed || cliCaps.supportsSkipGitRepoCheck) {
@@ -691,11 +699,8 @@ export function buildCodexArgs(config, workspace, prompt, resumeSessionId = '', 
     if (effort) {
         common.push('-c', `model_reasoning_effort=${JSON.stringify(effort)}`);
     }
-    if (effectiveMode === 'full') {
-        common.push('-c', 'sandbox_mode="danger-full-access"', '-c', 'approval_policy="never"');
-    } else {
-        common.push('-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"');
-    }
+    common.push('-c', `sandbox_mode=${JSON.stringify(native.sandbox)}`,
+        '-c', `approval_policy=${JSON.stringify(native.approvalPolicy)}`);
 
     const promptArg = stdinPrompt ? '-' : rawPrompt;
     if (resumeSessionId && (!cliCaps?.probed || cliCaps.supportsResume)) {
@@ -728,33 +733,41 @@ export function parseZCodeProviderCatalog(personalConfigObj, builtinConfigObj = 
         ...rules.filter(r => r?.providerId && !order.includes(r.providerId)),
     ];
 
+    const modelRules = Array.isArray(pc.modelConfigRules?.providerModelRules)
+        ? pc.modelConfigRules.providerModelRules : [];
+    const disabledModels = new Set(modelRules.filter(rule => rule?.config?.enabled === false)
+        .map(rule => JSON.stringify([rule.providerId, rule.modelId])));
+    const activeModels = (id, models) => [...new Set(models.map(model => String(model ?? '').trim())
+        .filter(model => model && !disabledModels.has(JSON.stringify([id, model]))))];
+
+    const builtinRules = Array.isArray(builtinConfigObj?.config?.providerConfigRules?.providerRules)
+        ? builtinConfigObj.config.providerConfigRules.providerRules : [];
+    const builtinById = new Map(builtinRules.map(rule => [rule?.providerId, rule]));
+
     for (const r of orderedRules) {
-        if (r.config?.enabled === false) continue;
+        if (r.config?.enabled === false || r.config?.visibility === 'hidden') continue;
         const id = String(r.providerId).trim();
         if (!id || seenIds.has(id)) continue;
         seenIds.add(id);
         const name = String(r.providerName || id).trim();
         const baseUrl = String(r.config?.api?.baseUrl || '').trim();
         const apiKey = String(r.config?.access?.apiKey || '').trim();
-        const rawModels = [
-            ...(Array.isArray(r.config?.modelOrder) ? r.config.modelOrder : []),
-            ...(Array.isArray(r.config?.personalModelIds) ? r.config.personalModelIds : []),
-        ];
-        const models = Array.from(new Set(rawModels.map(m => String(m ?? '').trim()).filter(Boolean)));
+        const builtinIds = builtinById.get(id)?.config?.builtinModelIds;
+        const personalIds = r.config?.personalModelIds;
+        const registered = new Set([
+            ...(Array.isArray(builtinIds) ? builtinIds : []),
+            ...(Array.isArray(personalIds) ? personalIds : []),
+        ]);
+        const modelOrder = Array.isArray(r.config?.modelOrder) ? r.config.modelOrder : [];
+        const models = activeModels(id, [...modelOrder.filter(model => registered.has(model)), ...registered]);
         providers.push({id, name, baseUrl, apiKey, models});
     }
 
-    const builtinRules = Array.isArray(builtinConfigObj?.config?.providerConfigRules?.providerRules)
-        ? builtinConfigObj.config.providerConfigRules.providerRules
-        : [];
     for (const r of builtinRules) {
         const id = String(r?.providerId || '').trim();
-        if (!id || seenIds.has(id) || r.config?.visibility === 'hidden') continue;
-        const models = Array.from(new Set(
-            (Array.isArray(r.config?.builtinModelIds) ? r.config.builtinModelIds : [])
-                .map(m => String(m ?? '').trim())
-                .filter(Boolean)
-        ));
+        if (!id || seenIds.has(id) || ruleById.get(id)?.config?.enabled === false ||
+            ruleById.get(id)?.config?.visibility === 'hidden' || r.config?.visibility === 'hidden') continue;
+        const models = activeModels(id, Array.isArray(r.config?.builtinModelIds) ? r.config.builtinModelIds : []);
         if (!models.length) continue;
         seenIds.add(id);
         const name = String(r.providerNameMap?.['zh-CN'] || r.providerNameMap?.['en-US'] || id).trim();
@@ -768,13 +781,13 @@ export function parseZCodeProviderCatalog(personalConfigObj, builtinConfigObj = 
     };
 }
 
-export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = '', model = '', reasoningEffort = 'default'} = {}) {
+export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = '', model = '', reasoningEffort = 'default', builtinConfig = null} = {}) {
     if (!personalConfigObj || typeof personalConfigObj !== 'object') return null;
     const cloned = JSON.parse(JSON.stringify(personalConfigObj));
     if (!cloned.config || typeof cloned.config !== 'object') {
         cloned.config = {};
     }
-    const catalog = parseZCodeProviderCatalog(cloned);
+    const catalog = parseZCodeProviderCatalog(cloned, builtinConfig);
     const providers = catalog.providers;
     let rawProvider = String(provider ?? '').trim();
     let rawModel = String(model ?? '').trim();
@@ -802,33 +815,22 @@ export function buildZCodePersonalConfigOverride(personalConfigObj, {provider = 
         }
     }
 
-    if (!matchedProvider && !rawProvider && rawModel) {
-        matchedProvider = providers.find(p => p.models.some(m => m.toLowerCase() === rawModel.toLowerCase()))
-            || providers[0]
-            || null;
-    }
-
     const existingDefault = cloned.config.defaultModelSelection || {};
-    const resolvedProviderId = (rawProvider || rawModel)
-        ? (matchedProvider ? matchedProvider.id : (rawProvider || providers[0]?.id || ''))
-        : (existingDefault.providerId || providers[0]?.id || '');
-    const resolvedModelId = (rawProvider || rawModel)
-        ? (rawModel || matchedProvider?.models?.[0] || '')
-        : (existingDefault.modelId || matchedProvider?.models?.[0] || '');
+    const ownsModel = candidate => candidate?.models.some(modelId => modelId.toLowerCase() === rawModel.toLowerCase());
+    if (!rawProvider) {
+        const defaultProvider = matchProvider(existingDefault.providerId);
+        matchedProvider = rawModel
+            ? (ownsModel(defaultProvider) ? defaultProvider : providers.find(ownsModel))
+            : defaultProvider;
+    }
+    const resolvedProviderId = matchedProvider?.id || '';
+    const sameProvider = resolvedProviderId === existingDefault.providerId;
+    const resolvedModelId = rawModel
+        ? (matchedProvider?.models.find(modelId => modelId.toLowerCase() === rawModel.toLowerCase()) || '')
+        : ((sameProvider && matchedProvider?.models.includes(existingDefault.modelId)
+            ? existingDefault.modelId : matchedProvider?.models[0]) || '');
 
     if (resolvedProviderId && resolvedModelId) {
-        const rules = Array.isArray(cloned.config.providerConfigRules?.providerRules)
-            ? cloned.config.providerConfigRules.providerRules
-            : [];
-        const rule = rules.find(r => r?.providerId === resolvedProviderId);
-        if (rule?.config) {
-            if (Array.isArray(rule.config.personalModelIds) && !rule.config.personalModelIds.includes(resolvedModelId)) {
-                rule.config.personalModelIds.unshift(resolvedModelId);
-            }
-            if (Array.isArray(rule.config.modelOrder) && !rule.config.modelOrder.includes(resolvedModelId)) {
-                rule.config.modelOrder.unshift(resolvedModelId);
-            }
-        }
         const preservedOptions = existingDefault.options && typeof existingDefault.options === 'object'
             ? {...existingDefault.options}
             : {};
@@ -1002,6 +1004,8 @@ export function normalizeEvent(backend, record) {
                 type: 'message_start',
                 sessionId: record.sessionId || '',
                 modelId: record.payload?.intent?.modelSelection?.modelId || '',
+                ...(record.payload?.intent?.modelSelection?.providerId
+                    ? {providerId: record.payload.intent.modelSelection.providerId} : {}),
                 message: {role: 'assistant'},
             };
         }

@@ -87,6 +87,20 @@ export function createGioFsEnv() {
     };
 }
 
+export function isDshWriteWorkspace(configuredWorkspace, workspace) {
+    if (!String(configuredWorkspace || '').trim() || !workspace) return false;
+    try {
+        const fs = createGioFsEnv();
+        const home = fs.realpath(GLib.get_home_dir());
+        const root = fs.realpath(workspace);
+        return Boolean(home && root && root !== '/' && root !== home && !home.startsWith(root + '/') &&
+            root === GLib.canonicalize_filename(resolveWorkspacePath(configuredWorkspace), null) &&
+            root === GLib.canonicalize_filename(workspace, null) && GLib.file_test(root, GLib.FileTest.IS_DIR));
+    } catch (_) {
+        return false;
+    }
+}
+
 /**
  * Enforces POSIX file/directory mode (`0o700` / `0o600`) via `Gio.File.set_attribute_uint32('unix::mode', ...)`
  * with `NOFOLLOW_SYMLINKS`. (`g_chmod` is in `<glib/gstdio.h>` and is NOT introspected in `GLib-2.0.gir`.)
