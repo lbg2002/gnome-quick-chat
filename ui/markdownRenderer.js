@@ -14,6 +14,7 @@ export function createWrapLabel(text, styleClass, selectable = true) {
         text: text ?? '',
         style_class: styleClass,
         x_expand: true,
+        x_align: Clutter.ActorAlign.FILL,
     });
     const ct = label.clutter_text;
     ct.line_wrap = true;
@@ -81,6 +82,8 @@ function createBlockEntry(block, onCreateCopyButton, codeExpanded = false) {
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        langLabel.clutter_text.line_wrap = false;
+        langLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
         codeHeader.add_child(langLabel);
 
         const entry = {

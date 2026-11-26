@@ -338,6 +338,17 @@ export class ModelPickerController {
             x_expand: true,
         });
         resultsScroll.set_child(resultsSection);
+        let lastPickerListWidth = 0;
+        resultsScroll.connect('notify::allocation', () => {
+            try {
+                const box = resultsScroll.get_allocation_box();
+                const w = Math.floor(box.x2 - box.x1);
+                if (w > 100 && w !== lastPickerListWidth) {
+                    lastPickerListWidth = w;
+                    resultsSection.set_width(w);
+                }
+            } catch (_) {}
+        });
         this.container.add_child(resultsScroll);
 
         const paginationBox = new St.BoxLayout({

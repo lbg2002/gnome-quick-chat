@@ -160,6 +160,11 @@ export class ChatPanelView {
 
         this._vadjValueSig = 0;
         this._vadjUpperSig = 0;
+        this._scrollAllocSig = 0;
+        this._lastMessagesWidth = 0;
+        this._approvalScroll = null;
+        this._approvalAllocSig = 0;
+        this._lastApprovalWidth = 0;
         this._entryTextChangedSig = 0;
         this._scrollIdleId = 0;
         this._scrollPendingAnimate = false;
@@ -472,6 +477,7 @@ export class ChatPanelView {
             x_expand: true,
         });
         this.scroll.set_child(this.messagesBox);
+        this._scrollAllocSig = this.scroll.connect('notify::allocation', () => this._syncMessagesWidth());
         scrollStack.add_child(this.scroll);
 
         this._jumpBottomBtn = new St.Button({
@@ -523,7 +529,9 @@ export class ChatPanelView {
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
         });
+        this._approvalScroll = approvalScroll;
         approvalScroll.set_child(this.approvalSlot);
+        this._approvalAllocSig = approvalScroll.connect('notify::allocation', () => this._syncApprovalWidth());
         this.chatBox.add_child(approvalScroll);
         const inputRow = new St.BoxLayout({
             orientation: H,
@@ -1256,6 +1264,29 @@ export class ChatPanelView {
         }
     }
 
+    _syncScrollChildWidth(scrollActor, childActor, lastWidthKey) {
+        if (!scrollActor || !childActor) return;
+        let w = 0;
+        try {
+            const box = scrollActor.get_allocation_box();
+            w = Math.floor(box.x2 - box.x1);
+        } catch (_) {
+            return;
+        }
+        if (w > 100 && w !== this[lastWidthKey]) {
+            this[lastWidthKey] = w;
+            childActor.set_width(w);
+        }
+    }
+
+    _syncMessagesWidth() {
+        this._syncScrollChildWidth(this.scroll, this.messagesBox, '_lastMessagesWidth');
+    }
+
+    _syncApprovalWidth() {
+        this._syncScrollChildWidth(this._approvalScroll, this.approvalSlot, '_lastApprovalWidth');
+    }
+
     applyDimensions({shared = false} = {}) {
         if (!this.wrapper || !this.chatBox || !this.scroll) return;
         const width = this._getSettingInt('panel-width', 460);
@@ -1263,6 +1294,13 @@ export class ChatPanelView {
         this.wrapper.set_width(shared ? -1 : width);
         this.chatBox.set_width(shared ? -1 : Math.max(300, width - 16));
         this.scroll.set_height(shared ? -1 : height);
+        const initialInnerWidth = Math.max(240, width - 24);
+        if (!this._lastMessagesWidth && this.messagesBox) {
+            this.messagesBox.set_width(initialInnerWidth);
+        }
+        if (!this._lastApprovalWidth && this.approvalSlot) {
+            this.approvalSlot.set_width(initialInnerWidth);
+        }
     }
 
     updateAiTabBadge({isAiTabOpenAndVisible = false} = {}) {
@@ -1878,6 +1916,14 @@ export class ChatPanelView {
             try { this.entry.clutter_text.disconnect(this._entryTextChangedSig); } catch (_) {}
             this._entryTextChangedSig = 0;
         }
+        if (this._scrollAllocSig && this.scroll) {
+            try { this.scroll.disconnect(this._scrollAllocSig); } catch (_) {}
+            this._scrollAllocSig = 0;
+        }
+        if (this._approvalAllocSig && this._approvalScroll) {
+            try { this._approvalScroll.disconnect(this._approvalAllocSig); } catch (_) {}
+            this._approvalAllocSig = 0;
+        }
         const vadj = this.scroll?.vadjustment;
         if (vadj) {
             if (this._vadjValueSig) {
@@ -1900,6 +1946,7 @@ export class ChatPanelView {
         }
 
         this.wrapper = this.chatBox = this.entry = this._scrollStack = this.scroll = this.messagesBox = null;
+        this._approvalScroll = null;
         this._aiTab = this._aiBadge = null;
         this._reconnectButton = this._status = this._statusDot = this._statusBtn = this._modelSelection = null;
         this._sendButton = this._stopButton = this._newButton = this._sessionMenuBtn = null;

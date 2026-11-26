@@ -1,5 +1,6 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import Pango from 'gi://Pango';
 import St from 'gi://St';
 import {
     computeAdaptiveRenderDelayMs,
@@ -135,7 +136,21 @@ export class MessageCardFactory {
             details.add_child(createWrapLabel(lines.join('\n'), 'qc-time'));
         }
         for (const choice of taskChoices) {
-            details.add_child(createStButton(choice, () => this._onChooseTask?.(card, choice), 'qc-copy-btn'));
+            const choiceLbl = createWrapLabel(choice, '');
+            choiceLbl.x_align = Clutter.ActorAlign.START;
+            choiceLbl.y_align = Clutter.ActorAlign.CENTER;
+            const choiceBtn = new St.Button({
+                style_class: 'qc-copy-btn',
+                can_focus: true,
+                reactive: true,
+                track_hover: true,
+                x_expand: true,
+                x_align: Clutter.ActorAlign.FILL,
+                accessible_name: choice,
+                child: choiceLbl,
+            });
+            choiceBtn.connect('clicked', () => this._onChooseTask?.(card, choice));
+            details.add_child(choiceBtn);
         }
         card.box.add_child(details);
         card.replyDetails = details;
@@ -169,6 +184,7 @@ export class MessageCardFactory {
             orientation: V,
             style_class: role === 'user' ? 'qc-message qc-user' : 'qc-message qc-assistant',
             x_expand: true,
+            clip_to_allocation: true,
         });
 
         const displayModel = role === 'user'
@@ -187,6 +203,8 @@ export class MessageCardFactory {
             style_class: 'qc-role',
             y_align: Clutter.ActorAlign.CENTER,
         });
+        name.clutter_text.line_wrap = false;
+        name.clutter_text.ellipsize = Pango.EllipsizeMode.END;
         top.add_child(name);
 
         const time = new St.Label({
@@ -195,6 +213,8 @@ export class MessageCardFactory {
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        time.clutter_text.line_wrap = false;
+        time.clutter_text.ellipsize = Pango.EllipsizeMode.END;
         top.add_child(time);
 
         const initialText = text || (errorMessage ? `⚠️ ${errorMessage}` : '');

@@ -135,6 +135,8 @@ export class TracePanelController {
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        traceHintLabel.clutter_text.line_wrap = false;
+        traceHintLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
         dotsRow.add_child(traceHintLabel);
         traceBox.add_child(dotsRow);
 

@@ -472,6 +472,7 @@ test('GNOME 50 UI polish keeps shared DateMenu sizing, focus feedback, and unwra
     }
     assert.match(css, /\.qc-in-date-menu \.qc-scroll-stack,\s*\.qc-in-date-menu \.qc-scroll\s*\{\s*min-height:\s*0;/);
     assert.match(css, /\.qc-picker-models\s*\{[\s\S]*?padding:\s*2px\s+12px\s+4px\s+0;/);
+    assert.match(css, /\.qc-messages\s*\{[\s\S]*?padding:\s*4px\s+14px\s+10px\s+2px;/);
 
     const chatPanel = source('ui/chatPanel.js');
     assert.doesNotMatch(chatPanel, /set_width\(160\)/);
@@ -479,9 +480,15 @@ test('GNOME 50 UI polish keeps shared DateMenu sizing, focus feedback, and unwra
     assert.match(chatPanel, /_createWrappingButton\(/);
     assert.match(chatPanel, /_onModelPickerToggled\(open\)/);
     assert.match(chatPanel, /this\.mountedCards\.length > 0/);
+    assert.match(chatPanel, /_syncMessagesWidth\(/);
+    assert.match(chatPanel, /this\.scroll\.disconnect\(this\._scrollAllocSig\)/);
     for (const iconName of ['mail-attachment-symbolic', 'edit-paste-symbolic', 'view-more-symbolic']) {
         assert.ok(chatPanel.includes(iconName), `missing symbolic icon ${iconName}`);
     }
+
+    const messageCard = source('ui/messageCard.js');
+    assert.match(messageCard, /clip_to_allocation:\s*true/);
+    assert.match(messageCard, /name\.clutter_text\.ellipsize\s*=\s*Pango\.EllipsizeMode\.END/);
 
     const picker = source('ui/modelPicker.js');
     assert.match(picker, /qc-picker-scroll/);
