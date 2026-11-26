@@ -641,10 +641,17 @@ export class BackendClient {
         }
         this._backend = this._runtime.backend;
 
-        this._store = new SessionStore(sessionId, {
+        this._store = this._createSessionStore(sessionId, sessionDir);
+
+        this._memory = config.autoMemory ? new MarkdownMemory(workspace) : null;
+        this._adapter = this._makeAdapter(config, this._turns, this._store);
+    }
+
+    _createSessionStore(sessionId, sessionDir) {
+        return new SessionStore(sessionId, {
             sessionsRootDir: sessionDir,
             onSaveError: errInfo => {
-                if (!this._closed) {
+                if (!this._closed && this._sessionId === sessionId) {
                     this._event({
                         type: 'session_save_error',
                         sessionId: errInfo.sessionId,
@@ -654,9 +661,18 @@ export class BackendClient {
                 }
             },
         });
+    }
 
-        this._memory = config.autoMemory ? new MarkdownMemory(workspace) : null;
-        this._adapter = this._makeAdapter(config, this._turns, this._store);
+    startNewSession(sessionId, commitSelection) {
+        if (this._closed || !this._store || !this._adapter || this._turns.activeTurn ||
+            this._memoryTurn || this._store.hasUnsavedChanges || sessionId === this._sessionId) return false;
+        const store = this._createSessionStore(sessionId, this._store.rootDir);
+        commitSelection();
+        this._sessionId = store.sessionId;
+        this._store = store;
+        this._adapter.setSessionStore(store);
+        this.revokeApprovedScopes();
+        return true;
     }
 
     _makeAdapter(config, turns, store, auxiliary = false) {
@@ -729,7 +745,7 @@ export class BackendClient {
     }
 
     _memoryNotice(message, job = null, status = '') {
-        if (!this._closed) this._event({
+        if (!this._closed && (!job?.sessionId || job.sessionId === this._sessionId)) this._event({
             type: 'memory_notice', message, status, memoryTurnId: job?.turnId || '',
             memoryPrompt: job?.userText || '',
         });
@@ -884,8 +900,10 @@ export class BackendClient {
         if (this._closed) {
             throw new Error('服务已关闭');
         }
-        if (this._store && this._adapter) {
-            await this._adapter.restoreSession(this._store, this._getSessionContextConfig());
+        const store = this._store;
+        if (store && this._adapter) {
+            await this._adapter.restoreSession(store, this._getSessionContextConfig());
+            if (store !== this._store) throw new Error('会话已切换，请重新操作');
         }
 
         if (type === 'get_state') {
@@ -1127,7 +1145,7 @@ export class BackendClient {
             if (this._memory) {
                 turnMeta.memoryInstructions = MEMORY_INSTRUCTIONS;
                 turnMeta.turnId ||= GLib.uuid_string_random();
-                const job = {turnId: turnMeta.turnId, notes: new Map(),
+                const job = {turnId: turnMeta.turnId, sessionId: this._sessionId, notes: new Map(),
                     userText: redactSensitiveText(userText, {apiKey: this._runtime.apiKey, maxChars: 2500}),
                     learn: !fields.displayUserText,
                     previousReferences: previousAssistant?.memoryReferences || [],

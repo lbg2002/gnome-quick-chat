@@ -493,6 +493,29 @@ let mockHttpProc = null;
         const memoryRuntime = {backend: 'openai', baseUrl: originABase, chatUrl: originABase + '/chat/completions',
             modelsUrl: originABase + '/models', apiKey: 'sk-mock', modelId: 'gpt-4o-mini', resolvedModel: 'gpt-4o-mini'};
         const memoryConfig = {openaiModel: 'gpt-4o-mini', mode: 'chat'};
+        const switchEvents = [];
+        const switchClient = new BackendClient(event => switchEvents.push(event), () => {});
+        try {
+            switchClient._initWithRuntime({...memoryRuntime}, memoryConfig, tmpRoot, tmpRoot, 'switch-before');
+            const adapter = switchClient.adapter;
+            await switchClient.request('prompt', {message: '旧会话消息', turnId: 'switch-before-turn'});
+            await waitForEventGjs(switchEvents, event => event.type === 'agent_settled' && event.turnId === 'switch-before-turn');
+            assert((await switchClient.request('flush_session')).ok, 'Previous session is durable before switching');
+            const oldStore = switchClient._store;
+            switchClient._approvedScopes.add('old-scope');
+            assert(switchClient.startNewSession('switch-after', () => {}) && switchClient.adapter === adapter &&
+                !switchClient._approvedScopes.size, 'New session reuses the actual adapter and resets approvals');
+            assert((await switchClient.request('get_messages')).messages.length === 0, 'New session starts empty');
+            await switchClient.request('prompt', {message: '新会话消息', turnId: 'switch-after-turn'});
+            await waitForEventGjs(switchEvents, event => event.type === 'agent_settled' && event.turnId === 'switch-after-turn');
+            const newHistory = (await switchClient.request('get_messages')).messages;
+            assert(newHistory.some(message => message.content === '新会话消息') &&
+                !newHistory.some(message => message.content === '旧会话消息') &&
+                !oldStore.messages.some(message => message.content === '新会话消息'), 'Adapter writes turns only to the selected session');
+            assert((await switchClient.request('flush_session')).ok, 'New session is saved independently');
+        } finally {
+            switchClient.close();
+        }
         const memoryWriterEvents = [];
         const memoryWriter = new BackendClient(event => memoryWriterEvents.push(event), () => {});
         const memoryReaderEvents = [];

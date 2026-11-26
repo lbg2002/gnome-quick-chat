@@ -746,7 +746,7 @@ export default class QuickChatPreferences extends ExtensionPreferences {
 
         const widthRow = new Adw.SpinRow({
             title: '面板宽度 (px)',
-            subtitle: '随问对话区域的宽度',
+            subtitle: '通知和随问共用左侧面板宽度',
             adjustment: new Gtk.Adjustment({
                 lower: 340,
                 upper: 680,
@@ -761,8 +761,8 @@ export default class QuickChatPreferences extends ExtensionPreferences {
         uiGroup.add(widthRow);
 
         const heightRow = new Adw.SpinRow({
-            title: '对话区高度 (px)',
-            subtitle: '消息滚动区域的最大显示高度',
+            title: '面板高度 (px)',
+            subtitle: '通知和随问共用左侧面板高度',
             adjustment: new Gtk.Adjustment({
                 lower: 280,
                 upper: 640,

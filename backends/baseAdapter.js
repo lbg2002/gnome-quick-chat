@@ -56,6 +56,10 @@ export class BaseBackendAdapter {
         };
     }
 
+    setSessionStore(store) {
+        this._store = store;
+    }
+
     async restoreSession(sessionStore, contextConfig = {}) {
         if (!sessionStore) {
             return {messages: [], remoteSessionId: ''};

@@ -323,6 +323,26 @@ export class ChatController {
         return task;
     }
 
+    startNewSession(sessionId, commitSelection) {
+        if (this._disposed || this._busy || !this.ready || this._reconnectPromise ||
+            !this._client?.startNewSession?.(sessionId, commitSelection)) return false;
+        this._currentSessionId = sessionId;
+        this._activeTurnState = null;
+        this._lastSecurityContextKey = '';
+        this._lastState = {
+            ...this._lastState,
+            sessionUnsavedWarning: '',
+            hasUnsavedChanges: false,
+            committedRevision: 0,
+            durableRevision: 0,
+            failedRevisions: [],
+            archivedMessageCount: 0,
+            totalLogicalMessageCount: 0,
+            canUndoLastRewind: false,
+        };
+        return true;
+    }
+
     stopClient() {
         this._reconnectPromise = null;
         ++this._clientGeneration;

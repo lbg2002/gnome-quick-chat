@@ -59,6 +59,11 @@ function sessionFixture() {
                 started.push(id);
                 await delayStartup;
             },
+            startNewSession(id, commitSelection) {
+                commitSelection();
+                this.id = id;
+                return true;
+            },
             request(command) {
                 return ({get_messages: {messages: []}, get_state: {backend: 'codex'}, flush_session: {ok: true}})[command];
             },
@@ -87,6 +92,7 @@ function sessionFixture() {
         _observedSessionId: sessionId,
         _chatController: controller,
         _rememberPreviousNonEmptySessionId: noop,
+        _onClientStateReady: () => render.push(controller.currentSessionId),
         _resetTransientComposerState: noop,
         _refreshAttachmentBarUi: noop,
         _cancelEditQuestion: noop,
@@ -106,7 +112,27 @@ function sessionFixture() {
     };
 }
 
-test('100 new-session switches each start one client and render history once', async () => {
+test('New sessions reuse the ready client and ignore repeated clicks', async () => {
+    const f = sessionFixture();
+    await f.ext._ensureClient();
+    const client = f.controller.client;
+    const generation = f.controller.clientGeneration;
+    for (let i = 0; i < 100; i++) {
+        await Promise.all([f.ext._newSession(), f.ext._newSession()]);
+        f.notify();
+        assert.equal(f.controller.client, client);
+        assert.equal(f.controller.clientGeneration, generation);
+        assert.equal(f.controller.currentSessionId, f.sessionId);
+        assert.equal(f.render.length, i + 2);
+        assert.equal(f.render.at(-1), f.sessionId);
+        assert.equal(f.time.tasks.size, 0);
+    }
+    assert.deepEqual(f.started, ['initial']);
+    assert.deepEqual(f.closed, []);
+    f.ext.disable();
+});
+
+test('Pending backend settings still reconnect on new session', async () => {
     const f = sessionFixture();
     await f.ext._ensureClient();
     for (let i = 1; i <= 100; i++) {
@@ -138,6 +164,7 @@ test('external session changes still reconnect, while lock, logout and relogin r
     await tick();
     assert.deepEqual(f.render, ['initial', 'external']);
 
+    f.controller.scheduleConfigReconnect();
     await f.ext._newSession();
     f.Main.sessionMode.isLocked = true;
     f.ext._onSessionModeUpdated(42);
@@ -173,6 +200,7 @@ test('external session changes still reconnect, while lock, logout and relogin r
 test('native panel destruction cancels a queued new session before touching stale actors', async () => {
     const f = sessionFixture();
     await f.ext._ensureClient();
+    f.controller.scheduleConfigReconnect();
     await f.ext._newSession();
     assert.equal(f.time.tasks.size, 1);
     f.ext._onPanelDestroyed(42);
@@ -214,6 +242,7 @@ function actorFixture({withDateMenu = false} = {}) {
             child.parent = this;
         }
         add_style_class_name() {}
+        remove_style_class_name() {}
         add_child(child) {
             assert.equal(child.parent, undefined);
             this.children.push(child);
@@ -231,6 +260,7 @@ function actorFixture({withDateMenu = false} = {}) {
             for (const child of [...this.children]) child.destroy();
             this.handlers.clear();
         }
+        set_size(width, height) { this.width = width; this.height = height; }
         set_width(width) { this.width = width; }
         set_height(height) { this.height = height; }
         set_position(x, y) { this.position = [x, y]; }
@@ -293,8 +323,8 @@ function actorFixture({withDateMenu = false} = {}) {
         },
     };
     const native = {
-        Main, Clutter: {Orientation: {}, ActorAlign: {}, KEY_Escape: 1}, Pango: {WrapMode: {}},
-        St: {BoxLayout, Label, ScrollView, Entry, Button: Actor, PolicyType: {}},
+        Main, Clutter: {Orientation: {}, ActorAlign: {}, KEY_Escape: 1, BinLayout: class {}}, Pango: {WrapMode: {}},
+        St: {BoxLayout, Label, ScrollView, Entry, Button: Actor, Widget: Actor, PolicyType: {}},
         GLib: time.GLib, global: {stage}, PanelMenu: {Button: PanelButton},
     };
     return {native, time, chrome, statusArea, stage, shellMenu, popupContent, nativeDate, notifications, calendar, Actor};
@@ -377,16 +407,23 @@ test('embedded DateMenu toggles the original left column and restores it on dest
     assert.equal(integration.mountMode, 'datemenu');
     assert.equal(f.shellMenu.box.children[0], tabs);
     assert.equal(f.statusArea.size, 0);
+    const slot = wrapper.get_parent();
+    assert.equal(slot, f.notifications.get_parent());
+    assert.equal(integration.setDimensions(460, 380), true);
     for (let i = 0; i < 30; i++) {
         integration.setChatVisible(true);
         assert.equal(wrapper.visible, true);
         assert.equal(f.notifications.visible, false);
-        assert.deepEqual(f.nativeDate.children, [wrapper, f.notifications, f.calendar]);
+        assert.deepEqual(f.nativeDate.children, [slot, f.calendar]);
+        assert.deepEqual([slot.width, slot.height], [460, 380]);
         assert.equal(f.calendar.visible, true);
         integration.setChatVisible(false);
         assert.equal(f.notifications.visible, true);
         assert.equal(wrapper.visible, false);
+        assert.deepEqual([slot.width, slot.height], [460, 380]);
     }
+    integration.setDimensions(600, 500);
+    assert.deepEqual([slot.width, slot.height], [600, 500]);
     f.native.Main.sessionMode.isLocked = true;
     integration.setChatVisible(true);
     assert.equal(wrapper.visible, false);

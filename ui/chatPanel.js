@@ -1114,13 +1114,13 @@ export class ChatPanelView {
         }
     }
 
-    applyDimensions() {
+    applyDimensions({shared = false} = {}) {
         if (!this.wrapper || !this.chatBox || !this.scroll) return;
         const width = this._getSettingInt('panel-width', 460);
         const height = this._getSettingInt('panel-height', 380);
-        this.wrapper.set_width(width);
-        this.chatBox.set_width(Math.max(300, width - 16));
-        this.scroll.set_height(height);
+        this.wrapper.set_width(shared ? -1 : width);
+        this.chatBox.set_width(shared ? -1 : Math.max(300, width - 16));
+        this.scroll.set_height(shared ? -1 : height);
     }
 
     updateAiTabBadge({isAiTabOpenAndVisible = false} = {}) {

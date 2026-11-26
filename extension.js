@@ -307,7 +307,7 @@ export default class QuickChat extends Extension {
             this._connectSettingsSignals();
             this._registerGlobalKeybindings();
             this._panel.syncThemeStyle(this._interfaceSettings);
-            this._panel.applyDimensions();
+            this._applyPanelDimensions();
             this._refreshAvailableBackendsAsync();
         } catch (err) {
             console.error('[Quick Chat] enable() failed, rolling back cleanly:', err);
@@ -959,6 +959,13 @@ export default class QuickChat extends Extension {
         this._panel?.setRouteSuggestion(null);
     }
 
+    _applyPanelDimensions() {
+        const shared = this._dateIntegration?.setDimensions(
+            this._getSettingInt('panel-width', 460),
+            this._getSettingInt('panel-height', 380));
+        this._panel?.applyDimensions({shared});
+    }
+
     _connectSettingsSignals() {
         this._settingSignals = [];
         const watch = (key, fn) => {
@@ -967,8 +974,8 @@ export default class QuickChat extends Extension {
             }
         };
 
-        watch('panel-width', () => this._panel?.applyDimensions());
-        watch('panel-height', () => this._panel?.applyDimensions());
+        watch('panel-width', () => this._applyPanelDimensions());
+        watch('panel-height', () => this._applyPanelDimensions());
         watch('render-markdown', () => this._panel?.rerenderAllMessages());
         watch('toggle-shortcut', () => this._registerGlobalKeybindings());
         watch('clipboard-shortcut', () => this._registerGlobalKeybindings());
@@ -2944,6 +2951,13 @@ export default class QuickChat extends Extension {
 
             const nextSessionId = GLib.uuid_string_random();
             this._rememberPreviousNonEmptySessionId(currentId);
+            if (controller.startNewSession(nextSessionId, () => this._setSessionId(nextSessionId))) {
+                this._capsule?.reset();
+                this._resetTransientComposerState(nextSessionId);
+                this._onClientStateReady({state: controller.lastState, config: {}, messages: []});
+                if (this._dateIntegration?.menu?.isOpen) this._panel?.entry?.grab_key_focus();
+                return;
+            }
             this._setSessionId(nextSessionId);
             this._chatController.stopClient();
             this._capsule?.reset();

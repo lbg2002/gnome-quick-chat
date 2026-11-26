@@ -3,7 +3,7 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
-/** Owns the chat and tab actors. The native notification and calendar actors stay in place. */
+/** Hosts chat and notifications in the same date-menu column. */
 export class DateMenuIntegration {
     constructor() {
         this._button = null;
@@ -43,13 +43,23 @@ export class DateMenuIntegration {
             return false;
         }
 
+        const slot = new St.Widget({
+            layout_manager: new Clutter.BinLayout(),
+            y_expand: true,
+            clip_to_allocation: true,
+        });
+
         try {
             wrapper.hide();
-            columns.insert_child_at_index(wrapper, nativeIndex);
+            columns.remove_child(notifications);
+            columns.insert_child_at_index(slot, nativeIndex);
+            slot.add_child(notifications);
+            slot.add_child(wrapper);
+            wrapper.add_style_class_name('qc-in-date-menu');
             wrapper.remove_child(tabs);
             menu.box.insert_child_at_index(tabs, popupIndex);
             tabs.add_style_class_name('qc-datemenu-tabs');
-            const mount = {menu, columns, notifications, wrapper, tabs,
+            const mount = {menu, columns, slot, notifications, wrapper, tabs,
                 nativeVisibility: notifications.visible};
             this._embedded = mount;
             tabs.connect('destroy', () => { mount.tabs = null; });
@@ -65,27 +75,41 @@ export class DateMenuIntegration {
             this.mountMode = 'unmounted';
             if (tabs.get_parent() === menu.box) menu.box.remove_child(tabs);
             if (!tabs.get_parent()) wrapper.insert_child_at_index(tabs, 0);
-            if (wrapper.get_parent() === columns) columns.remove_child(wrapper);
+            if (wrapper.get_parent() === slot) slot.remove_child(wrapper);
+            if (notifications.get_parent() === slot) slot.remove_child(notifications);
+            if (!notifications.get_parent()) columns.insert_child_at_index(notifications, nativeIndex);
+            slot.destroy();
+            wrapper.remove_style_class_name('qc-in-date-menu');
             wrapper.show();
             return false;
         }
     }
 
+    setDimensions(width, height) {
+        if (!this._embedded) return false;
+        this._embedded.slot.set_size(width, height);
+        return true;
+    }
+
     setChatVisible(visible) {
         const mount = this._embedded;
-        if (!mount || mount.notifications?.get_parent() !== mount.columns) return;
+        if (!mount || mount.notifications?.get_parent() !== mount.slot) return;
         const unlocked = !Main.sessionMode?.isLocked && !Main.sessionMode?.isGreeter;
         const nativeAllowed = Main.sessionMode?.hasNotifications !== false && !Main.sessionMode?.isGreeter;
         if (mount.tabs) mount.tabs.visible = unlocked;
         mount.wrapper.visible = unlocked && visible;
         mount.notifications.visible = nativeAllowed && !mount.wrapper.visible;
+        mount.slot.visible = mount.wrapper.visible || mount.notifications.visible;
     }
 
     _detachEmbedded() {
         const mount = this._embedded;
         this._embedded = null;
         this.mountMode = 'unmounted';
-        if (mount.notifications?.get_parent() === mount.columns) {
+        if (mount.notifications?.get_parent() === mount.slot && mount.slot.get_parent() === mount.columns) {
+            const index = mount.columns.get_children().indexOf(mount.slot);
+            mount.slot.remove_child(mount.notifications);
+            mount.columns.insert_child_at_index(mount.notifications, index);
             mount.notifications.visible = Main.sessionMode?.isLocked || Main.sessionMode?.isGreeter
                 ? Boolean(Main.sessionMode.hasNotifications && !Main.sessionMode.isGreeter)
                 : mount.nativeVisibility && Main.sessionMode?.hasNotifications !== false;
@@ -94,6 +118,11 @@ export class DateMenuIntegration {
             mount.notifications.disconnect(mount.nativeDestroySignal);
         }
         mount.tabs?.destroy();
+        // The wrapper can itself be delivering destroy after the native tree was torn down.
+        if (mount.slot.get_parent() === mount.columns) {
+            if (mount.wrapper.get_parent() === mount.slot) mount.slot.remove_child(mount.wrapper);
+            mount.slot.destroy();
+        }
     }
 
     _mountStandalone(wrapper) {
